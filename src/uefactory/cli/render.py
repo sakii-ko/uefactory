@@ -6,7 +6,7 @@ from typing import Annotated
 import typer
 
 from uefactory.cli._common import settings_from_context
-from uefactory.render.job import compare_job_luma, render_job
+from uefactory.render.job import compare_job_luma, render_job, render_job_remote
 from uefactory.render.jobspec import JobSpecError
 from uefactory.render.mrq_spike import compare_spike_luma, render_mrq_spike
 from uefactory.render.smoke import render_smoke, render_smoke_remote
@@ -93,14 +93,34 @@ def render_job_command(
         bool,
         typer.Option("--verify-twice", help="Run twice and require identical frame luma."),
     ] = False,
+    host: Annotated[
+        str | None,
+        typer.Option("--host", help="Run render job on a configured remote host."),
+    ] = None,
 ) -> None:
     settings = settings_from_context(ctx)
     try:
-        first = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
+        if host is not None and verify_twice:
+            typer.echo("--verify-twice is only supported for local render jobs", err=True)
+            raise typer.Exit(2)
+        first = (
+            render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
+            if host is None
+            else render_job_remote(
+                settings=settings,
+                host=host,
+                job_path=job_path,
+                timeout_sec=timeout_sec,
+            )
+        )
         typer.echo(f"Render job OK: {first.run_dir}")
         typer.echo(f"Passes: {', '.join(first.frame_paths)}")
         typer.echo(f"Frames/pass: {first.spec.frame_count}")
         typer.echo(f"Manifest: {first.manifest_path}")
+        if first.artifacts is not None:
+            typer.echo(f"Contact sheet: {first.artifacts.contact_sheet}")
+            typer.echo(f"Turntable: {first.artifacts.turntable_mp4}")
+            typer.echo(f"Index: {first.artifacts.index_html}")
         if verify_twice:
             second = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
             compare_job_luma(first, second)

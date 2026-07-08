@@ -33,6 +33,11 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
                     "run/builtin_cube/beauty_lit/frame_0000.png'): "
                     "errno=2 (No such file or directory)"
                 ),
+                (
+                    "LogCore: Warning: Unable to statfs('/remote/jobs/render/out/"
+                    "builtin_cube/_mrq/beauty_lit/FinalImage.frame_0000.png'): "
+                    "errno=2 (No such file or directory)"
+                ),
                 "LogPython: Error: traceback",
                 (
                     "LogUsd: Error: TF_DIAGNOSTIC_CODING_ERROR_TYPE: Failed to load plugin "
@@ -51,7 +56,7 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
     summary = summarize_ue_log(log_path)
 
     assert summary.warning_count == 2
-    assert summary.warning_noise_count == 8
+    assert summary.warning_noise_count == 9
     assert summary.warning_noise == {
         "directory_watcher": 1,
         "unreal_trace_server_startup": 1,
@@ -61,6 +66,7 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
         "python_types_runtime_class_probe": 1,
         "mrq_output_path_probe": 1,
         "mrq_render_output_path_probe": 1,
+        "mrq_remote_output_path_probe": 1,
     }
     assert summary.error_count == 1
     assert summary.error_noise_count == 2

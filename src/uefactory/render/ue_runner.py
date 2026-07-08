@@ -41,6 +41,11 @@ KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
         "out/renders/",
         "errno=2 (No such file or directory)",
     ),
+    "mrq_remote_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "/_mrq/",
+        "errno=2 (No such file or directory)",
+    ),
 }
 
 KNOWN_ERROR_NOISE_RULES: dict[str, tuple[str, ...]] = {
