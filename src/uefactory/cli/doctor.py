@@ -7,7 +7,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -16,6 +15,13 @@ from typing import Annotated, Any
 import typer
 
 from uefactory.core.config import Settings
+from uefactory.core.sysinfo import (
+    is_candidate_local_mount,
+    is_network_fs,
+    mount_for_path,
+    mounts,
+    write_speed_mbps,
+)
 
 doctor_app = typer.Typer(help="Check the local UEFactory runtime environment.")
 LOGGER = logging.getLogger(__name__)
@@ -27,14 +33,6 @@ class CheckResult:
     status: str
     message: str
     details: dict[str, Any]
-
-
-@dataclass(frozen=True)
-class WriteSpeedResult:
-    mbps: float | None
-    size_mib: int
-    error: str | None = None
-    skipped_reason: str | None = None
 
 
 @doctor_app.callback(invoke_without_command=True)
@@ -254,13 +252,13 @@ def check_disk(settings: Settings) -> CheckResult:
     else:
         candidates.append(("default_ddc_dir", settings.data_dir / "ddc"))
 
-    mounts = _mounts()
+    mount_table = mounts()
     local_mounts = [
         mount
-        for mount in mounts
-        if _is_candidate_local_mount(mount) and not _is_network_fs(mount["fstype"])
+        for mount in mount_table
+        if is_candidate_local_mount(mount) and not is_network_fs(mount["fstype"])
     ]
-    network_mounts = [mount for mount in mounts if _is_network_fs(mount["fstype"])]
+    network_mounts = [mount for mount in mount_table if is_network_fs(mount["fstype"])]
     paths = []
     warnings = []
     failures = []
@@ -278,8 +276,8 @@ def check_disk(settings: Settings) -> CheckResult:
             failures.append(f"{label} path is not usable: {exc}")
             continue
 
-        write_speed = _write_speed_mbps(path, settings.doctor.write_test_mib)
-        mount = _mount_for_path(path, mounts)
+        write_speed = write_speed_mbps(path, settings.doctor.write_test_mib)
+        mount = mount_for_path(path, mount_table)
         path_details = {
             "label": label,
             "path": str(path),
@@ -298,7 +296,7 @@ def check_disk(settings: Settings) -> CheckResult:
             warnings.append(
                 f"{label} write speed is below {settings.doctor.nas_warn_write_mbps} MB/s"
             )
-        if mount and _is_network_fs(str(mount.get("fstype"))):
+        if mount and is_network_fs(str(mount.get("fstype"))):
             warnings.append(f"{label} is on network filesystem {mount.get('fstype')}")
 
     details: dict[str, Any] = {
@@ -369,140 +367,3 @@ def _float_or_none(value: str) -> float | None:
         return float(value)
     except ValueError:
         return None
-
-
-def _write_speed_mbps(path: Path, size_mib: int) -> WriteSpeedResult:
-    if size_mib <= 0:
-        return WriteSpeedResult(
-            mbps=None,
-            size_mib=size_mib,
-            skipped_reason="write test disabled",
-        )
-    path.mkdir(parents=True, exist_ok=True)
-    fd = -1
-    tmp_path: Path | None = None
-    try:
-        fd, raw_tmp_path = tempfile.mkstemp(prefix=".uef_write_", dir=path)
-        tmp_path = Path(raw_tmp_path)
-        block = b"\0" * (1024 * 1024)
-        start = time.monotonic()
-        with os.fdopen(fd, "wb", closefd=True) as file:
-            fd = -1
-            for _ in range(size_mib):
-                file.write(block)
-            file.flush()
-            os.fsync(file.fileno())
-        duration = time.monotonic() - start
-        if duration <= 0:
-            return WriteSpeedResult(
-                mbps=None,
-                size_mib=size_mib,
-                skipped_reason="duration was not positive",
-            )
-        return WriteSpeedResult(mbps=round(size_mib / duration, 2), size_mib=size_mib)
-    except OSError as exc:
-        LOGGER.warning("write speed test failed for %s: %s", path, exc)
-        return WriteSpeedResult(mbps=None, size_mib=size_mib, error=str(exc))
-    finally:
-        if fd != -1:
-            os.close(fd)
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
-
-
-def _mounts() -> list[dict[str, Any]]:
-    mounts: list[dict[str, Any]] = []
-    try:
-        lines = Path("/proc/mounts").read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return mounts
-    for line in lines:
-        parts = line.split()
-        if len(parts) < 3:
-            continue
-        mounts.append(
-            {
-                "source": parts[0],
-                "mountpoint": parts[1].replace("\\040", " "),
-                "fstype": parts[2],
-            }
-        )
-    return mounts
-
-
-def _mount_for_path(path: Path, mounts: list[dict[str, Any]]) -> dict[str, Any] | None:
-    resolved = path.resolve()
-    best: dict[str, Any] | None = None
-    best_len = -1
-    for mount in mounts:
-        mountpoint = Path(str(mount["mountpoint"]))
-        try:
-            resolved.relative_to(mountpoint)
-        except ValueError:
-            continue
-        length = len(str(mountpoint))
-        if length > best_len:
-            best = mount
-            best_len = length
-    return best
-
-
-def _is_network_fs(fstype: str) -> bool:
-    return fstype.lower() in {
-        "ceph",
-        "cifs",
-        "dingofs",
-        "fuse.ceph",
-        "fuse.dingofs",
-        "fuse.sshfs",
-        "gpfs",
-        "nfs",
-        "nfs4",
-        "smb3",
-    }
-
-
-def _is_candidate_local_mount(mount: dict[str, Any]) -> bool:
-    fstype = str(mount["fstype"]).lower()
-    mountpoint = Path(str(mount["mountpoint"]))
-    ignored_fstypes = {
-        "autofs",
-        "binfmt_misc",
-        "bpf",
-        "cgroup",
-        "cgroup2",
-        "configfs",
-        "debugfs",
-        "devpts",
-        "devtmpfs",
-        "fusectl",
-        "hugetlbfs",
-        "mqueue",
-        "overlay",
-        "proc",
-        "pstore",
-        "rpc_pipefs",
-        "securityfs",
-        "sysfs",
-        "tmpfs",
-        "tracefs",
-    }
-    if fstype in ignored_fstypes:
-        return False
-    if fstype.startswith("fuse."):
-        return False
-    if not mountpoint.exists() or not mountpoint.is_dir():
-        return False
-    return str(mountpoint) in {"/", "/scratch", "/tmp"} or not any(
-        str(mountpoint).startswith(prefix)
-        for prefix in (
-            "/proc",
-            "/sys",
-            "/dev",
-            "/run",
-            "/usr/bin",
-            "/usr/lib",
-            "/usr/share",
-            "/etc",
-        )
-    )

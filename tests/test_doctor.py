@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from uefactory.cli.doctor import CheckResult, _write_speed_mbps, build_doctor_report, check_disk
+from uefactory.cli.doctor import CheckResult, build_doctor_report, check_disk
 from uefactory.core.config import DoctorConfig, Settings
+from uefactory.core.sysinfo import write_speed_mbps
 
 
 def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
@@ -64,7 +65,7 @@ def test_write_speed_reports_mkstemp_failure_without_unlinking_cwd(
 
     monkeypatch.setattr("tempfile.mkstemp", fail_mkstemp)
 
-    result = _write_speed_mbps(tmp_path, 1)
+    result = write_speed_mbps(tmp_path, 1)
 
     assert result.mbps is None
     assert result.error is not None
@@ -83,7 +84,7 @@ def test_check_disk_fails_when_write_test_fails(monkeypatch: Any, tmp_path: Path
         doctor=DoctorConfig(write_test_mib=1),
     )
     monkeypatch.setattr("tempfile.mkstemp", fail_mkstemp)
-    monkeypatch.setattr("uefactory.cli.doctor._mounts", lambda: [])
+    monkeypatch.setattr("uefactory.cli.doctor.mounts", lambda: [])
 
     result = check_disk(settings)
 
