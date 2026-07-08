@@ -13,6 +13,10 @@
   - **Planner**(Claude 会话):Monitor 持久监听 `signals/to_planner/`,信号即时推送,自动归档;
   - **Coder**:后台跑 `tools/wait_signal.sh coder`——收到信号打印 JSON 并退出 0;
     处理完事务后**重新启动监听**;超时(默认 2h)退出 2,直接重启即可。
+    ⚠️ **必须让"脚本退出"成为唤醒事件**(agent 后台任务在进程退出时收到通知并读取输出)。
+    **不要**用 `while true; do wait_signal.sh ...; done` 外层循环包裹——那样信号会被脚本
+    消费归档,但输出被循环吞掉,你的会话永远不会被唤醒(2026-07-09 实发事故)。
+    兜底:即使漏掉信号,内容永远在 PLAN/reviews 里,`git pull` + 读 PLAN 状态区即可对齐。
 
 ## 事件表
 
