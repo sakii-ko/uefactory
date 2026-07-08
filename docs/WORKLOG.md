@@ -470,3 +470,48 @@ REVIEW REQUESTED: feat/m0-remote d64848b
 - 待决问题:4090 provision/smoke 按 PLAN 顺延为 M1 首任务,顺延主因是 WAN 大包传输耗时与 M0 closeout 优先级。
 
 REVIEW REQUESTED: feat/m0-remote f19bbeb
+
+## [2026-07-09] T1.2 MRQ headless 可行性 spike — DONE
+- 分支/commit:
+  - 实现: feat/m1-render @ 0218a75
+- T1.1 机会性探测:
+  - 本工作日已做一次 4090 轻量探测,不继续 hammer。
+  - 命令:通过 `RemoteHost.from_settings(settings, "4090").run("printf ok", timeout_sec=20, check=False)`。
+  - 结果:`returncode=255`,`duration_sec=0.099`;stderr 为 `kex_exchange_identification: Connection closed by remote host` / `Connection closed by 27.189.109.208 port 22`。
+- 做了什么:
+  - 新增 `uef render mrq-spike [--verify-twice]`,只做 T1.2 spike,不扩展 JobSpec 封装。
+  - UE 侧用 `-ExecutePythonScript=uef_mrq_spike.py -NullRHI` 幂等创建 `/Game/UEF/MRQSpike/UEF_MRQ_Spike` LevelSequence 和测试材质;渲染侧用 `/Engine/Maps/Entry -game -RenderOffScreen` + `MoviePipelinePythonHostExecutor` 启动 MRQ runtime executor。
+  - LevelSequence 使用 spawnable CineCameraActor、Cube backdrop/foreground、灯光与显式 transform tracks;输出 `MoviePipelineDeferredPass_Unlit` + PNG。
+  - 为 MRQ legacy PNG 路径设置 `MoviePipelineColorSetting.disable_tone_curve=True` 且启用空 OCIO configuration,让 PNG 输出避开 sRGB half-float quantization 的随机 dither;setup/render summary 均无真实 warning/error。
+  - `ue_runner` 增加两类已知 UE 噪声过滤:`/Engine/PythonTypes` 加载探测 warning、MRQ output path statfs 探测 warning,并补单测。
+- 验收产物:
+  - 命令:`.venv/bin/uef render mrq-spike --verify-twice` → 退出码 0。
+  - 两次 run:
+    - `out/mrq_spike/20260708T201149Z`
+    - `out/mrq_spike/20260708T201234Z`
+  - 每次均产出 8 张 PNG + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`render_kind=mrq_spike`,`status=ok`,`frames_expected=8`,`frames_found=8`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [212.111, 212.111, 212.111, 212.111, 212.111, 212.111, 212.111, 212.111]
+    ```
+  - 额外像素级复核:8 帧逐帧 `ImageChops.difference` 的 bbox 均为 `None`,extrema 全为 `((0, 0), (0, 0), (0, 0))`;两跑 PNG 像素完全一致。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    33 files already formatted
+    Success: no issues found in 28 source files
+    collected 24 items / 1 deselected / 23 selected
+    23 passed, 1 deselected in 0.58s
+    ```
+- 可行路径/必需 flags:
+  - setup:`UnrealEditor-Cmd UEFBase.uproject -ExecutePythonScript=uef_mrq_spike.py -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoSound -LocalDataCachePath=data/ddc`
+  - render:`UnrealEditor-Cmd UEFBase.uproject /Engine/Maps/Entry -game -RenderOffScreen -unattended -nopause -nosplash -stdout -FullStdOutLogOutput -NoSound -NoLoadingScreen -windowed -resx=640 -resy=360 -LocalDataCachePath=data/ddc -MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor -ExecutorPythonClass=/Engine/PythonTypes.UEFMRQSpikeRuntimeExecutor -LevelSequence=/Game/UEF/MRQSpike/UEF_MRQ_Spike.UEF_MRQ_Spike`
+- 耗时/坑:
+  - editor/PIE MRQ 路径能出图,但 `QUIT_EDITOR` 后出现 `munmap_chunk()/invalid pointer`;已放弃该路径,改用 runtime PythonHostExecutor。
+  - runtime executor 直接跑模板地图会混入默认天空/地面并有轻微 luma drift;改为 `/Engine/Maps/Entry` 后,必须给 spawnable 显式 transform tracks,否则输出全黑。
+  - UE 5.5 legacy MRQ PNG 输出源码中对 sRGB half-float 8-bit quantization 会加随机噪声;这是前期两跑 luma 差 `0.001-0.004` 的根因。当前用 ColorSetting/OCIO 规避后像素级一致。
+  - setup log 里有 `LogOpenColorIOEditor: Display: Force-disable invalid viewport transform settings.` 的 Display 行,不是 warning/error。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/mrq_spike`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.2 DoD 已达成,下一步按 PLAN 串行进入 T1.3 JobSpec v1。
