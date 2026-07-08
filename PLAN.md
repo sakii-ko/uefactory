@@ -4,9 +4,8 @@
 > 由 Planner 维护;Coder(同事)只执行「当前 Sprint」清单中的任务,不自行扩大范围。
 > 最后更新:2026-07-08(第 5 次) · 当前阶段:**M0 后半(远程节点)** · 状态:**T0.1–T0.5 正式 review 通过,已合入 main(tag `m0-core-done`)**
 > ✅ 正式 review:`docs/reviews/2026-07-08-formal-m0-core.md`(APPROVE;确定性渲染三连验证)。
-> **当前主线:F9(rsync_pull delete 本地侧防护,见 `docs/reviews/2026-07-08-t06-remote.md`)
-> → Planner 复核 → T0.7(引擎 provision + 远程冒烟)→ M0 完整验收(Owner)→ tag `v0.1.0` → M1。**
-> T0.6 已 APPROVE-WITH-FIXES(远程 doctor 双节点单连接达标);Q1–Q4 已归档(能收尽收)。
+> **当前主线:T0.7(引擎 provision 双节点 + 远程冒烟渲染闭环)→ M0 完整验收(Owner)→
+> tag `v0.1.0` → M1。** F9 已复核通过(fail-closed 加分),T0.6 完全关闭;Q1–Q4 已归档(能收尽收)。
 > 规则不变:DoD 验收对象不可自行替换;一次只推进一个任务。
 
 ---
