@@ -714,3 +714,59 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
   - 4090 未跑:PLAN 已把 4090 作为机会性任务,本轮 T1.6 DoD 以 l40s 为远端必验节点。
   - 本轮未使用 `/root/nas/fastdata2`;产物和 DDC 在本机 `bigdata1`,远端临时产物在 l40s 自己的 `/root/nas/bigdata1/cjw/uef/jobs/...` 且已清理。
 - 待决问题:无;T1.6 DoD 已达成,下一步按 PLAN 串行进入 T1.7 收尾。
+
+## [2026-07-09] T1.7 M1 收尾 — DONE
+
+- 分支/commit:
+  - 禁用在线请求:`feat/m1-render` @ `10b9fe2`
+  - README/配置样例:`feat/m1-render` @ `15a47a0`
+- 做了什么:
+  - 在 UE project config 层关闭 headless 在线请求源头:`[HTTP] bEnableHttp=False`,
+    `bUseNullHttp=True`,同时关闭 StudioTelemetry 硬件/OS 数据发送。
+  - 新增 `tests/test_ue_project_config.py`,把 HTTP/OnlineSubsystem/Analytics/StudioTelemetry
+    的离线约束变成回归测试。
+  - README 补「五分钟上手」:安装、`uef.toml`、doctor、本地六通道 job、HDRI job、l40s
+    远程 job、产物查看路径。
+  - `uef.toml.example` 补运行数据路径、doctor 写入测试、l40s 同路径陷阱和 `/root/nas/fastdata2`
+    不放大数据的注释。
+- 验收产物:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    47 files already formatted
+    Success: no issues found in 40 source files
+    collected 55 items / 1 deselected / 54 selected
+    54 passed, 1 deselected in 0.52s
+    ```
+  - 本机 smoke:
+    - 命令:`.venv/bin/uef render smoke --timeout-sec 1800` → 退出码 0。
+    - run:`out/smoke/20260708T225415Z`
+    - manifest:`status=ok`,`render_kind=scene`,`ue_summary.warning_count=0`,`ue_summary.error_count=0`,
+      `mean_luma=36.866`。
+    - 复查 `ue.log`:无 `LogHttp`、proxy、libcurl、HTTP request failed 匹配。
+  - 本机六通道 job:
+    - 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T225541Z/builtin_cube`
+    - 六通道 × 8 帧均产出;`contact_sheet.png`、`turntable.mp4`、`index.html` 均存在。
+    - manifest:`status=ok`,`ue_summary.warning_count=0`,`ue_summary.error_count=0`,
+      `frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`。
+    - 复查 `ue.log`/`ue_setup.log`:无 `LogHttp`、proxy、libcurl、HTTP request failed 匹配。
+- M1 汇总:
+  - T1.2 证明 MRQ headless 路线可行并保持确定性;T1.3 落地严格 JobSpec + orbit camera。
+  - T1.4 完成 lit/unlit/depth/normal/basecolor/object_mask 六通道和通道级校验。
+  - T1.5 完成 `three_point`/`hdri`/`none` 光照预设及最小 HDRI acquire。
+  - T1.6 完成本地/远程统一入口、l40s 跑通、contact sheet、index.html、turntable mp4 和远端清理。
+  - T1.7 关闭 UE 在线请求源头,补齐 README/配置样例,清点 QUESTIONS。
+- 给 M2(资产 ingest)的建议:
+  - 先用一个小型本地 glTF/FBX 样例贯通 import → catalog → thumbnail → JobSpec asset id 替换
+    `builtin:cube`;不要一上来接 Objaverse 全量。
+  - catalog 从第一版开始记录 source URI、license、license tier、original filename、content hash、
+    import status、UE package path、thumbnail path;license 字段保持 NOT NULL。
+  - 资产缓存、导入产物和缩略图默认继续放 `data/` 与 `out/`,不要使用 `/root/nas/fastdata2` 承载大缓存。
+  - 复用 M1 的 render validator 作为 ingest smoke:每个新导入资产至少跑一帧 beauty_lit + object_mask,
+    及时暴露尺度、材质、法线和 stencil 问题。
+  - 先把失败资产保留结构化 failure record,不要静默跳过;M0/T0.6 的 fail-closed 模式应继续沿用。
+- QUESTIONS 清点:`docs/QUESTIONS.md` 待批复为 `(暂无)`;Q1-Q4 均已归档并有 Owner/Planner 答复。
+- 待决问题:无;M1 当前分支已可请求 review。
+
+REVIEW REQUESTED: feat/m1-render PENDING_HEAD
