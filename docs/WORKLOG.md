@@ -605,3 +605,49 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
   - MRQ EXR 实际写出 `RGBA`;manifest 如实记录物理通道数为 4,校验统计取第一通道标量值。
   - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
 - 待决问题:无;T1.4 DoD 已达成,下一步按 PLAN 串行进入 T1.5 光照预设。
+
+## [2026-07-09] T1.5 光照预设 — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `9024c89`
+- 做了什么:
+  - JobSpec lighting 扩展为 `preset ∈ {three_point, hdri, none}`;`hdri` 可指定 `lighting.hdri`,默认 `studio_small_03_1k`。
+  - 新增 `uef acquire hdri`,从 PolyHaven files API 下载 1k HDRI 到 `data/hdri/`,写 metadata,记录 source URL/license/md5,并校验已存在文件。
+  - UE setup 按 lighting preset 幂等构建灯光:
+    - `three_point`:保留三点光 + SkyLight。
+    - `hdri`:导入 job 指定 `.hdr` 为 TextureCube,绑定到 SkyLight specified cubemap。
+    - `none`:不 spawn 任何灯光,给 cube/floor 使用 unlit emissive 材质,用于无外部光下验证发光材质。
+  - 新增 `examples/orbit8_hdri.yaml`、`examples/orbit8_none.yaml`;校验器支持 `none` preset 的发光区域断言,不再用全局平均 luma 拒绝小面积发光体。
+- HDRI 获取:
+  - 命令:`.venv/bin/uef acquire hdri --asset-id studio_small_03 --resolution 1k` → 退出码 0。
+  - 产物:
+    - `data/hdri/studio_small_03_1k.hdr`(1.7M,不入 git)
+    - `data/hdri/studio_small_03_1k.json`(metadata,不入 git)
+  - metadata:license=`CC0`,source=`https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_03_1k.hdr`,md5=`74e6ef69ea9024c2cc25b3a7de8ec2f7`。
+- 验收产物:
+  - three_point 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T220541Z/builtin_cube`
+    - `frames_found`:六通道均为 8;`frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`
+  - hdri 命令:`.venv/bin/uef render job examples/orbit8_hdri.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T220645Z/builtin_cube`
+    - `frames_found.beauty_lit=8`;`frame_luma=[254.536, 198.764, 110.994, 141.161, 159.926, 140.906, 99.452, 133.575]`
+  - none 命令:`.venv/bin/uef render job examples/orbit8_none.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T221403Z/builtin_cube`
+    - `frames_found.beauty_lit=8`;`frame_luma=[0.461, 81.116, 0.461, 0.461, 0.461, 0.461, 0.461, 81.116]`
+    - `none` 画面低平均亮度但有 emissive 高亮区域;校验条件为每帧 `max > 32` 且非均匀,不是全局平均 luma。
+  - 三个 run 的 `setup_summary.error_count=0`,`setup_summary.warning_count=0`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`;仅有既有 UE 噪声被过滤。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    43 files already formatted
+    Success: no issues found in 36 source files
+    collected 51 items / 1 deselected / 50 selected
+    50 passed, 1 deselected in 0.51s
+    ```
+- 耗时/坑:
+  - PolyHaven API 不带 User-Agent 会返回 403;下载器显式设置 `UEFactory/<version> research downloader`。
+  - UE headless 导入 `studio_small_03_1k.hdr` 会生成 `TextureCube`,可直接作为 SkyLight cubemap。
+  - 初版 `none` 使用 DefaultLit + 弱 emissive,校验器拒绝近黑是正确的;后改为无灯光 + Unlit emissive 材质,并按 preset 定制 beauty 断言。
+  - 本轮下载的 HDRI 是 1.7M 小样例,放在 `data/hdri/`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.5 DoD 已达成,下一步按 PLAN 串行进入 T1.6 本地/远程统一执行器 + contact sheet + turntable。
