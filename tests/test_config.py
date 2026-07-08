@@ -20,6 +20,7 @@ runtime_lib_dir = "runtime/lib"
 [doctor]
 min_free_vram_gib = 12
 nas_warn_write_mbps = 350
+write_test_mib = 64
 """.strip(),
         encoding="utf-8",
     )
@@ -34,6 +35,7 @@ nas_warn_write_mbps = 350
     assert settings.runtime_lib_dir == tmp_path / "runtime/lib"
     assert settings.doctor.min_free_vram_gib == 12
     assert settings.doctor.nas_warn_write_mbps == 350
+    assert settings.doctor.write_test_mib == 64
 
 
 def test_environment_overrides_config_file(tmp_path: Path) -> None:
@@ -55,6 +57,7 @@ data_dir = "custom-data"
             "UEF_DATA_DIR": "env-data",
             "UEF_RUNTIME_LIB_DIR": "/opt/ue-runtime/lib",
             "UEF_MIN_FREE_VRAM_GIB": "16",
+            "UEF_DOCTOR_WRITE_TEST_MIB": "8",
         },
         project_root=tmp_path,
     )
@@ -64,6 +67,7 @@ data_dir = "custom-data"
     assert settings.data_dir == tmp_path / "env-data"
     assert settings.runtime_lib_dir == Path("/opt/ue-runtime/lib")
     assert settings.doctor.min_free_vram_gib == 16
+    assert settings.doctor.write_test_mib == 8
 
 
 def test_hosts_are_loaded_from_config(tmp_path: Path) -> None:

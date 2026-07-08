@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from uefactory.cli.doctor import CheckResult, _write_speed_mbps, build_doctor_report, check_disk
-from uefactory.core.config import Settings
+from uefactory.core.config import DoctorConfig, Settings
 
 
 def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
@@ -62,10 +62,9 @@ def test_write_speed_reports_mkstemp_failure_without_unlinking_cwd(
     def fail_mkstemp(*args: Any, **kwargs: Any) -> tuple[int, str]:
         raise PermissionError("read-only candidate")
 
-    monkeypatch.setenv("UEF_DOCTOR_WRITE_TEST_MIB", "1")
     monkeypatch.setattr("tempfile.mkstemp", fail_mkstemp)
 
-    result = _write_speed_mbps(tmp_path)
+    result = _write_speed_mbps(tmp_path, 1)
 
     assert result.mbps is None
     assert result.error is not None
@@ -81,8 +80,8 @@ def test_check_disk_fails_when_write_test_fails(monkeypatch: Any, tmp_path: Path
         data_dir=tmp_path / "data",
         log_dir=tmp_path / "logs",
         ddc_dir=tmp_path / "ddc",
+        doctor=DoctorConfig(write_test_mib=1),
     )
-    monkeypatch.setenv("UEF_DOCTOR_WRITE_TEST_MIB", "1")
     monkeypatch.setattr("tempfile.mkstemp", fail_mkstemp)
     monkeypatch.setattr("uefactory.cli.doctor._mounts", lambda: [])
 

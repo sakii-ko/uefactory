@@ -278,7 +278,7 @@ def check_disk(settings: Settings) -> CheckResult:
             failures.append(f"{label} path is not usable: {exc}")
             continue
 
-        write_speed = _write_speed_mbps(path)
+        write_speed = _write_speed_mbps(path, settings.doctor.write_test_mib)
         mount = _mount_for_path(path, mounts)
         path_details = {
             "label": label,
@@ -371,8 +371,7 @@ def _float_or_none(value: str) -> float | None:
         return None
 
 
-def _write_speed_mbps(path: Path) -> WriteSpeedResult:
-    size_mib = int(os.environ.get("UEF_DOCTOR_WRITE_TEST_MIB", "512"))
+def _write_speed_mbps(path: Path, size_mib: int) -> WriteSpeedResult:
     if size_mib <= 0:
         return WriteSpeedResult(
             mbps=None,

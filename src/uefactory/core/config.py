@@ -17,6 +17,7 @@ DEFAULT_UE_HOME = Path("/root/nas/bigdata1/cjw/UE5Home")
 class DoctorConfig:
     min_free_vram_gib: float = 8.0
     nas_warn_write_mbps: float = 200.0
+    write_test_mib: int = 512
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,13 @@ def load_settings(
             doctor_config,
             env_values,
             DoctorConfig.nas_warn_write_mbps,
+        ),
+        write_test_mib=_int_setting(
+            "UEF_DOCTOR_WRITE_TEST_MIB",
+            "write_test_mib",
+            doctor_config,
+            env_values,
+            DoctorConfig.write_test_mib,
         ),
     )
 
@@ -164,6 +172,22 @@ def _float_setting(
         return float(value)
     except (TypeError, ValueError) as exc:
         msg = f"{config_key} must be a number"
+        raise ValueError(msg) from exc
+
+
+def _int_setting(
+    env_key: str,
+    config_key: str,
+    config: dict[str, Any],
+    env: Mapping[str, str],
+    default: int,
+) -> int:
+    value: str | int
+    value = env[env_key] if env_key in env else config.get(config_key, default)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        msg = f"{config_key} must be an integer"
         raise ValueError(msg) from exc
 
 
