@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+dist/
+build/
+
+# 项目运行时目录(产物不入库)
+logs/
+out/
+data/
+uef.toml
+
+# UE 工程:只保留 .uproject / Config / Content/Python
+ue/UEFBase/Binaries/
+ue/UEFBase/DerivedDataCache/
+ue/UEFBase/Intermediate/
+ue/UEFBase/Saved/
+ue/UEFBase/Content/*
+!ue/UEFBase/Content/Python/
+
+# 通用
+*.swp
+.DS_Store
+.idea/
+.vscode/
