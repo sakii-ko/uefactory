@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw
 from uefactory.core.config import HostConfig, Settings, load_settings
 from uefactory.core.remote import RemoteCommandResult
 from uefactory.render.smoke import (
+    _REMOTE_SMOKE_PREPARE_SCRIPT,
     _engine_version,
     _validate_image,
     render_smoke,
@@ -58,6 +59,15 @@ def test_engine_version_missing_file_raises(tmp_path: Path) -> None:
 
     with pytest.raises(FileNotFoundError, match="Build.version"):
         _engine_version(settings)
+
+
+def test_remote_smoke_prepare_includes_linux_shader_case_compat_links() -> None:
+    assert "Raytracing" in _REMOTE_SMOKE_PREPARE_SCRIPT
+    assert "RayTracing" in _REMOTE_SMOKE_PREPARE_SCRIPT
+    assert "RaytracingSkylightRGS.usf" in _REMOTE_SMOKE_PREPARE_SCRIPT
+    assert "RayTracingSkyLightRGS.usf" in _REMOTE_SMOKE_PREPARE_SCRIPT
+    assert "NiagaraStatelessModule_ScaleMeshSizebySpeed.ush" in _REMOTE_SMOKE_PREPARE_SCRIPT
+    assert "NiagaraStatelessModule_ScaleMeshSizeBySpeed.ush" in _REMOTE_SMOKE_PREPARE_SCRIPT
 
 
 def test_remote_smoke_pulls_validated_frame_and_cleans_up(
@@ -172,6 +182,7 @@ def test_remote_smoke_pulls_validated_frame_and_cleans_up(
 
     assert result.frame_path.exists()
     assert result.mean_luma > 5
+    assert any("UEF_REMOTE_RUN_USER=uef" in call for call in calls)
     assert any(call.startswith("tmux:smoke_l40s_") for call in calls)
     assert any(call.startswith("pull:True:") for call in calls)
     assert any(call.startswith("remove:/remote/work/jobs/smoke_l40s_") for call in calls)

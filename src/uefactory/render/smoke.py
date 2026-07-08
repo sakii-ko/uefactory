@@ -14,7 +14,7 @@ from PIL import Image, ImageStat
 
 from uefactory.core.config import Settings
 from uefactory.core.paths import resolve_path, utc_timestamp
-from uefactory.core.remote import RemoteHost, remote_python_command
+from uefactory.core.remote import RemoteHost, parse_json_stdout, remote_python_command
 from uefactory.render.ue_runner import UERunnerError, run_ue
 
 LOGGER = logging.getLogger(__name__)
@@ -185,6 +185,9 @@ def render_smoke_remote(
     poll_interval_sec: int = 30,
 ) -> SmokeRenderResult:
     remote = RemoteHost.from_settings(settings, host)
+    requested_run_user = "uef"
+    runtime = _prepare_remote_smoke_runtime(remote, run_user=requested_run_user)
+    run_user = str(runtime.get("run_user") or "")
     timestamp = utc_timestamp()
     job_id = f"smoke_{remote.config.name}_{timestamp}"
     run_dir = resolve_path(out_root, settings.project_root) / timestamp
@@ -214,6 +217,7 @@ def render_smoke_remote(
             "UEF_ENGINE_DIR": str(remote.config.engine_dir),
             "UEF_REMOTE_RUN_DIR": str(remote_run_dir),
             "UEF_REMOTE_PROJECT_DIR": str(remote_project_dir),
+            "UEF_REMOTE_RUN_USER": run_user,
             "UEF_TIMEOUT_SEC": str(timeout_sec),
         },
     )
@@ -265,6 +269,29 @@ def render_smoke_remote(
         ue_log_path=ue_log_path,
         mean_luma=image_info.mean_luma,
     )
+
+
+def _prepare_remote_smoke_runtime(remote: RemoteHost, *, run_user: str) -> dict[str, Any]:
+    result = remote.run(
+        remote_python_command(
+            _REMOTE_SMOKE_PREPARE_SCRIPT,
+            {
+                "UEF_HOST_NAME": remote.config.name,
+                "UEF_WORK_DIR": str(remote.config.work_dir),
+                "UEF_ENGINE_DIR": str(remote.config.engine_dir),
+                "UEF_REMOTE_RUN_USER": run_user,
+            },
+        ),
+        timeout_sec=120,
+    )
+    payload = parse_json_stdout(result.stdout)
+    LOGGER.info(
+        "Prepared remote smoke runtime on %s: mode=%s run_user=%s",
+        remote.config.name,
+        payload.get("mode"),
+        payload.get("run_user"),
+    )
+    return payload
 
 
 def _package_smoke_project(settings: Settings, package_dir: Path) -> Path:
@@ -365,6 +392,8 @@ def _manifest(
             "warning_noise_count": ue_result.summary.warning_noise_count,
             "warning_noise": ue_result.summary.warning_noise or {},
             "error_count": ue_result.summary.error_count,
+            "error_noise_count": ue_result.summary.error_noise_count,
+            "error_noise": ue_result.summary.error_noise or {},
             "warnings": ue_result.summary.warnings,
             "errors": ue_result.summary.errors,
         },
@@ -444,6 +473,132 @@ def _engine_version(settings: Settings) -> dict[str, Any]:
         raise ValueError(msg) from exc
 
 
+_REMOTE_SMOKE_PREPARE_SCRIPT = r"""
+import json
+import os
+import pwd
+import shutil
+import subprocess
+import time
+from pathlib import Path
+
+host_name = os.environ["UEF_HOST_NAME"]
+work_dir = Path(os.environ["UEF_WORK_DIR"])
+engine_dir = Path(os.environ["UEF_ENGINE_DIR"])
+run_user = os.environ["UEF_REMOTE_RUN_USER"]
+
+
+def run(command):
+    return subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+
+def user_exists(name):
+    try:
+        pwd.getpwnam(name)
+    except KeyError:
+        return False
+    return True
+
+
+def ensure_symlink(link_path, target_path, *, relative_target=None):
+    if link_path.exists() or link_path.is_symlink():
+        if link_path.resolve() != target_path.resolve():
+            raise RuntimeError(f"Unexpected shader compatibility path: {link_path}")
+        return False
+    if os.geteuid() != 0:
+        raise RuntimeError(f"Missing shader compatibility link and not root: {link_path}")
+    link_path.symlink_to(relative_target or target_path)
+    return True
+
+
+actions = []
+executable = engine_dir / "Engine/Binaries/Linux/UnrealEditor-Cmd"
+version_path = engine_dir / "Engine/Build/Build.version"
+if not executable.exists():
+    raise RuntimeError(f"UnrealEditor-Cmd is missing: {executable}")
+if not version_path.exists():
+    raise RuntimeError(f"Build.version is missing: {version_path}")
+
+shader_private_dir = engine_dir / "Engine/Shaders/Private"
+ray_tracing_dir = shader_private_dir / "RayTracing"
+raytracing_dir = shader_private_dir / "Raytracing"
+sky_light_shader = ray_tracing_dir / "RayTracingSkyLightRGS.usf"
+sky_light_compat_shader = ray_tracing_dir / "RaytracingSkylightRGS.usf"
+niagara_modules_dir = (
+    engine_dir / "Engine/Plugins/FX/Niagara/Shaders/Private/Stateless/Modules"
+)
+niagara_scale_mesh_shader = niagara_modules_dir / "NiagaraStatelessModule_ScaleMeshSizeBySpeed.ush"
+niagara_scale_mesh_compat_shader = (
+    niagara_modules_dir / "NiagaraStatelessModule_ScaleMeshSizebySpeed.ush"
+)
+if not ray_tracing_dir.exists():
+    raise RuntimeError(f"RayTracing shader directory is missing: {ray_tracing_dir}")
+if not sky_light_shader.exists():
+    raise RuntimeError(f"RayTracing skylight shader is missing: {sky_light_shader}")
+if not niagara_scale_mesh_shader.exists():
+    raise RuntimeError(f"Niagara scale mesh shader is missing: {niagara_scale_mesh_shader}")
+if ensure_symlink(raytracing_dir, ray_tracing_dir, relative_target=Path("RayTracing")):
+    actions.append("created shader directory compatibility link Raytracing -> RayTracing")
+if ensure_symlink(
+    sky_light_compat_shader,
+    sky_light_shader,
+    relative_target=Path("RayTracingSkyLightRGS.usf"),
+):
+    actions.append(
+        "created shader file compatibility link RaytracingSkylightRGS.usf -> "
+        "RayTracingSkyLightRGS.usf"
+    )
+if ensure_symlink(
+    niagara_scale_mesh_compat_shader,
+    niagara_scale_mesh_shader,
+    relative_target=Path("NiagaraStatelessModule_ScaleMeshSizeBySpeed.ush"),
+):
+    actions.append(
+        "created Niagara shader compatibility link "
+        "NiagaraStatelessModule_ScaleMeshSizebySpeed.ush -> "
+        "NiagaraStatelessModule_ScaleMeshSizeBySpeed.ush"
+    )
+
+if os.geteuid() == 0:
+    if shutil.which("runuser") is None:
+        raise RuntimeError("runuser is required to launch Unreal as a non-root user")
+    if not user_exists(run_user):
+        run(["useradd", "-m", "-s", "/bin/bash", run_user])
+        actions.append(f"created user {run_user}")
+    if work_dir.parts[:2] == ("/", "root") or engine_dir.parts[:2] == ("/", "root"):
+        setfacl = shutil.which("setfacl")
+        if setfacl is None:
+            raise RuntimeError("setfacl is required for /root-backed remote paths; install acl")
+        run([setfacl, "-m", f"u:{run_user}:--x", "/root"])
+        actions.append(f"granted {run_user} execute ACL on /root")
+    run(["runuser", "-u", run_user, "--", "test", "-x", str(executable)])
+    run(["runuser", "-u", run_user, "--", "test", "-r", str(version_path)])
+    mode = "root-orchestrated"
+else:
+    run_user = ""
+    mode = "current-user"
+
+print(
+    json.dumps(
+        {
+            "status": "ok",
+            "host": host_name,
+            "mode": mode,
+            "run_user": run_user,
+            "actions": actions,
+            "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        },
+        sort_keys=True,
+    )
+)
+"""
+
+
 _REMOTE_SMOKE_SCRIPT = r"""
 import json
 import os
@@ -459,6 +614,7 @@ work_dir = Path(os.environ["UEF_WORK_DIR"])
 engine_dir = Path(os.environ["UEF_ENGINE_DIR"])
 run_dir = Path(os.environ["UEF_REMOTE_RUN_DIR"])
 project_dir = Path(os.environ["UEF_REMOTE_PROJECT_DIR"])
+run_user = os.environ.get("UEF_REMOTE_RUN_USER", "")
 timeout_sec = int(os.environ["UEF_TIMEOUT_SEC"])
 status_path = work_dir / "jobs" / job_id / "status.json"
 status_path.parent.mkdir(parents=True, exist_ok=True)
@@ -470,8 +626,8 @@ ue_log_path = run_dir / "ue.log"
 job_path = run_dir / "job.json"
 project_path = project_dir / "UEFBase.uproject"
 script_path = project_dir / "Content/Python/uef_smoke.py"
-ddc_dir = work_dir / "ddc"
-ue_home = work_dir / "ue_home"
+ddc_dir = work_dir / "ddc" / "smoke"
+ue_home = work_dir / "ue_home" / "smoke"
 
 
 def write_status(status, phase, **extra):
@@ -494,14 +650,52 @@ def summarize_log(path):
     errors = []
     warning_count = 0
     error_count = 0
+    warning_noise = {}
+    error_noise = {}
     if not path.exists():
-        return {"warnings": [], "errors": [], "warning_count": 0, "error_count": 0}
+        return {
+            "warnings": [],
+            "errors": [],
+            "warning_count": 0,
+            "error_count": 0,
+            "warning_noise_count": 0,
+            "warning_noise": {},
+            "error_noise_count": 0,
+            "error_noise": {},
+        }
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if "Warning:" in line:
+            if "LogDirectoryWatcher: Warning:" in line:
+                reason = "directory_watcher"
+                warning_noise[reason] = warning_noise.get(reason, 0) + 1
+                continue
+            if "LogStreaming: Warning: Failed to read file" in line and ".png" in line:
+                reason = "missing_editor_icon"
+                warning_noise[reason] = warning_noise.get(reason, 0) + 1
+                continue
+            if "USD" in line and "plugInfo.json" in line:
+                reason = "usd_plugin_metadata_write_permission"
+                warning_noise[reason] = warning_noise.get(reason, 0) + 1
+                continue
+            if "/Engine/" in line and "WritePermissions." in line and "Permission denied" in line:
+                reason = "engine_content_write_permission_probe"
+                warning_noise[reason] = warning_noise.get(reason, 0) + 1
+                continue
             warning_count += 1
             if len(warnings) < 20:
                 warnings.append(line)
         if "Error:" in line:
+            if "LogUsd: Error: TF_DIAGNOSTIC_CODING_ERROR_TYPE: Failed to load plugin" in line:
+                reason = "missing_optional_usd_plugin"
+                error_noise[reason] = error_noise.get(reason, 0) + 1
+                continue
+            if (
+                "LogFeaturePack: Error: Error in Feature pack" in line
+                and "Cannot find screenshot" in line
+            ):
+                reason = "missing_feature_pack_screenshot"
+                error_noise[reason] = error_noise.get(reason, 0) + 1
+                continue
             error_count += 1
             if len(errors) < 20:
                 errors.append(line)
@@ -510,7 +704,27 @@ def summarize_log(path):
         "errors": errors,
         "warning_count": warning_count,
         "error_count": error_count,
+        "warning_noise_count": sum(warning_noise.values()),
+        "warning_noise": warning_noise,
+        "error_noise_count": sum(error_noise.values()),
+        "error_noise": error_noise,
     }
+
+
+def chown_for_run_user(*paths):
+    if not run_user or os.geteuid() != 0:
+        return
+    subprocess.run(["id", "-u", run_user], check=True, stdout=subprocess.DEVNULL)
+    for path in paths:
+        subprocess.run(["chown", "-R", f"{run_user}:{run_user}", str(path)], check=True)
+
+
+def command_for_run_user(command, env):
+    if not run_user or os.geteuid() != 0:
+        return command, env
+    env_keys = ["HOME", "UEF_JOB_FILE", "UE-LocalDataCachePath", "LD_LIBRARY_PATH"]
+    env_args = [f"{key}={env[key]}" for key in env_keys if key in env]
+    return ["runuser", "-u", run_user, "--", "env", *env_args, *command], os.environ.copy()
 
 
 try:
@@ -536,6 +750,7 @@ try:
         "remote_host": host_name,
     }
     job_path.write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+    chown_for_run_user(run_dir, ddc_dir, ue_home)
     env = os.environ.copy()
     env.update(
         {
@@ -557,13 +772,14 @@ try:
         "-NoSound",
         f"-LocalDataCachePath={ddc_dir}",
     ]
-    write_status("running", "rendering", command=command)
+    run_command, run_env = command_for_run_user(command, env)
+    write_status("running", "rendering", command=run_command, ue_command=command, run_user=run_user)
     started = time.monotonic()
     with ue_log_path.open("w", encoding="utf-8", errors="replace") as log_file:
         result = subprocess.run(
-            command,
+            run_command,
             cwd=project_dir,
-            env=env,
+            env=run_env,
             stdout=log_file,
             stderr=subprocess.STDOUT,
             text=True,
@@ -581,7 +797,9 @@ try:
         "job": job,
         "remote_host": host_name,
         "job_id": job_id,
-        "command": command,
+        "command": run_command,
+        "ue_command": command,
+        "run_user": run_user,
         "duration_sec": duration_sec,
         "ue_log": str(ue_log_path),
         "frame": str(frame_path),
