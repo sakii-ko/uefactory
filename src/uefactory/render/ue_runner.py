@@ -25,6 +25,14 @@ KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
         "WritePermissions.",
         "Permission denied",
     ),
+    "python_types_runtime_class_probe": (
+        "LogStreaming: Warning: LoadPackage: SkipPackage: /Engine/PythonTypes",
+    ),
+    "mrq_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "out/mrq_spike/",
+        "errno=2 (No such file or directory)",
+    ),
 }
 
 KNOWN_ERROR_NOISE_RULES: dict[str, tuple[str, ...]] = {

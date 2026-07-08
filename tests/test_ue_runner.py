@@ -19,6 +19,14 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
                     "LogUnixPlatformFile: Warning: open('/x/Engine/Content/"
                     "WritePermissions.abc.temp') failed: Permission denied"
                 ),
+                (
+                    "LogStreaming: Warning: LoadPackage: SkipPackage: /Engine/PythonTypes "
+                    "(0xB446D7D5D25A361D) - The package to load does not exist on disk"
+                ),
+                (
+                    "LogCore: Warning: Unable to statfs('/repo/out/mrq_spike/"
+                    "run/frame_0000.png'): errno=2 (No such file or directory)"
+                ),
                 "LogPython: Error: traceback",
                 (
                     "LogUsd: Error: TF_DIAGNOSTIC_CODING_ERROR_TYPE: Failed to load plugin "
@@ -37,12 +45,14 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
     summary = summarize_ue_log(log_path)
 
     assert summary.warning_count == 2
-    assert summary.warning_noise_count == 4
+    assert summary.warning_noise_count == 6
     assert summary.warning_noise == {
         "directory_watcher": 1,
         "missing_editor_icon": 1,
         "usd_plugin_metadata_write_permission": 1,
         "engine_content_write_permission_probe": 1,
+        "python_types_runtime_class_probe": 1,
+        "mrq_output_path_probe": 1,
     }
     assert summary.error_count == 1
     assert summary.error_noise_count == 2
