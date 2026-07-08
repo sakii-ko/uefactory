@@ -25,7 +25,7 @@
 (暂无条目 —— M0 开工后从这里开始)
 
 ## [2026-07-08] T0.1 Python 包骨架 + uef doctor — DONE
-- 分支/commit: feat/m0-skeleton @ 待提交
+- 分支/commit: feat/m0-skeleton @ 7d933da
 - 做了什么:
   - 建立 `pyproject.toml`、`src/uefactory/` 包结构和 `uef` Typer CLI 入口,版本为 `0.1.0`。
   - 配置统一收口到 `core/config.py`,优先级为 `UEF_*` 环境变量 > `uef.toml` > 默认值。
@@ -78,7 +78,7 @@
 - 待决问题:无
 
 ## [2026-07-08] T0.3 冒烟渲染 `uef render smoke` — DONE
-- 分支/commit: feat/m0-skeleton @ 待提交
+- 分支/commit: feat/m0-skeleton @ e426feb
 - 做了什么:
   - 新增 `uef render smoke [--out out/smoke]`,每次创建 UTC run 目录,写 `job.json`、`ue.log`、`manifest.json` 和 `frame_0000.png`。
   - 新增 `render/ue_runner.py`,统一封装 UE 子进程、超时进程组 kill、stdout/stderr 落盘、Warning/Error 摘要。
@@ -123,7 +123,7 @@
 - 待决问题:无
 
 ## [2026-07-08] T0.4 工程质量基建 — DONE
-- 分支/commit: feat/m0-skeleton @ 待提交
+- 分支/commit: feat/m0-skeleton @ 7d933da
 - 做了什么:
   - 在 `pyproject.toml` 配置 ruff(lint+format)、mypy 和 pytest;默认 pytest 跳过 `ue`/`net` 标记。
   - 新增 `tools/check.sh`,优先使用 `.venv/bin/python`,顺序执行 ruff check、ruff format --check、mypy、pytest。
@@ -150,7 +150,7 @@
 - 待决问题:无
 
 ## [2026-07-08] T0.2 UE 基础工程 UEFBase — DONE
-- 分支/commit: feat/m0-skeleton @ 待提交
+- 分支/commit: feat/m0-skeleton @ 2368513
 - 做了什么:
   - 新增最小 UE 5.5 工程 `ue/UEFBase/UEFBase.uproject`,启用 `PythonScriptPlugin`、`MovieRenderPipeline`、`SequencerScripting`。
   - `Config/DefaultEngine.ini` 显式设置 Vulkan RHI、基础渲染项,并关闭 UDP Messaging、AndroidFileServer、OnlineSubsystem 默认服务、CrashReportClient 隐式上传和 Analytics。
@@ -188,4 +188,51 @@
   - 首次打开:`2:24.51`;当时只传 env,UE 仍默认使用 `/home/chijw/.config/.../Zen/Data`。
   - 修正为 `HOME=/root/nas/bigdata1/cjw/UE5Home` + `-LocalDataCachePath=...` 后,二次打开 `29.723s`,最终在线插件禁用后验证打开 `28.129s`。
   - UE 在 NAS 上会报 DirectoryWatcher warnings,但 commandlet 退出码 0 且 `Success - 0 error(s), 6 warning(s)`。
+- 待决问题:无
+
+## [2026-07-08] T0.3 冒烟渲染 SceneCapture 修复 — DONE
+- 分支/commit: feat/m0-skeleton @ 5a81f1b
+- 做了什么:
+  - 正式 `uef render smoke` 从 Canvas 诊断画面改回 SceneCapture2D 场景输出,`manifest.json` 顶层和 job 都标记 `render_kind=scene`,UE 标记测试断言该字段。
+  - `DefaultEngine.ini` 关闭自动曝光;场景保留 Cube + DirectionalLight + SkyLight + Plane,使用普通 lit 材质参与光照,不再用 Canvas 写 RT。
+  - DirectionalLight/SkyLight 设为 MOVABLE,SkyLight 调 `recapture_sky()`;capture component 开 `always_persist_rendering_state` 并连续 `capture_scene()` 两次预热。
+  - 未继续 F5-F7;T0.6/T0.7 仍冻结。
+- SceneCapture 近黑排查顺序:
+  - Step 1 关自动曝光:已设置 `r.DefaultFeature.AutoExposure=False` 与 `r.DefaultFeature.AutoExposure.ExtendDefaultLuminanceRange=False`。
+  - Step 2 灯光 mobility/recapture:已对 DirectionalLight/SkyLight 组件设 MOVABLE,并调用 SkyLight `recapture_sky()`。
+  - Step 3 预热:已双次 `capture_scene()`;首次有效验证图 `out/smoke/20260708T090441Z/frame_0000.png` 通过校验(`mean_luma=37.283`,`luma_stddev=29.667`,`ue_summary.error_count=0`)。
+  - Step 4 `SCS_BASE_COLOR` 排障:未触发,因为 Step 1-3 后 SceneCapture 正式路径已产出可见场景图。
+  - Step 5 HighResShot 退路:未触发,SceneCapture 路线已可用。
+- 验收产物:
+  - 命令:`.venv/bin/uef render smoke --timeout-sec 900` → 退出码 0
+  - 图:`out/smoke/20260708T090839Z/frame_0000.png`(1280x720,`mean_luma=30.990`,`luma_stddev=45.346`,min/max=0/149)
+  - Manifest:`out/smoke/20260708T090839Z/manifest.json`
+    - `status=ok`,`render_kind=scene`,`duration_sec=27.601`
+    - `ue_summary.error_count=0`,`warning_count=1298`
+    - `runtime.enabled=true`,`ddc_dir=/root/nas/bigdata1/cjw/projs/uefactory/data/ddc`,`ue_home=/root/nas/bigdata1/cjw/UE5Home`
+  - UE log:`out/smoke/20260708T090839Z/ue.log`
+  - 测试:`.venv/bin/python -m pytest tests/test_smoke_render.py -m ue` → 退出码 0,`1 passed, 3 deselected in 28.90s`
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    22 files already formatted
+    Success: no issues found in 20 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 9 items / 1 deselected / 8 selected
+
+    tests/test_config.py ...                                                 [ 37%]
+    tests/test_doctor.py .                                                   [ 50%]
+    tests/test_smoke_render.py ...                                           [ 87%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 8 passed, 1 deselected in 0.10s ========================
+    ```
+- 耗时/坑:
+  - UE 5.5 Python 绑定里的 SceneCapture2D 组件属性是 `capture_component2d`;误用 `scene_capture_component2d` 的首次运行只产生 Python AttributeError,未进入图像排查。
+  - 一次斜向相机构图尝试 `out/smoke/20260708T090629Z/frame_0000.png` 被校验器拒绝(`mean_luma=0.095`),原因是取景偏离几何;最终回到已验证的相机轴向,仅保守调整距离/FOV/Cube 尺寸。
+  - `/root/nas/fastdata2` 未使用;输出、DDC 和 ignored runtime 小依赖继续放在 `bigdata1`。
 - 待决问题:无
