@@ -318,3 +318,5 @@
   - 本轮 `uef render smoke` 过滤后仍有 6 条 `LogHttp`/proxy warning,未列为已知噪声,保留在 manifest 供正式 review 判断。
   - T0.6/T0.7 未解冻,没有触碰远程节点。
 - 待决问题:Q1-Q4 已登记在 `docs/QUESTIONS.md`,均不阻塞 M0 正式 review。
+
+REVIEW REQUESTED: feat/m0-skeleton 678ff46
