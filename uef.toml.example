@@ -1,9 +1,15 @@
 [core]
 ue_root = "/root/nas/bigdata1/cjw/UnrealEngine_5.5.4"
 ue_home = "/root/nas/bigdata1/cjw/UE5Home"
+
+# Runtime data is repo-relative by default and gitignored. Keep large caches,
+# render outputs, downloaded assets, and DDC on bigdata1 or another approved
+# bulk disk. Do not point these paths at /root/nas/fastdata2 unless Owner has
+# explicitly approved it.
 data_dir = "data"
 log_dir = "logs"
 ddc_dir = "data/ddc"
+
 # Optional local runtime dependency directory. Use only when the system loader is
 # unavailable; the current node needs this for libvulkan.so.1.
 # runtime_lib_dir = "data/runtime_deps/extracted/usr/lib/x86_64-linux-gnu"
@@ -11,6 +17,8 @@ ddc_dir = "data/ddc"
 [doctor]
 min_free_vram_gib = 8
 nas_warn_write_mbps = 200
+# Lower this with UEF_DOCTOR_WRITE_TEST_MIB=8 for a quick smoke check; keep the
+# config default large enough to catch slow DDC/output disks.
 write_test_mib = 512
 
 [hosts.4090]
@@ -21,6 +29,8 @@ gpu = "8x RTX 4090"
 
 [hosts.l40s]
 ssh_alias = "l40s"
+# This path is on l40s' own NAS. It is not the same filesystem as the local
+# /root/nas/bigdata1 path, even though the string looks similar.
 work_dir = "/root/nas/bigdata1/cjw/uef"
 engine_dir = "/root/nas/bigdata1/cjw/uef/engine"
 gpu = "1x L40S"
