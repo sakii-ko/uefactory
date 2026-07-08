@@ -38,7 +38,8 @@ def _create_sequence(job: dict):
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
         unreal.EditorAssetLibrary.delete_asset(asset_path)
 
-    materials = _create_materials(package_path)
+    lighting = job["lighting"]
+    materials = _create_materials(package_path, lighting_preset=str(lighting["preset"]))
     _create_object_mask_material(package_path)
     sequence = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
         asset_name,
@@ -75,6 +76,113 @@ def _create_sequence(job: dict):
         scale=(5.0, 5.0, 0.05),
         stencil_value=2,
     )
+    _configure_lighting(sequence, job, package_path)
+    _add_orbit_camera(sequence, job)
+
+    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    unreal.log(f"[UEF-RENDER-JOB] sequence={asset_path}.{asset_name}")
+    return sequence
+
+
+def _create_materials(package_path: str, *, lighting_preset: str) -> dict[str, object]:
+    cube_emissive = 10.0 if lighting_preset == "none" else 0.0
+    floor_emissive = 3.0 if lighting_preset == "none" else 0.0
+    return {
+        "cube": _create_lit_material(
+            package_path,
+            "UEF_Job_Cube_Mat",
+            (0.8, 0.18, 0.08),
+            emissive_strength=cube_emissive,
+        ),
+        "floor": _create_lit_material(
+            package_path,
+            "UEF_Job_Floor_Mat",
+            (0.42, 0.46, 0.50),
+            emissive_strength=floor_emissive,
+        ),
+    }
+
+
+def _create_lit_material(
+    package_path: str,
+    asset_name: str,
+    color: tuple[float, float, float],
+    *,
+    emissive_strength: float,
+):
+    asset_path = f"{package_path}/{asset_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        unreal.EditorAssetLibrary.delete_asset(asset_path)
+    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        asset_name,
+        package_path,
+        unreal.Material,
+        unreal.MaterialFactoryNew(),
+    )
+    if material is None:
+        raise RuntimeError(f"Could not create material: {asset_path}")
+    material.set_editor_property(
+        "shading_model",
+        unreal.MaterialShadingModel.MSM_UNLIT
+        if emissive_strength > 0
+        else unreal.MaterialShadingModel.MSM_DEFAULT_LIT,
+    )
+    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
+    color_node = unreal.MaterialEditingLibrary.create_material_expression(
+        material,
+        unreal.MaterialExpressionConstant3Vector,
+        -400,
+        0,
+    )
+    color_node.set_editor_property("constant", unreal.LinearColor(*color, 1.0))
+    if emissive_strength > 0:
+        emissive_color = unreal.MaterialEditingLibrary.create_material_expression(
+            material,
+            unreal.MaterialExpressionConstant3Vector,
+            -400,
+            180,
+        )
+        emissive_color.set_editor_property(
+            "constant",
+            unreal.LinearColor(
+                color[0] * emissive_strength,
+                color[1] * emissive_strength,
+                color[2] * emissive_strength,
+                1.0,
+            ),
+        )
+        unreal.MaterialEditingLibrary.connect_material_property(
+            emissive_color,
+            "",
+            unreal.MaterialProperty.MP_EMISSIVE_COLOR,
+        )
+    else:
+        unreal.MaterialEditingLibrary.connect_material_property(
+            color_node,
+            "",
+            unreal.MaterialProperty.MP_BASE_COLOR,
+        )
+    unreal.MaterialEditingLibrary.recompile_material(material)
+    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    return material
+
+
+def _configure_lighting(sequence, job: dict, package_path: str) -> None:
+    lighting = job["lighting"]
+    preset = str(lighting["preset"])
+    frames = int(job["frames"])
+    if preset == "three_point":
+        _add_three_point_lighting(sequence, frames=frames)
+    elif preset == "hdri":
+        texture = _import_hdri_texture(package_path, str(lighting["hdri_file"]))
+        _add_hdri_lighting(sequence, frames=frames, texture=texture)
+    elif preset == "none":
+        unreal.log("[UEF-RENDER-JOB] lighting preset none: no lights spawned")
+    else:
+        raise RuntimeError(f"Unsupported lighting preset: {preset}")
+
+
+def _add_three_point_lighting(sequence, *, frames: int) -> None:
     _add_directional_light_spawnable(
         sequence,
         frames=frames,
@@ -99,57 +207,44 @@ def _create_sequence(job: dict):
         rotation=(0, 0, 0),
         intensity=1.0,
     )
-    _add_orbit_camera(sequence, job)
-
-    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
-    unreal.log(f"[UEF-RENDER-JOB] sequence={asset_path}.{asset_name}")
-    return sequence
 
 
-def _create_materials(package_path: str) -> dict[str, object]:
-    return {
-        "cube": _create_lit_material(
-            package_path,
-            "UEF_Job_Cube_Mat",
-            unreal.LinearColor(0.8, 0.18, 0.08, 1.0),
-        ),
-        "floor": _create_lit_material(
-            package_path,
-            "UEF_Job_Floor_Mat",
-            unreal.LinearColor(0.42, 0.46, 0.50, 1.0),
-        ),
-    }
+def _add_hdri_lighting(sequence, *, frames: int, texture) -> None:
+    _add_sky_light_spawnable(
+        sequence,
+        frames=frames,
+        label="UEF_Job_HDRISkyLight",
+        location=(0, 0, 250),
+        rotation=(0, 0, 0),
+        intensity=2.5,
+        cubemap=texture,
+    )
 
 
-def _create_lit_material(package_path: str, asset_name: str, color):
-    asset_path = f"{package_path}/{asset_name}"
+def _import_hdri_texture(package_path: str, hdri_file: str):
+    source = Path(hdri_file)
+    if not source.exists():
+        raise RuntimeError(f"HDRI file not found: {source}")
+    destination_path = f"{package_path}/Lighting"
+    asset_name = source.stem
+    asset_path = f"{destination_path}/{asset_name}"
+    unreal.EditorAssetLibrary.make_directory(destination_path)
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
         unreal.EditorAssetLibrary.delete_asset(asset_path)
-    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
-        asset_name,
-        package_path,
-        unreal.Material,
-        unreal.MaterialFactoryNew(),
-    )
-    if material is None:
-        raise RuntimeError(f"Could not create material: {asset_path}")
-    material.set_editor_property("shading_model", unreal.MaterialShadingModel.MSM_DEFAULT_LIT)
-    material.set_editor_property("blend_mode", unreal.BlendMode.BLEND_OPAQUE)
-    color_node = unreal.MaterialEditingLibrary.create_material_expression(
-        material,
-        unreal.MaterialExpressionConstant3Vector,
-        -400,
-        0,
-    )
-    color_node.set_editor_property("constant", color)
-    unreal.MaterialEditingLibrary.connect_material_property(
-        color_node,
-        "",
-        unreal.MaterialProperty.MP_BASE_COLOR,
-    )
-    unreal.MaterialEditingLibrary.recompile_material(material)
-    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
-    return material
+    task = unreal.AssetImportTask()
+    task.set_editor_property("filename", str(source))
+    task.set_editor_property("destination_path", destination_path)
+    task.set_editor_property("destination_name", asset_name)
+    task.set_editor_property("automated", True)
+    task.set_editor_property("save", True)
+    task.set_editor_property("replace_existing", True)
+    unreal.AssetToolsHelpers.get_asset_tools().import_asset_tasks([task])
+    texture = unreal.load_asset(asset_path)
+    if texture is None:
+        raise RuntimeError(f"Could not import HDRI texture: {source}")
+    if texture.get_class().get_name() != "TextureCube":
+        raise RuntimeError(f"HDRI import did not produce TextureCube: {texture.get_path_name()}")
+    return texture
 
 
 def _create_object_mask_material(package_path: str):
@@ -266,6 +361,7 @@ def _add_sky_light_spawnable(
     location: tuple[float, float, float],
     rotation: tuple[float, float, float],
     intensity: float,
+    cubemap=None,
 ):
     binding = sequence.add_spawnable_from_class(unreal.SkyLight)
     binding.set_display_name(label)
@@ -277,6 +373,14 @@ def _add_sky_light_spawnable(
     )
     _set_movable(actor)
     actor.light_component.set_editor_property("intensity", intensity)
+    if cubemap is not None:
+        actor.light_component.set_editor_property(
+            "source_type",
+            unreal.SkyLightSourceType.SLS_SPECIFIED_CUBEMAP,
+        )
+        actor.light_component.set_editor_property("cubemap", cubemap)
+        actor.light_component.set_editor_property("lower_hemisphere_is_black", False)
+        actor.light_component.set_editor_property("real_time_capture", False)
     return binding
 
 

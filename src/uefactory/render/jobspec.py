@@ -25,6 +25,7 @@ class CameraSpec:
 @dataclass(frozen=True)
 class LightingSpec:
     preset: str
+    hdri: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,13 +91,20 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
         raise JobSpecError("$.camera.fov: expected value in [10, 120]")
 
     lighting_raw = _mapping(root["lighting"], "$.lighting")
-    _require_keys(lighting_raw, {"preset"}, "$.lighting")
+    _require_keys(lighting_raw, {"preset"}, "$.lighting", optional={"hdri"})
+    preset = _enum(
+        _string(lighting_raw["preset"], "$.lighting.preset"),
+        {"hdri", "three_point", "none"},
+        "$.lighting.preset",
+    )
+    hdri = None
+    if preset == "hdri":
+        hdri = _string(lighting_raw.get("hdri", "studio_small_03_1k"), "$.lighting.hdri")
+    elif "hdri" in lighting_raw:
+        raise JobSpecError("$.lighting.hdri: only valid when preset is 'hdri'")
     lighting = LightingSpec(
-        preset=_enum(
-            _string(lighting_raw["preset"], "$.lighting.preset"),
-            {"three_point"},
-            "$.lighting.preset",
-        )
+        preset=preset,
+        hdri=hdri,
     )
 
     passes = tuple(_string_list(root["passes"], "$.passes", min_len=1))
@@ -127,10 +135,16 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
     )
 
 
-def _require_keys(value: dict[str, Any], required: set[str], path: str) -> None:
+def _require_keys(
+    value: dict[str, Any],
+    required: set[str],
+    path: str,
+    *,
+    optional: set[str] | None = None,
+) -> None:
     keys = set(value)
     missing = sorted(required - keys)
-    extra = sorted(keys - required)
+    extra = sorted(keys - required - (optional or set()))
     if missing:
         raise JobSpecError(f"{path}: missing required key {missing[0]!r}")
     if extra:

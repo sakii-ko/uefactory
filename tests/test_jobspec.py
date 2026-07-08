@@ -47,6 +47,26 @@ def test_parse_jobspec_accepts_t14_all_passes() -> None:
     assert spec.passes == PASS_ORDER
 
 
+def test_parse_jobspec_accepts_t15_hdri_lighting() -> None:
+    raw = valid_jobspec()
+    raw["lighting"] = {"preset": "hdri", "hdri": "studio_small_03_1k"}
+
+    spec = parse_jobspec(raw, source_path=Path("examples/orbit8_hdri.yaml"))
+
+    assert spec.lighting.preset == "hdri"
+    assert spec.lighting.hdri == "studio_small_03_1k"
+
+
+def test_parse_jobspec_accepts_t15_none_lighting() -> None:
+    raw = valid_jobspec()
+    raw["lighting"] = {"preset": "none"}
+
+    spec = parse_jobspec(raw, source_path=Path("examples/orbit8_none.yaml"))
+
+    assert spec.lighting.preset == "none"
+    assert spec.lighting.hdri is None
+
+
 @pytest.mark.parametrize(
     ("patch", "message"),
     [
@@ -57,7 +77,8 @@ def test_parse_jobspec_accepts_t14_all_passes() -> None:
         ({"camera": {"fov": 9}}, "$.camera.fov"),
         ({"camera": {"resolution": [640]}}, "$.camera.resolution"),
         ({"assets": ["chair_001"]}, "$.assets"),
-        ({"lighting": {"preset": "hdri"}}, "$.lighting.preset"),
+        ({"lighting": {"preset": "unlit"}}, "$.lighting.preset"),
+        ({"lighting": {"preset": "three_point", "hdri": "studio_small_03_1k"}}, "$.lighting.hdri"),
         ({"passes": ["not_a_pass"]}, "$.passes[0]"),
         ({"passes": ["beauty_lit", "beauty_lit"]}, "$.passes[1]"),
     ],

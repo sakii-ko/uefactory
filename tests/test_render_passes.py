@@ -83,6 +83,36 @@ def test_assert_passes_distinct_rejects_pixel_identical_pngs(tmp_path: Path) -> 
         )
 
 
+def test_validate_beauty_lit_none_accepts_small_emissive_region(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.png"
+    image = Image.new("RGB", (16, 16), (0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((7, 7, 8, 8), fill=(255, 191, 64))
+    image.save(frame)
+
+    result = validate_render_pass(
+        "beauty_lit",
+        [frame],
+        expected_frames=1,
+        lighting_preset="none",
+    )
+
+    assert result.frames[0].max == (255.0, 191.0, 64.0)
+
+
+def test_validate_beauty_lit_none_rejects_no_emissive_highlight(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.png"
+    Image.new("RGB", (16, 16), (8, 8, 8)).save(frame)
+
+    with pytest.raises(RuntimeError, match="lacks emissive highlights"):
+        validate_render_pass(
+            "beauty_lit",
+            [frame],
+            expected_frames=1,
+            lighting_preset="none",
+        )
+
+
 def _write_rgb_gradient(path: Path) -> None:
     image = Image.new("RGB", (8, 8), (0, 0, 0))
     draw = ImageDraw.Draw(image)

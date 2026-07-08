@@ -89,6 +89,7 @@ def validate_render_pass(
     frame_paths: list[Path],
     *,
     expected_frames: int,
+    lighting_preset: str = "three_point",
 ) -> PassValidation:
     if pass_name not in SUPPORTED_PASSES:
         raise ValueError(f"Unsupported render pass: {pass_name}")
@@ -104,7 +105,7 @@ def validate_render_pass(
         )
 
     frames = tuple(_frame_stats(pass_name, path) for path in frame_paths)
-    _assert_pass_quality(pass_name, frames)
+    _assert_pass_quality(pass_name, frames, lighting_preset=lighting_preset)
     return PassValidation(
         pass_name=pass_name,
         format=fmt,
@@ -208,9 +209,14 @@ def _exr_frame_stats(pass_name: str, frame_path: Path) -> PassFrameStats:
     )
 
 
-def _assert_pass_quality(pass_name: str, frames: tuple[PassFrameStats, ...]) -> None:
+def _assert_pass_quality(
+    pass_name: str,
+    frames: tuple[PassFrameStats, ...],
+    *,
+    lighting_preset: str,
+) -> None:
     if pass_name in {"beauty_lit", "beauty_unlit", "basecolor"}:
-        _assert_rgb_non_dark_non_uniform(pass_name, frames)
+        _assert_rgb_non_dark_non_uniform(pass_name, frames, lighting_preset=lighting_preset)
     elif pass_name == "depth":
         _assert_depth_gradient(frames)
     elif pass_name == "normal":
@@ -219,10 +225,18 @@ def _assert_pass_quality(pass_name: str, frames: tuple[PassFrameStats, ...]) -> 
         _assert_object_mask_values(frames)
 
 
-def _assert_rgb_non_dark_non_uniform(pass_name: str, frames: tuple[PassFrameStats, ...]) -> None:
+def _assert_rgb_non_dark_non_uniform(
+    pass_name: str,
+    frames: tuple[PassFrameStats, ...],
+    *,
+    lighting_preset: str,
+) -> None:
     for frame in frames:
         mean_luma = 0.2126 * frame.mean[0] + 0.7152 * frame.mean[1] + 0.0722 * frame.mean[2]
-        if mean_luma <= 5:
+        if lighting_preset == "none" and pass_name == "beauty_lit":
+            if max(frame.max) <= 32:
+                raise RuntimeError(f"{pass_name}: {frame.frame} lacks emissive highlights")
+        elif mean_luma <= 5:
             raise RuntimeError(f"{pass_name}: {frame.frame} is too dark mean_luma={mean_luma:.3f}")
         if max(frame.stddev) <= 1:
             raise RuntimeError(f"{pass_name}: {frame.frame} is too uniform stddev={frame.stddev}")

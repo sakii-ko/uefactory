@@ -70,7 +70,7 @@ def render_job(
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
 
-    ue_job = _ue_job_payload(spec, run_id, run_dir, sequence_path)
+    ue_job = _ue_job_payload(settings, spec, run_id, run_dir, sequence_path)
     ue_job_path.write_text(json.dumps(ue_job, indent=2, sort_keys=True), encoding="utf-8")
 
     ddc_dir = settings.ddc_dir or settings.data_dir / "ddc"
@@ -191,6 +191,7 @@ def render_job(
             pass_name,
             paths,
             expected_frames=spec.frame_count,
+            lighting_preset=spec.lighting.preset,
         )
         for pass_name, paths in frame_paths.items()
     }
@@ -246,6 +247,7 @@ def compare_job_luma(first: RenderJobResult, second: RenderJobResult) -> dict[st
 
 
 def _ue_job_payload(
+    settings: Settings,
     spec: RenderJobSpec,
     run_id: str,
     run_dir: Path,
@@ -263,7 +265,7 @@ def _ue_job_payload(
         },
         "frames": spec.frame_count,
         "job": spec.raw,
-        "lighting": {"preset": spec.lighting.preset},
+        "lighting": _lighting_payload(settings, spec),
         "out_dir": str(run_dir),
         "passes": list(spec.passes),
         "render_kind": "job",
@@ -271,6 +273,20 @@ def _ue_job_payload(
         "schema_version": 2,
         "sequence_path": sequence_path,
     }
+
+
+def _lighting_payload(settings: Settings, spec: RenderJobSpec) -> dict[str, Any]:
+    payload = {"preset": spec.lighting.preset, "hdri": spec.lighting.hdri}
+    if spec.lighting.preset == "hdri":
+        if spec.lighting.hdri is None:
+            raise ValueError("HDRI lighting requires hdri id")
+        hdri_file = settings.data_dir / "hdri" / f"{spec.lighting.hdri}.hdr"
+        if not hdri_file.exists():
+            raise FileNotFoundError(
+                f"HDRI file not found: {hdri_file}; run `uef acquire hdri` first"
+            )
+        payload["hdri_file"] = str(hdri_file)
+    return payload
 
 
 def _summary_payload(result: Any) -> dict[str, Any]:
