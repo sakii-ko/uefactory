@@ -1,0 +1,1 @@
+"""Asset acquisition modules."""

@@ -23,3 +23,83 @@
 ---
 
 (暂无条目 —— M0 开工后从这里开始)
+
+## [2026-07-08] T0.1 Python 包骨架 + uef doctor — DONE
+- 分支/commit: feat/m0-skeleton @ 待提交
+- 做了什么:
+  - 建立 `pyproject.toml`、`src/uefactory/` 包结构和 `uef` Typer CLI 入口,版本为 `0.1.0`。
+  - 配置统一收口到 `core/config.py`,优先级为 `UEF_*` 环境变量 > `uef.toml` > 默认值。
+  - 日志统一由 `core/log.py` 初始化,每次 CLI 调用写 `logs/<UTC时间戳>_<命令>.log`,终端 INFO、文件 DEBUG。
+  - `uef doctor` 检查 UE 5.5.4、GPU、Vulkan、磁盘/写速、本地候选盘和 Python 版本,支持 `--json`。
+- 验收产物:
+  - 命令:`.venv/bin/uef --version` → 退出码 0,输出 `0.1.0`
+  - 命令:`.venv/bin/uef doctor` → 退出码 0
+  - 日志:`logs/20260708T061918Z_doctor.log`
+  - 测试:`tools/check.sh` 全绿,summary:
+    ```text
+    All checks passed!
+    15 files already formatted
+    Success: no issues found in 15 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 4 items
+
+    tests/test_config.py ...                                                 [ 75%]
+    tests/test_doctor.py .                                                   [100%]
+
+    ============================== 4 passed in 0.04s ===============================
+    ```
+- 终端输出:
+  ```text
+  CHECK          STATUS  MESSAGE
+  -------------  ------  ------------------------------------------------------------------------
+  unreal_engine  OK      UE 5.5.4 found
+  gpu            OK      1 GPU(s) available
+  vulkan         WARN    NVIDIA Vulkan ICD exists; vulkaninfo not installed
+  disk           WARN    Disk checks passed with storage warnings; DDC should prefer a local disk
+  python         OK      Python 3.13.13
+
+  Overall: WARN
+  ```
+- JSON 验证:
+  - 命令:`.venv/bin/uef doctor --json > /tmp/uef_doctor_t01.json && .venv/bin/python -m json.tool /tmp/uef_doctor_t01.json`
+  - 退出码 0;schema_version=1,status=WARN。
+  - UE:`/root/nas/bigdata1/cjw/UnrealEngine_5.5.4`,Build.version=5.5.4,Changelist=40574608。
+  - GPU:NVIDIA H100 80GB HBM3,driver 580.126.20,total 81559 MiB,free 11865 MiB(11.59 GiB)。
+  - Vulkan:`/etc/vulkan/icd.d/nvidia_icd.json` 存在;`vulkaninfo` 未安装(WARN)。
+  - 磁盘:repo/data/default DDC 都在 Ceph `/root/nas/bigdata1`;512 MiB 写速分别为 155.32 / 151.39 / 148.65 MB/s,低于 200 MB/s(WARN)。
+  - 候选本地盘:`/anc-init` ext4;网络/共享挂载:`/root/public` fuse.dingofs、`/root/nas/bigdata1` ceph、`/root/nas/fastdata2` gpfs。
+- 耗时/坑:
+  - `uef doctor --json` 完整 512 MiB 写速测试耗时 10.516s。
+  - pre-commit 首次用远端 `ruff-pre-commit` 初始化时 GitHub 访问卡住,改成本地 hook,直接调用 `.venv/bin/python -m ruff`。
+- 待决问题:无
+
+## [2026-07-08] T0.4 工程质量基建 — DONE
+- 分支/commit: feat/m0-skeleton @ 待提交
+- 做了什么:
+  - 在 `pyproject.toml` 配置 ruff(lint+format)、mypy 和 pytest;默认 pytest 跳过 `ue`/`net` 标记。
+  - 新增 `tools/check.sh`,优先使用 `.venv/bin/python`,顺序执行 ruff check、ruff format --check、mypy、pytest。
+  - 新增 `.pre-commit-config.yaml` 和 `tools/forbid_main_commit.sh`,本地 hook 包含 ruff、format check、禁止 main 直接提交。
+- 验收产物:
+  - 命令:`tools/check.sh` → 退出码 0,输出见 T0.1 summary。
+  - 命令:`.venv/bin/pre-commit install` → 退出码 0,输出 `pre-commit installed at .git/hooks/pre-commit`
+  - 命令:`.venv/bin/pre-commit run --all-files` → 退出码 0;当前新增文件尚未进入 git 索引时 ruff hook skipped,禁止 main hook passed。
+- 反例校验:
+  ```text
+  F401 [*] `os` imported but unused
+   --> /tmp/uef_ruff_bad_demo.py:1:8
+    |
+  1 | import os
+    |        ^^
+    |
+  help: Remove unused import: `os`
+
+  Found 1 error.
+  [*] 1 fixable with the `--fix` option.
+  ```
+- 耗时/坑:
+  - 直接用系统 `python` 跑 check 会找不到 venv 内的 ruff,已改为优先 `.venv/bin/python`。
+- 待决问题:无
