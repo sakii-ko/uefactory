@@ -13,6 +13,9 @@ LOGGER = logging.getLogger(__name__)
 
 KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
     "directory_watcher": ("LogDirectoryWatcher: Warning:",),
+    "unreal_trace_server_startup": (
+        "LogCore: Warning: UTS: Unreal Trace Server process returned an error",
+    ),
     "missing_editor_icon": ("LogStreaming: Warning: Failed to read file", ".png"),
     "usd_plugin_metadata_write_permission": (
         "Warning:",
@@ -31,6 +34,11 @@ KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
     "mrq_output_path_probe": (
         "LogCore: Warning: Unable to statfs(",
         "out/mrq_spike/",
+        "errno=2 (No such file or directory)",
+    ),
+    "mrq_render_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "out/renders/",
         "errno=2 (No such file or directory)",
     ),
 }
