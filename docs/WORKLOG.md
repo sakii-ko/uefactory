@@ -438,3 +438,35 @@ REVIEW REQUESTED: feat/m0-remote 0fd6ae6
 - 待决问题:无
 
 REVIEW REQUESTED: feat/m0-remote d64848b
+
+## [2026-07-08] T0.7 review #4 fixes(F10/F11/F12) — DONE
+- 分支/commit:
+  - 修复: feat/m0-remote @ f19bbeb
+- 做了什么:
+  - F10:在 `DefaultEngine.ini` 关闭 on-screen debug messages;`uef_smoke.py` 启动时执行 `DisableAllScreenMessages`,并在远景放置 `UEF_Smoke_Backdrop` 遮挡模板 skydome 暴露区域,避免 l40s offscreen capture 出现黄字污染。
+  - F11:远程 smoke 清理后把 `cleanup.removed_paths`、`cleanup.verified`、`verify_returncode` 写回本地 manifest;测试覆盖 cleanup manifest 证据。
+  - F11:清理 l40s 旧 provision 空目录 `/root/nas/bigdata1/cjw/uef/jobs/provision_l40s_20260708T120419Z`,复核 `test ! -e ... && printf cleaned` → `cleaned`。
+  - F12:4090 顺延理由按 review 修正为 WAN engine transfer 约 `3.414 MiB/s` 会占用数小时且 M0 收尾优先;本轮仍做轻量探测,结果为 `kex_exchange_identification: Connection closed by remote host`(rc=255,duration=1.109s),不再把 SSH 不可能连接作为顺延主理由。
+- 本地 smoke 复验:
+  - 命令:`.venv/bin/uef render smoke --timeout-sec 1800` → 退出码 0
+  - 图:`out/smoke/20260708T163651Z/frame_0000.png`(1280x720,`mean_luma=36.866`,`luma_stddev=15.877`,min/max=0/144);目检无 skydome/debug 文本。
+  - Manifest:`out/smoke/20260708T163651Z/manifest.json`,`status=ok`,`render_kind=scene`,`duration_sec=30.203`,`ue_summary.error_count=0`,`warning_count=0`。
+- l40s 远程 smoke 复验:
+  - 命令:`.venv/bin/uef render smoke --host l40s --timeout-sec 1800` → 退出码 0
+  - 图:`out/smoke/20260708T163802Z/frame_0000.png`(1280x720,`mean_luma=35.608`,`luma_stddev=11.88`,min/max=0/93);目检无 skydome/debug 文本。
+  - Manifest:`out/smoke/20260708T163802Z/manifest.json`
+    - `status=ok`,`render_kind=scene`,`remote_host=l40s`,`job_id=smoke_l40s_20260708T163802Z`,`run_user=uef`
+    - `local_validation.status=ok`,`validated_utc=20260708T163905Z`
+    - `cleanup.status=ok`,`cleanup.verified=true`,`cleanup.verify_returncode=0`
+    - `cleanup.removed_paths=["/root/nas/bigdata1/cjw/uef/jobs/smoke_l40s_20260708T163802Z"]`
+    - `ue_summary.error_count=0`,`warning_count=0`;noise 仍保留为 `error_noise_count=14`,`warning_noise_count=338`
+  - 无前台 SSH 挂住证据:CLI 只启动 `tmux new-session -d -s uef_smoke_l40s_20260708T163802Z`,随后 16:38:03/16:38:33/16:39:03 做短 status poll,拉回产物后 16:39:05 删除并复核远端 job 目录。
+- 测试:
+  - `tools/check.sh` → 退出码 0
+  - summary:`29 files already formatted`;`mypy` success;`23 passed, 1 deselected in 0.16s`
+- 耗时/坑:
+  - 直接删除模板 sky/atmosphere/fog/light actor 会让本地 SceneCapture 退回近黑图(`out/smoke/20260708T163413Z/frame_0000.png`,mean_luma=0.095),已废弃该方案;最终保留模板环境,只屏蔽/遮挡屏幕文本来源。
+  - 未使用 `/root/nas/fastdata2` 存储 engine、DDC、产物或临时大文件。
+- 待决问题:4090 provision/smoke 按 PLAN 顺延为 M1 首任务,顺延主因是 WAN 大包传输耗时与 M0 closeout 优先级。
+
+REVIEW REQUESTED: feat/m0-remote f19bbeb
