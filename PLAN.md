@@ -55,7 +55,7 @@
 | **M0 骨架与冒烟渲染** | `uef` CLI 骨架、`uef doctor`、headless 渲出第一张非全黑图 | pytest 全绿;`out/smoke/` 有 PNG + manifest + 日志 |
 | **M1 渲染服务 v1** | JobSpec(YAML)→ MRQ 渲染:多 pass、orbit 相机、光照预设、contact sheet;本地/远程节点同一入口 | 同一资产渲出 lit/unlit/depth/normal 四通道 × 8 视角,且在 4090 节点跑通 |
 | **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图 | 10 个杂源模型一键入库,catalog 可查,缩略图正确 |
-| **M3 持续获取** | PolyHaven / Objaverse 抓取器、许可证过滤、增量调度 | 无人值守跑 24h,只入 CC0/CC-BY,断点续传可用 |
+| **M3 持续获取** | 按 `docs/ASSET_ACQUISITION.md` 五腿战略:PolyHaven adapter 打样 → Objaverse LVIS 灌库 → 质量门禁/去重 → 每日增量调度 | 无人值守跑 24h;license 三档(open/nc/ue-only)全程可追溯;catalog stats 报告可读 |
 | **M4 农场化** | 作业队列、**多节点池调度**(本机 + 4090 + l40s)、失败重试、HTML 统计报告 | 100 资产 × 全通道批渲无人值守完成(跨节点),报告可读 |
 | **M5 UnrealZoo 化(后议)** | 交互控制 / 场景组合 / gym 接口 | 待 Owner 定义 |
 
@@ -141,5 +141,7 @@
 
 - A1:引擎用已就位的 **UE 5.5.4 预编译 Linux 版**,不自己编引擎(ADR-001)。
 - A2:资产用途按"研究/内部数据生产"处理,商用合规问题出现时再升级。
-- A3:优先接入的外部资产源顺序:PolyHaven(CC0,API 友好)→ Objaverse → Sketchfab(需 API key)。
+- A3:资产供给按 `docs/ASSET_ACQUISITION.md` 五腿战略执行(存量数据集 / API 抓取 / UE 生态半人工 /
+  程序化生成 / AIGC 定向补货 + 变体增殖);接入顺序 PolyHaven → Objaverse LVIS → Sketchfab。
+  该文档 §4 有四个待 Owner 拍板项(nc 档收不收、Fab 人工通道、AIGC 许可尺度、Objaverse-XL 范围)。
 - A4:渲染主力管线 M1 起用 MovieRenderQueue(ADR-002)。
