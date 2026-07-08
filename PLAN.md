@@ -48,6 +48,8 @@
 **流程**:Coder 从 `main` 切 `feat/m0-<slug>` 分支 → 按任务提交(Conventional Commits)→
 任务全部 DoD 达成后在 WORKLOG 登记并请求 review → Planner review → 通过后由 Planner 合入 `main` 并打 tag。
 详细 git / 代码规范见 `docs/CONVENTIONS.md`,**开工前先读完它**。
+**互相通知走信号机制**(2026-07-08 起,Owner 不再中转):协议见 `docs/SIGNALS.md`——
+push 完发 `tools/signal.sh planner REVIEW_REQUESTED`,收到 `REVIEW_DONE` 信号后 pull 并读 review。
 
 ## 3. 里程碑路线图
 
