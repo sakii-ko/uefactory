@@ -42,8 +42,14 @@
 
 ## 5. Git 规范(严格执行)
 
-**身份**:开工前设置 `git config user.name "<你的名字>" && git config user.email "<你的邮箱>"`。
-Planner 的提交署名 `UEF-Planner`。身份混用会导致 blame/credit 失真,发现即打回。
+**身份**:所有提交的作者统一为 Owner 的 GitHub 账号——
+`git config user.name "sakii-ko" && git config user.email "chijw2004@outlook.com"`(repo 级已配)。
+**角色区分改用 commit trailer**(消息末尾,与 Co-Authored-By 并列):
+- Planner 的提交:`Role: Planner`
+- Coder 的提交:`Role: Coder`
+blame/credit 按 trailer 统计(`git log --format='%h %(trailers:key=Role,valueonly)'`);
+漏写 trailer 视同规范违规,review 时打回。AI 参与的提交保留
+`Co-Authored-By: Claude ... <noreply@anthropic.com>` 尾注。
 
 **分支**:
 - `main`:只有 Planner 在 review 通过后合入(`merge --no-ff`),Coder 永远不直接 push main。
