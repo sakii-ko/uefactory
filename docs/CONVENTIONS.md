@@ -42,14 +42,12 @@
 
 ## 5. Git 规范(严格执行)
 
-**身份**:所有提交的作者统一为 Owner 的 GitHub 账号——
-`git config user.name "sakii-ko" && git config user.email "chijw2004@outlook.com"`(repo 级已配)。
-**角色区分改用 commit trailer**(消息末尾,与 Co-Authored-By 并列):
-- Planner 的提交:`Role: Planner`
-- Coder 的提交:`Role: Coder`
-blame/credit 按 trailer 统计(`git log --format='%h %(trailers:key=Role,valueonly)'`);
-漏写 trailer 视同规范违规,review 时打回。AI 参与的提交保留
-`Co-Authored-By: Claude ... <noreply@anthropic.com>` 尾注。
+**身份**(2026-07-08 Owner 定):**作者字段即角色标识**——
+- Planner 的提交:`sakii-ko <chijw2004@outlook.com>`(repo 级 git config 已按此配置);
+- Coder 的提交:`chijw`(Coder 自己的既有身份;在本 checkout 提交时注意确认 `git config user.name`
+  或环境变量生效的是自己的身份,别被 repo 级配置带偏)。
+blame/credit 直接按作者统计(`git shortlog -sne`)。Role trailer 不强制(历史提交里出现的无需清理)。
+AI 参与的提交保留 `Co-Authored-By: Claude ... <noreply@anthropic.com>` 尾注。
 
 **分支**:
 - `main`:只有 Planner 在 review 通过后合入(`merge --no-ff`),Coder 永远不直接 push main。
