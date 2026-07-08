@@ -7,3 +7,7 @@
   - C. HighResShot 截屏:最简单,只有 beauty,无法出通道。
 - 决定:M1 起生产管线用 **A(MRQ)**;**M0 冒烟测试允许用 C**,目的只是验证"headless 引擎能出一张非全黑的图",不代表最终管线。B 作为 MRQ 在 headless 下遇到硬坑时的退路。
 - 后果:M1 需要验证 MRQ 在 `-game -RenderOffscreen` 下各通道可用性,验证结论(哪些 flag 必需)必须写进 WORKLOG;若 MRQ 不可行,切 B 需新 ADR。
+- **修订(2026-07-08,T0.3 完成后)**:M0 冒烟实际落地为 **B 变体(SceneCapture2D + RenderTarget 导出)**,
+  编辑器 `-ExecutePythonScript` 模式;关键前提:`r.DefaultFeature.AutoExposure=False`、灯光/捕捉组件
+  MOVABLE、双次 capture 预热(详见 review #3 与 WORKLOG)。C(HighResShot)未启用。
+  两次运行 mean_luma 逐位一致——**确定性渲染自此为必须保持的不变量**。MRQ 仍为 M1 生产路线不变。
