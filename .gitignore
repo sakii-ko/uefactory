@@ -29,3 +29,6 @@ ue/UEFBase/Content/*
 .DS_Store
 .idea/
 .vscode/
+
+# 协作信号(运行时,不入库)
+signals/
