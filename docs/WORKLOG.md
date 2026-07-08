@@ -273,3 +273,48 @@
   - 不用 chmod 0555 模拟只读目录,因为当前权限/用户模型可能绕过目录权限;测试改为 monkeypatch `tempfile.mkstemp` 抛 `PermissionError`,精确覆盖 finally bug。
   - 本轮未继续 T0.6/T0.7,也未动远程节点。
 - 待决问题:无
+
+## [2026-07-08] T0.5 M0 收尾 — DONE
+- 分支/commit: feat/m0-skeleton @ 768e90b
+- 做了什么:
+  - 清理 F8 杂项:GPU 低显存文案使用配置阈值;`_engine_version` 对缺失/坏 JSON fail-fast;`render_smoke` 统一 `_finalize_manifest` 出口;UE log error 判断去掉重复分支;CLI settings helper 合并到 `cli/_common.py`;`forbid_main_commit.sh` 增加 `UEF_ALLOW_MAIN=1` 逃生口。
+  - 落实 review #3 NIT:`uef_smoke.py` 的 mobility 设置失败改为 raise,不再 warning 后继续;UE warning 摘要增加已知噪声过滤清单,DirectoryWatcher 与缺图标 warning 进入 `warning_noise`。
+  - 清点 QUESTIONS:登记 `docs/ASSET_ACQUISITION.md` §4 的四个 Owner 待拍板项(Q1-Q4);均不阻塞 M0/M1/M2。
+  - M0 产物索引:CLI/doctor/config/log 基建(T0.1/T0.4),UEFBase 工程(T0.2),确定性 SceneCapture 冒烟渲染(T0.3),F5-F7 review 修正,T0.5 收尾全部在 WORKLOG 有证据记录。
+- 验收产物:
+  - 命令:`.venv/bin/uef render smoke --timeout-sec 900` → 退出码 0
+  - 图:`out/smoke/20260708T095059Z/frame_0000.png`(1280x720,`mean_luma=30.990`,`luma_stddev=45.346`,min/max=0/149)
+  - Manifest:`out/smoke/20260708T095059Z/manifest.json`
+    - `status=ok`,`render_kind=scene`,`duration_sec=59.108`
+    - `ue_summary.error_count=0`,`warning_count=6`,`warning_noise_count=1298`
+    - `warning_noise.directory_watcher=1293`,`warning_noise.missing_editor_icon=5`
+  - UE log:`out/smoke/20260708T095059Z/ue.log`
+  - 测试:`.venv/bin/python -m pytest tests/test_smoke_render.py -m ue` → 退出码 0,`1 passed, 4 deselected in 26.67s`
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    25 files already formatted
+    Success: no issues found in 23 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 14 items / 1 deselected / 13 selected
+
+    tests/test_config.py ...                                                 [ 23%]
+    tests/test_doctor.py ....                                                [ 53%]
+    tests/test_smoke_render.py ....                                          [ 84%]
+    tests/test_tools.py .                                                    [ 92%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 13 passed, 1 deselected in 0.12s =======================
+    ```
+- 给 M1 的建议:
+  - 保持 T0.3 建立的确定性不变量:固定曝光、固定采样/预热策略,渲染参数变更若破坏确定性需记录原因。
+  - MRQ 多通道实现复用 `run_ue`、manifest 校验和 `warning_noise` 结构;新增 warning 类型不要直接吞,先列入清单再过滤。
+  - 继续避免 `/root/nas/fastdata2` 存放 DDC/输出/资产缓存;大数据仍默认落 `bigdata1` 或后续经 Owner 批准的节点目录。
+- 耗时/坑:
+  - 本轮 `uef render smoke` 过滤后仍有 6 条 `LogHttp`/proxy warning,未列为已知噪声,保留在 manifest 供正式 review 判断。
+  - T0.6/T0.7 未解冻,没有触碰远程节点。
+- 待决问题:Q1-Q4 已登记在 `docs/QUESTIONS.md`,均不阻塞 M0 正式 review。
