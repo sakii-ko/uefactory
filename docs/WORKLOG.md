@@ -236,3 +236,40 @@
   - 一次斜向相机构图尝试 `out/smoke/20260708T090629Z/frame_0000.png` 被校验器拒绝(`mean_luma=0.095`),原因是取景偏离几何;最终回到已验证的相机轴向,仅保守调整距离/FOV/Cube 尺寸。
   - `/root/nas/fastdata2` 未使用;输出、DDC 和 ignored runtime 小依赖继续放在 `bigdata1`。
 - 待决问题:无
+
+## [2026-07-08] F5-F7 中期 review 修正 — DONE
+- 分支/commit:
+  - F5: feat/m0-skeleton @ dcfa5fa
+  - F6: feat/m0-skeleton @ d0f4342
+  - F7: feat/m0-skeleton @ 522300e
+- 做了什么:
+  - F5:doctor 写速测试从 `float | None` 改为结构化 `WriteSpeedResult`;`mkstemp` 失败时不再尝试 unlink `Path('.')`,并让 `check_disk` 对不可写候选路径/写速测试失败返回 FAIL。
+  - F6:`UEF_DOCTOR_WRITE_TEST_MIB` 收口进 `DoctorConfig.write_test_mib`,支持 TOML `[doctor].write_test_mib` 与 env 覆盖;doctor 不再直接读取环境变量。
+  - F7:将 mount 解析、网络文件系统判断、本地候选盘判断、写速测试抽到 `core/sysinfo.py`,doctor 保留检查编排和呈现。
+- 验收产物:
+  - F5 测试:`.venv/bin/python -m pytest tests/test_doctor.py` → 退出码 0,`3 passed`
+  - F6 测试:`.venv/bin/python -m pytest tests/test_config.py tests/test_doctor.py` → 退出码 0,`6 passed`
+  - F7 测试:`.venv/bin/python -m pytest tests/test_doctor.py` → 退出码 0,`3 passed`
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    23 files already formatted
+    Success: no issues found in 21 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 11 items / 1 deselected / 10 selected
+
+    tests/test_config.py ...                                                 [ 30%]
+    tests/test_doctor.py ...                                                 [ 60%]
+    tests/test_smoke_render.py ...                                           [ 90%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 10 passed, 1 deselected in 0.60s =======================
+    ```
+- 耗时/坑:
+  - 不用 chmod 0555 模拟只读目录,因为当前权限/用户模型可能绕过目录权限;测试改为 monkeypatch `tempfile.mkstemp` 抛 `PermissionError`,精确覆盖 finally bug。
+  - 本轮未继续 T0.6/T0.7,也未动远程节点。
+- 待决问题:无
