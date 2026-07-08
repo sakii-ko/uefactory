@@ -103,3 +103,44 @@
 - 耗时/坑:
   - 直接用系统 `python` 跑 check 会找不到 venv 内的 ruff,已改为优先 `.venv/bin/python`。
 - 待决问题:无
+
+## [2026-07-08] T0.2 UE 基础工程 UEFBase — DONE
+- 分支/commit: feat/m0-skeleton @ 待提交
+- 做了什么:
+  - 新增最小 UE 5.5 工程 `ue/UEFBase/UEFBase.uproject`,启用 `PythonScriptPlugin`、`MovieRenderPipeline`、`SequencerScripting`。
+  - `Config/DefaultEngine.ini` 显式设置 Vulkan RHI、基础渲染项,并关闭 UDP Messaging、AndroidFileServer、OnlineSubsystem 默认服务、CrashReportClient 隐式上传和 Analytics。
+  - 新增 `Content/Python/uef_hello.py` 作为无头 Python commandlet 冒烟脚本。
+  - `.uproject` 显式禁用 OnlineSubsystem 系列插件;验证日志中不再出现 `Mounting Engine plugin OnlineSubsystem` / `LogOnline`。
+- 验收产物:
+  - 工程:`ue/UEFBase/UEFBase.uproject`
+  - 配置:`ue/UEFBase/Config/DefaultEngine.ini`
+  - UE 脚本:`ue/UEFBase/Content/Python/uef_hello.py`
+  - 首次日志:`logs/t02_uefbase_open_first.log`
+  - 二次日志:`logs/t02_uefbase_open_after_disable.log`
+  - 命令:
+    ```text
+    env HOME=/root/nas/bigdata1/cjw/UE5Home \
+      UE-LocalDataCachePath=/root/nas/bigdata1/cjw/projs/uefactory/data/ddc \
+      /root/nas/bigdata1/cjw/UnrealEngine_5.5.4/Engine/Binaries/Linux/UnrealEditor-Cmd \
+      /root/nas/bigdata1/cjw/projs/uefactory/ue/UEFBase/UEFBase.uproject \
+      -run=pythonscript \
+      -script=/root/nas/bigdata1/cjw/projs/uefactory/ue/UEFBase/Content/Python/uef_hello.py \
+      -unattended -nopause -nosplash -nullrhi -stdout -FullStdOutLogOutput -NoSound \
+      -LocalDataCachePath=/root/nas/bigdata1/cjw/projs/uefactory/data/ddc
+    ```
+  - 输出摘要:
+    ```text
+    LogPython: UEFactory UEFBase Python smoke script loaded
+    LogPythonScriptCommandlet: Display: Python script executed successfully
+    LogInit: Display: Success - 0 error(s), 6 warning(s)
+    ```
+- DDC/存储方案:
+  - `/root/nas/fastdata2` 按 Owner 要求不用于大数据/DDC。
+  - `/anc-init` 是本地 ext4 但只读,无法使用。
+  - 因无可写本地盘,DDC/Zen 放在 `bigdata1`:命令行 `-LocalDataCachePath=/root/nas/bigdata1/cjw/projs/uefactory/data/ddc`。
+  - 验证日志显示 Zen 数据目录为 `/root/nas/bigdata1/cjw/projs/uefactory/data/ddc/Zen`;当前 `data/ddc` 约 257M。
+- 耗时/坑:
+  - 首次打开:`2:24.51`;当时只传 env,UE 仍默认使用 `/home/chijw/.config/.../Zen/Data`。
+  - 修正为 `HOME=/root/nas/bigdata1/cjw/UE5Home` + `-LocalDataCachePath=...` 后,二次打开 `29.723s`,最终在线插件禁用后验证打开 `28.129s`。
+  - UE 在 NAS 上会报 DirectoryWatcher warnings,但 commandlet 退出码 0 且 `Success - 0 error(s), 6 warning(s)`。
+- 待决问题:无
