@@ -7,6 +7,7 @@ import typer
 
 from uefactory import __version__
 from uefactory.cli.doctor import doctor_app
+from uefactory.cli.render import render_app
 from uefactory.core.config import load_settings
 from uefactory.core.log import configure_logging
 
@@ -46,3 +47,4 @@ def main(
 
 
 app.add_typer(doctor_app, name="doctor")
+app.add_typer(render_app, name="render")

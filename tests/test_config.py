@@ -11,9 +11,11 @@ def test_config_file_overrides_defaults(tmp_path: Path) -> None:
         """
 [core]
 ue_root = "engine"
+ue_home = "ue-home"
 data_dir = "custom-data"
 log_dir = "custom-logs"
 ddc_dir = "fast-ddc"
+runtime_lib_dir = "runtime/lib"
 
 [doctor]
 min_free_vram_gib = 12
@@ -25,9 +27,11 @@ nas_warn_write_mbps = 350
     settings = load_settings(config_file=config, env={}, project_root=tmp_path)
 
     assert settings.ue_root == tmp_path / "engine"
+    assert settings.ue_home == tmp_path / "ue-home"
     assert settings.data_dir == tmp_path / "custom-data"
     assert settings.log_dir == tmp_path / "custom-logs"
     assert settings.ddc_dir == tmp_path / "fast-ddc"
+    assert settings.runtime_lib_dir == tmp_path / "runtime/lib"
     assert settings.doctor.min_free_vram_gib == 12
     assert settings.doctor.nas_warn_write_mbps == 350
 
@@ -47,14 +51,18 @@ data_dir = "custom-data"
         config_file=config,
         env={
             "UEF_UE_ROOT": "/opt/ue",
+            "UEF_UE_HOME": "/tmp/ue-home",
             "UEF_DATA_DIR": "env-data",
+            "UEF_RUNTIME_LIB_DIR": "/opt/ue-runtime/lib",
             "UEF_MIN_FREE_VRAM_GIB": "16",
         },
         project_root=tmp_path,
     )
 
     assert settings.ue_root == Path("/opt/ue")
+    assert settings.ue_home == Path("/tmp/ue-home")
     assert settings.data_dir == tmp_path / "env-data"
+    assert settings.runtime_lib_dir == Path("/opt/ue-runtime/lib")
     assert settings.doctor.min_free_vram_gib == 16
 
 

@@ -26,7 +26,7 @@ def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
     )
     monkeypatch.setattr(
         "uefactory.cli.doctor.check_vulkan",
-        lambda: CheckResult("vulkan", "OK", "vulkan ok", {}),
+        lambda settings: CheckResult("vulkan", "OK", "vulkan ok", {}),
     )
     monkeypatch.setattr(
         "uefactory.cli.doctor.check_disk",
@@ -43,6 +43,8 @@ def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
     assert report["status"] == "WARN"
     assert isinstance(report["duration_sec"], float)
     assert report["paths"]["project_root"] == str(tmp_path)
+    assert report["paths"]["ue_home"] == str(settings.ue_home)
+    assert report["paths"]["runtime_lib_dir"] is None
     assert [check["name"] for check in report["checks"]] == [
         "unreal_engine",
         "gpu",

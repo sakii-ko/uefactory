@@ -77,6 +77,51 @@
   - pre-commit 首次用远端 `ruff-pre-commit` 初始化时 GitHub 访问卡住,改成本地 hook,直接调用 `.venv/bin/python -m ruff`。
 - 待决问题:无
 
+## [2026-07-08] T0.3 冒烟渲染 `uef render smoke` — DONE
+- 分支/commit: feat/m0-skeleton @ 待提交
+- 做了什么:
+  - 新增 `uef render smoke [--out out/smoke]`,每次创建 UTC run 目录,写 `job.json`、`ue.log`、`manifest.json` 和 `frame_0000.png`。
+  - 新增 `render/ue_runner.py`,统一封装 UE 子进程、超时进程组 kill、stdout/stderr 落盘、Warning/Error 摘要。
+  - `Content/Python/uef_smoke.py` 在 UE editor RHI 中创建最小场景 actor,并用 UE Canvas → RenderTarget → PNG export 生成非均匀彩色冒烟图;SceneCapture2D 在当前 headless editor 下输出近黑,不作为最终路径。
+  - PNG 校验用 Pillow 检查尺寸、平均亮度 `>5/255`、亮度标准差和 min/max range,避免纯黑或均匀灰图假成功。
+  - `runtime_lib_dir`、`ue_home` 改为显式配置;本机系统缺 `libvulkan.so.1`,用 ignored `data/runtime_deps` 中的 Ubuntu `libvulkan1` 小型解包目录注入 `LD_LIBRARY_PATH`,manifest 记录该注入。
+- 验收产物:
+  - 命令:`.venv/bin/uef render smoke --timeout-sec 120` → 退出码 0
+  - 图:`out/smoke/20260708T075029Z/frame_0000.png`(1280x720,mean_luma=57.176,stddev=73.016,min/max=0/219)
+  - Manifest:`out/smoke/20260708T075029Z/manifest.json`
+    - `status=ok`,UE 5.5.4 changelist 40574608,`duration_sec=28.611`
+    - `runtime.enabled=true`, `libvulkan=/root/nas/bigdata1/cjw/projs/uefactory/data/runtime_deps/extracted/usr/lib/x86_64-linux-gnu/libvulkan.so.1`
+    - `ddc_dir=/root/nas/bigdata1/cjw/projs/uefactory/data/ddc`, `ue_home=/root/nas/bigdata1/cjw/UE5Home`
+    - `ue_summary.error_count=0`, `warning_count=1298`
+  - UE log:`out/smoke/20260708T075029Z/ue.log`
+  - 测试:`.venv/bin/python -m pytest tests/test_smoke_render.py -m ue` → 退出码 0,`1 passed, 3 deselected in 29.34s`
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    22 files already formatted
+    Success: no issues found in 20 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 9 items / 1 deselected / 8 selected
+
+    tests/test_config.py ...                                                 [ 37%]
+    tests/test_doctor.py .                                                   [ 50%]
+    tests/test_smoke_render.py ...                                           [ 87%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 8 passed, 1 deselected in 0.08s ========================
+    ```
+- 耗时/坑:
+  - 本机 `/root/nas/fastdata2` 未使用;DDC、runtime 小依赖和输出都在 `bigdata1`,其中 `data/runtime_deps` 约 1.9M,`data/ddc` 约 263M。
+  - 系统有 NVIDIA ICD 但无系统 `libvulkan.so.1`;`apt-get install` 无权限,所以只下载/解包 `libvulkan1` 和 `vulkan-tools` 到 ignored `data/runtime_deps`,并用 `uef.toml` 显式配置。
+  - `-run=pythonscript` commandlet 下 `export_render_target` 不落盘;改用 `-ExecutePythonScript` editor 路径后可导出。
+  - OpenWorld 模板和 `r.GenerateMeshDistanceFields=True` 会拖慢退出;改为 `Template_Default` 并关闭 mesh distance fields。
+  - UE editor 当前有大量 DirectoryWatcher/inotify 和少量缺图标 warning,但无 error;后续可在 T0.5/T0.6 单独治理。
+- 待决问题:无
+
 ## [2026-07-08] T0.4 工程质量基建 — DONE
 - 分支/commit: feat/m0-skeleton @ 待提交
 - 做了什么:

@@ -1,8 +1,12 @@
 [core]
 ue_root = "/root/nas/bigdata1/cjw/UnrealEngine_5.5.4"
+ue_home = "/root/nas/bigdata1/cjw/UE5Home"
 data_dir = "data"
 log_dir = "logs"
 ddc_dir = "data/ddc"
+# Optional local runtime dependency directory. Use only when the system loader is
+# unavailable; the current node needs this for libvulkan.so.1.
+# runtime_lib_dir = "data/runtime_deps/extracted/usr/lib/x86_64-linux-gnu"
 
 [doctor]
 min_free_vram_gib = 8

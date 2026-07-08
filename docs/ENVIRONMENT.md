@@ -7,6 +7,7 @@
 - GPU:**NVIDIA H100 80GB HBM3**(driver 580.126.20, CUDA 13.0)。
   - ⚠️ 常驻进程 `miniconda3/envs/wm/bin/python3`(非本项目)占用 **~69 GiB** 显存,渲染可用余量约 12 GiB。**不得动这个进程。**
 - Vulkan:`/etc/vulkan/icd.d/nvidia_icd.json` 存在;`vulkaninfo` 未安装(想装需走 QUESTIONS)。
+  - 系统 `libvulkan.so.1` 也未安装,但当前用户无权限 `apt-get install`;本项目用 ignored `data/runtime_deps` 解包 `libvulkan1` 小依赖,并通过本地 `uef.toml` 的 `runtime_lib_dir` 显式注入 `LD_LIBRARY_PATH`。
 - **无 docker**;git 2.x 可用;系统 Python 3.13.13。
 
 ## 存储

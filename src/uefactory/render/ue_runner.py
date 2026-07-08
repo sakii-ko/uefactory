@@ -1,0 +1,143 @@
+from __future__ import annotations
+
+import logging
+import os
+import signal
+import subprocess
+import time
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from pathlib import Path
+
+LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LogSummary:
+    warnings: list[str]
+    errors: list[str]
+    warning_count: int
+    error_count: int
+
+
+@dataclass(frozen=True)
+class UERunResult:
+    command: list[str]
+    returncode: int
+    duration_sec: float
+    log_path: Path
+    summary: LogSummary
+
+
+class UERunnerError(RuntimeError):
+    def __init__(self, result: UERunResult) -> None:
+        self.result = result
+        message = (
+            f"Unreal Engine command failed with exit code {result.returncode}; "
+            f"log={result.log_path}; errors={result.summary.error_count}; "
+            f"warnings={result.summary.warning_count}"
+        )
+        super().__init__(message)
+
+
+def run_ue(
+    command: Sequence[str | Path],
+    *,
+    cwd: Path,
+    log_path: Path,
+    timeout_sec: int,
+    env: Mapping[str, str] | None = None,
+) -> UERunResult:
+    argv = [str(part) for part in command]
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    LOGGER.info("Starting UE process: %s", " ".join(argv))
+    LOGGER.debug("UE cwd=%s log=%s timeout=%s", cwd, log_path, timeout_sec)
+    start = time.monotonic()
+    with log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        process = subprocess.Popen(
+            argv,
+            cwd=cwd,
+            env=merged_env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            returncode = process.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            LOGGER.error(
+                "UE process timed out after %s seconds; killing process group",
+                timeout_sec,
+            )
+            _kill_process_group(process)
+            returncode = process.wait(timeout=30)
+    duration_sec = time.monotonic() - start
+    summary = summarize_ue_log(log_path)
+    result = UERunResult(
+        command=argv,
+        returncode=returncode,
+        duration_sec=round(duration_sec, 3),
+        log_path=log_path,
+        summary=summary,
+    )
+    _log_summary(result)
+    if returncode != 0:
+        raise UERunnerError(result)
+    return result
+
+
+def summarize_ue_log(log_path: Path, *, limit: int = 20) -> LogSummary:
+    warnings: list[str] = []
+    errors: list[str] = []
+    warning_count = 0
+    error_count = 0
+    try:
+        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        LOGGER.warning("Could not read UE log %s: %s", log_path, exc)
+        return LogSummary(warnings=[], errors=[], warning_count=0, error_count=0)
+    for line in lines:
+        if "Warning:" in line:
+            warning_count += 1
+            if len(warnings) < limit:
+                warnings.append(line)
+        if "Error:" in line or "LogPython: Error:" in line:
+            error_count += 1
+            if len(errors) < limit:
+                errors.append(line)
+    return LogSummary(
+        warnings=warnings,
+        errors=errors,
+        warning_count=warning_count,
+        error_count=error_count,
+    )
+
+
+def _kill_process_group(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=10)
+    except (ProcessLookupError, subprocess.TimeoutExpired):
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+
+
+def _log_summary(result: UERunResult) -> None:
+    LOGGER.info(
+        "UE process finished: returncode=%s duration=%.3fs log=%s warnings=%s errors=%s",
+        result.returncode,
+        result.duration_sec,
+        result.log_path,
+        result.summary.warning_count,
+        result.summary.error_count,
+    )
+    for line in result.summary.errors:
+        LOGGER.error("UE error summary: %s", line)
+    for line in result.summary.warnings:
+        LOGGER.warning("UE warning summary: %s", line)

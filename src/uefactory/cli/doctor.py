@@ -53,7 +53,7 @@ def build_doctor_report(settings: Settings) -> dict[str, Any]:
     checks = [
         check_unreal_engine(settings),
         check_gpu(settings),
-        check_vulkan(),
+        check_vulkan(settings),
         check_disk(settings),
         check_python(),
     ]
@@ -66,9 +66,13 @@ def build_doctor_report(settings: Settings) -> dict[str, Any]:
         "paths": {
             "project_root": str(settings.project_root),
             "ue_root": str(settings.ue_root),
+            "ue_home": str(settings.ue_home),
             "data_dir": str(settings.data_dir),
             "log_dir": str(settings.log_dir),
             "ddc_dir": None if settings.ddc_dir is None else str(settings.ddc_dir),
+            "runtime_lib_dir": (
+                None if settings.runtime_lib_dir is None else str(settings.runtime_lib_dir)
+            ),
         },
         "checks": [asdict(check) for check in checks],
     }
@@ -161,16 +165,27 @@ def check_gpu(settings: Settings) -> CheckResult:
     return CheckResult("gpu", "OK", f"{len(gpus)} GPU(s) available", details)
 
 
-def check_vulkan() -> CheckResult:
+def check_vulkan(settings: Settings) -> CheckResult:
     icd_path = Path("/etc/vulkan/icd.d/nvidia_icd.json")
     vulkaninfo = shutil.which("vulkaninfo")
+    configured_loader = _configured_vulkan_loader(settings)
+    system_loader = _system_library_path("libvulkan.so.1")
     details: dict[str, Any] = {
         "nvidia_icd": str(icd_path),
         "nvidia_icd_exists": icd_path.exists(),
         "vulkaninfo": vulkaninfo,
+        "system_libvulkan": system_loader,
+        "configured_libvulkan": None if configured_loader is None else str(configured_loader),
     }
     if not icd_path.exists():
         return CheckResult("vulkan", "FAIL", "NVIDIA Vulkan ICD is missing", details)
+    if system_loader is None and configured_loader is None:
+        return CheckResult(
+            "vulkan",
+            "WARN",
+            "NVIDIA Vulkan ICD exists, but libvulkan.so.1 was not found",
+            details,
+        )
     if vulkaninfo is None:
         return CheckResult(
             "vulkan", "WARN", "NVIDIA Vulkan ICD exists; vulkaninfo not installed", details
@@ -192,6 +207,33 @@ def check_vulkan() -> CheckResult:
         details["stderr"] = result.stderr.strip()
         return CheckResult("vulkan", "WARN", "vulkaninfo returned non-zero", details)
     return CheckResult("vulkan", "OK", "Vulkan summary succeeded", details)
+
+
+def _configured_vulkan_loader(settings: Settings) -> Path | None:
+    if settings.runtime_lib_dir is None:
+        return None
+    loader = settings.runtime_lib_dir / "libvulkan.so.1"
+    return loader if loader.exists() else None
+
+
+def _system_library_path(library_name: str) -> str | None:
+    try:
+        result = subprocess.run(
+            ["ldconfig", "-p"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    marker = f"{library_name} "
+    for line in result.stdout.splitlines():
+        if marker in line and "=>" in line:
+            return line.rsplit("=>", maxsplit=1)[1].strip()
+    return None
 
 
 def check_disk(settings: Settings) -> CheckResult:

@@ -10,6 +10,7 @@ from typing import Any
 from uefactory.core.paths import find_project_root, resolve_path
 
 DEFAULT_UE_ROOT = Path("/root/nas/bigdata1/cjw/UnrealEngine_5.5.4")
+DEFAULT_UE_HOME = Path("/root/nas/bigdata1/cjw/UE5Home")
 
 
 @dataclass(frozen=True)
@@ -31,9 +32,11 @@ class HostConfig:
 class Settings:
     project_root: Path
     ue_root: Path = DEFAULT_UE_ROOT
+    ue_home: Path = DEFAULT_UE_HOME
     data_dir: Path = field(default_factory=lambda: Path("data"))
     log_dir: Path = field(default_factory=lambda: Path("logs"))
     ddc_dir: Path | None = None
+    runtime_lib_dir: Path | None = None
     doctor: DoctorConfig = field(default_factory=DoctorConfig)
     hosts: dict[str, HostConfig] = field(default_factory=dict)
 
@@ -56,11 +59,17 @@ def load_settings(
     ue_root = _path_setting(
         "UEF_UE_ROOT", "ue_root", core_config, env_values, root, DEFAULT_UE_ROOT
     )
+    ue_home = _path_setting(
+        "UEF_UE_HOME", "ue_home", core_config, env_values, root, DEFAULT_UE_HOME
+    )
     data_dir = _path_setting(
         "UEF_DATA_DIR", "data_dir", core_config, env_values, root, root / "data"
     )
     log_dir = _path_setting("UEF_LOG_DIR", "log_dir", core_config, env_values, root, root / "logs")
     ddc_dir = _optional_path_setting("UEF_DDC_DIR", "ddc_dir", core_config, env_values, root)
+    runtime_lib_dir = _optional_path_setting(
+        "UEF_RUNTIME_LIB_DIR", "runtime_lib_dir", core_config, env_values, root
+    )
 
     doctor = DoctorConfig(
         min_free_vram_gib=_float_setting(
@@ -84,9 +93,11 @@ def load_settings(
     return Settings(
         project_root=root,
         ue_root=ue_root,
+        ue_home=ue_home,
         data_dir=data_dir,
         log_dir=log_dir,
         ddc_dir=ddc_dir,
+        runtime_lib_dir=runtime_lib_dir,
         doctor=doctor,
         hosts=hosts,
     )
