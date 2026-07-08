@@ -29,6 +29,14 @@ class CheckResult:
     details: dict[str, Any]
 
 
+@dataclass(frozen=True)
+class WriteSpeedResult:
+    mbps: float | None
+    size_mib: int
+    error: str | None = None
+    skipped_reason: str | None = None
+
+
 @doctor_app.callback(invoke_without_command=True)
 def doctor(
     ctx: typer.Context,
@@ -255,9 +263,21 @@ def check_disk(settings: Settings) -> CheckResult:
     network_mounts = [mount for mount in mounts if _is_network_fs(mount["fstype"])]
     paths = []
     warnings = []
+    failures = []
     for label, path in candidates:
-        path.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(path)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            usage = shutil.disk_usage(path)
+        except OSError as exc:
+            path_details: dict[str, Any] = {
+                "label": label,
+                "path": str(path),
+                "error": str(exc),
+            }
+            paths.append(path_details)
+            failures.append(f"{label} path is not usable: {exc}")
+            continue
+
         write_speed = _write_speed_mbps(path)
         mount = _mount_for_path(path, mounts)
         path_details = {
@@ -265,11 +285,16 @@ def check_disk(settings: Settings) -> CheckResult:
             "path": str(path),
             "free_gib": round(usage.free / (1024**3), 2),
             "total_gib": round(usage.total / (1024**3), 2),
-            "write_mbps": write_speed,
+            "write_mbps": write_speed.mbps,
+            "write_test": asdict(write_speed),
             "mount": mount,
         }
         paths.append(path_details)
-        if write_speed is not None and write_speed < settings.doctor.nas_warn_write_mbps:
+        if write_speed.error is not None:
+            failures.append(f"{label} write test failed: {write_speed.error}")
+        elif (
+            write_speed.mbps is not None and write_speed.mbps < settings.doctor.nas_warn_write_mbps
+        ):
             warnings.append(
                 f"{label} write speed is below {settings.doctor.nas_warn_write_mbps} MB/s"
             )
@@ -281,6 +306,11 @@ def check_disk(settings: Settings) -> CheckResult:
         "local_mounts": local_mounts,
         "network_mounts": network_mounts,
     }
+    if failures:
+        details["failures"] = failures
+        if warnings:
+            details["warnings"] = warnings
+        return CheckResult("disk", "FAIL", "Disk write checks failed", details)
     if warnings:
         details["warnings"] = warnings
         return CheckResult(
@@ -341,13 +371,17 @@ def _float_or_none(value: str) -> float | None:
         return None
 
 
-def _write_speed_mbps(path: Path) -> float | None:
+def _write_speed_mbps(path: Path) -> WriteSpeedResult:
     size_mib = int(os.environ.get("UEF_DOCTOR_WRITE_TEST_MIB", "512"))
     if size_mib <= 0:
-        return None
+        return WriteSpeedResult(
+            mbps=None,
+            size_mib=size_mib,
+            skipped_reason="write test disabled",
+        )
     path.mkdir(parents=True, exist_ok=True)
     fd = -1
-    tmp_path = Path()
+    tmp_path: Path | None = None
     try:
         fd, raw_tmp_path = tempfile.mkstemp(prefix=".uef_write_", dir=path)
         tmp_path = Path(raw_tmp_path)
@@ -361,15 +395,19 @@ def _write_speed_mbps(path: Path) -> float | None:
             os.fsync(file.fileno())
         duration = time.monotonic() - start
         if duration <= 0:
-            return None
-        return round(size_mib / duration, 2)
+            return WriteSpeedResult(
+                mbps=None,
+                size_mib=size_mib,
+                skipped_reason="duration was not positive",
+            )
+        return WriteSpeedResult(mbps=round(size_mib / duration, 2), size_mib=size_mib)
     except OSError as exc:
         LOGGER.warning("write speed test failed for %s: %s", path, exc)
-        return None
+        return WriteSpeedResult(mbps=None, size_mib=size_mib, error=str(exc))
     finally:
         if fd != -1:
             os.close(fd)
-        if tmp_path:
+        if tmp_path is not None:
             tmp_path.unlink(missing_ok=True)
 
 
