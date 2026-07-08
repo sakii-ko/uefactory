@@ -81,19 +81,19 @@
 5. **可观测**:`uef catalog stats` + 每日 HTML 报告:各源新增/拒收/去重数、license 分布、
    品类分布(缺口一目了然,反过来驱动 pull 式补货)。
 
-## 4. 需要 Owner 拍板的事项
-- Q-A1:`nc`(非商用)档资产是否入库?(建议:入,隔离标记,研究用途可用)
-- Q-A2:Fab/Epic 内容的人工认领通道,Owner 是否愿意每月花约 15 分钟?需要一台能跑
-  Epic Launcher 的 Windows 机或在 UE editor 内装 Fab 插件。
-- Q-A3:AIGC 腿的模型选型许可(TRELLIS MIT 无虞;Hunyuan 系列社区许可有地域/规模条款)
-  是否需要法务级核验,还是研究用途从宽?
-- Q-A4:Objaverse-XL(千万级)全量还是精选?全量约数十 TB 原始文件(NAS 装得下,
-  但去重/门禁算力周期长)。建议先 1.0 LVIS 子集打通全链路。
+## 4. Owner 已拍板(2026-07-08,"所有资产都需要"——能收尽收)
+- Q1 = A:`nc` 档收录 + 隔离标记(license 追溯硬约束不变);
+- Q2 = A:建 Fab/Epic drop 目录半人工通道(细节 M3 C 腿动工前对齐);
+- Q3 = A:AIGC 研究用途从宽 + model/version/prompt/seed 全程留痕;
+- Q4 = 终点全量、路径分批:LVIS 子集打通闭环后,**XL 全量灌库为 M3 v2 正式任务**,
+  存储/去重/门禁按千万级规模设计。
+详见 `docs/QUESTIONS.md` 已归档 Q1–Q4。
 
-## 5. 落地顺序(并入里程碑)
+## 5. 落地顺序(并入里程碑;按 Q1–Q4 批复更新)
 - **M2**(不变):本地文件 ingest + 规范化 + catalog + 缩略图 —— 一切腿的公共地基;
 - **M3 v1**:PolyHaven adapter(HDRI+模型+材质,打样)→ Objaverse LVIS 子集灌库
   → 质量门禁 + 去重 v1 → 每日增量调度;
-- **M3 v2**:Sketchfab adapter、GSO/Smithsonian bulk、drop 目录半人工通道(C 腿);
+- **M3 v2**:**Objaverse-XL 全量灌库(正式任务)**、Sketchfab adapter、GSO/Smithsonian bulk、
+  drop 目录半人工通道(C 腿);
 - **M3.5**:变体增殖(材质库 × mesh);
 - **M4 之后**:Infinigen(D 腿)与 AIGC(E 腿)作为 farm 的"生产型作业"接入队列。
