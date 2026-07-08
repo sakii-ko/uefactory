@@ -181,7 +181,7 @@ def _set_movable(actor) -> None:
         try:
             component.set_editor_property("mobility", unreal.ComponentMobility.MOVABLE)
         except Exception as exc:
-            unreal.log_warning(f"[UEF-SMOKE] could not set movable on {component}: {exc}")
+            raise RuntimeError(f"Could not set movable on {component}: {exc}") from exc
 
 
 if __name__ == "__main__":

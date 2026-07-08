@@ -12,6 +12,8 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
             [
                 "LogInit: Display: ok",
                 "LogFoo: Warning: first warning",
+                "LogDirectoryWatcher: Warning: Failed to begin reading directory changes",
+                "LogStreaming: Warning: Failed to read file '../../../Engine/Icon128.png' error.",
                 "LogPython: Error: traceback",
                 "LogBar: Warning: second warning",
             ]
@@ -22,6 +24,11 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
     summary = summarize_ue_log(log_path)
 
     assert summary.warning_count == 2
+    assert summary.warning_noise_count == 2
+    assert summary.warning_noise == {
+        "directory_watcher": 1,
+        "missing_editor_icon": 1,
+    }
     assert summary.error_count == 1
     assert summary.warnings == [
         "LogFoo: Warning: first warning",

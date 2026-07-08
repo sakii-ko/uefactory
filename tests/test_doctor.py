@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+from subprocess import CompletedProcess
 from typing import Any
 
-from uefactory.cli.doctor import CheckResult, build_doctor_report, check_disk
+from uefactory.cli.doctor import CheckResult, build_doctor_report, check_disk, check_gpu
 from uefactory.core.config import DoctorConfig, Settings
 from uefactory.core.sysinfo import write_speed_mbps
 
@@ -90,3 +91,22 @@ def test_check_disk_fails_when_write_test_fails(monkeypatch: Any, tmp_path: Path
 
     assert result.status == "FAIL"
     assert result.details["failures"]
+
+
+def test_gpu_warning_uses_configured_vram_threshold(monkeypatch: Any, tmp_path: Path) -> None:
+    settings = Settings(
+        project_root=tmp_path,
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+        doctor=DoctorConfig(min_free_vram_gib=12),
+    )
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/nvidia-smi")
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda *args, **kwargs: CompletedProcess(args[0], 0, "GPU, 24576, 8192, 580.0\n", ""),
+    )
+
+    result = check_gpu(settings)
+
+    assert result.status == "WARN"
+    assert "12 GiB" in result.message

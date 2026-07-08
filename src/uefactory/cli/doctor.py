@@ -14,6 +14,7 @@ from typing import Annotated, Any
 
 import typer
 
+from uefactory.cli._common import settings_from_context
 from uefactory.core.config import Settings
 from uefactory.core.sysinfo import (
     is_candidate_local_mount,
@@ -43,7 +44,7 @@ def doctor(
         typer.Option("--json", help="Emit machine-readable JSON instead of a text table."),
     ] = False,
 ) -> None:
-    settings = _settings_from_context(ctx)
+    settings = settings_from_context(ctx)
     report = build_doctor_report(settings)
     if json_output:
         typer.echo(json.dumps(report, indent=2, sort_keys=True))
@@ -167,7 +168,13 @@ def check_gpu(settings: Settings) -> CheckResult:
     if not gpus:
         return CheckResult("gpu", "WARN", "No GPUs reported by nvidia-smi", details)
     if low_memory:
-        return CheckResult("gpu", "WARN", "At least one GPU has less than 8 GiB free VRAM", details)
+        threshold = settings.doctor.min_free_vram_gib
+        return CheckResult(
+            "gpu",
+            "WARN",
+            f"At least one GPU has less than {threshold:g} GiB free VRAM",
+            details,
+        )
     return CheckResult("gpu", "OK", f"{len(gpus)} GPU(s) available", details)
 
 
@@ -328,15 +335,6 @@ def check_python() -> CheckResult:
         "platform": platform.platform(),
     }
     return CheckResult("python", "OK", f"Python {platform.python_version()}", details)
-
-
-def _settings_from_context(ctx: typer.Context) -> Settings:
-    obj = ctx.find_root().obj or {}
-    settings = obj.get("settings")
-    if not isinstance(settings, Settings):
-        msg = "CLI settings were not initialized"
-        raise RuntimeError(msg)
-    return settings
 
 
 def _print_table(report: dict[str, Any]) -> None:

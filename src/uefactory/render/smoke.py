@@ -103,67 +103,60 @@ def render_smoke(settings: Settings, out_root: Path, timeout_sec: int = 1800) ->
             env=env,
         )
     except UERunnerError as exc:
-        _write_failed_manifest(
+        _finalize_manifest(
             manifest_path,
             job,
             exc.result.command,
             exc.result.duration_sec,
             exc.result,
-            runtime,
+            status="failed",
+            runtime=runtime,
         )
         raise
 
     if ue_result.summary.error_count:
-        manifest = _manifest(
+        _finalize_manifest(
+            manifest_path,
             job,
             ue_result.command,
             ue_result.duration_sec,
             ue_result,
             status="failed",
             runtime=runtime,
+            error=f"UE log contains {ue_result.summary.error_count} error lines",
         )
-        manifest["error"] = f"UE log contains {ue_result.summary.error_count} error lines"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         msg = f"Smoke render UE log contains errors; UE log: {ue_log_path}"
         raise RuntimeError(msg)
 
     if not raw_frame.exists():
-        manifest = _manifest(
+        _finalize_manifest(
+            manifest_path,
             job,
             ue_result.command,
             ue_result.duration_sec,
             ue_result,
             status="failed",
             runtime=runtime,
+            error=f"Expected frame was not created: {raw_frame}",
         )
-        manifest["error"] = f"Expected frame was not created: {raw_frame}"
-        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
         msg = f"Smoke render did not produce {raw_frame}; UE log: {ue_log_path}"
         raise RuntimeError(msg)
     shutil.move(raw_frame, frame_path)
 
     image_info = _validate_image(frame_path)
-    manifest = _manifest(
+    _finalize_manifest(
+        manifest_path,
         job,
         ue_result.command,
         ue_result.duration_sec,
         ue_result,
         status="ok",
         runtime=runtime,
+        image_info=image_info,
+        settings=settings,
+        ddc_dir=ddc_dir,
+        ue_home=ue_home,
     )
-    manifest["image"] = {
-        "path": str(frame_path),
-        "width": image_info.width,
-        "height": image_info.height,
-        "mean_luma": image_info.mean_luma,
-        "luma_stddev": image_info.luma_stddev,
-        "luma_min": image_info.luma_min,
-        "luma_max": image_info.luma_max,
-    }
-    manifest["engine"] = _engine_version(settings)
-    manifest["ddc_dir"] = str(ddc_dir)
-    manifest["ue_home"] = str(ue_home)
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     LOGGER.info(
         "Smoke render produced %s (%sx%s mean_luma=%.3f)",
         frame_path,
@@ -233,6 +226,8 @@ def _manifest(
         "runtime": runtime,
         "ue_summary": {
             "warning_count": ue_result.summary.warning_count,
+            "warning_noise_count": ue_result.summary.warning_noise_count,
+            "warning_noise": ue_result.summary.warning_noise or {},
             "error_count": ue_result.summary.error_count,
             "warnings": ue_result.summary.warnings,
             "errors": ue_result.summary.errors,
@@ -240,16 +235,43 @@ def _manifest(
     }
 
 
-def _write_failed_manifest(
+def _finalize_manifest(
     manifest_path: Path,
     job: dict[str, Any],
     command: list[str],
     duration_sec: float,
     ue_result: Any,
+    *,
+    status: str,
     runtime: dict[str, Any],
-) -> None:
-    manifest = _manifest(job, command, duration_sec, ue_result, status="failed", runtime=runtime)
+    error: str | None = None,
+    image_info: ImageInfo | None = None,
+    settings: Settings | None = None,
+    ddc_dir: Path | None = None,
+    ue_home: Path | None = None,
+) -> dict[str, Any]:
+    manifest = _manifest(job, command, duration_sec, ue_result, status=status, runtime=runtime)
+    if error is not None:
+        manifest["error"] = error
+    if image_info is not None:
+        frame_path = Path(str(job["out_dir"])) / "frame_0000.png"
+        manifest["image"] = {
+            "path": str(frame_path),
+            "width": image_info.width,
+            "height": image_info.height,
+            "mean_luma": image_info.mean_luma,
+            "luma_stddev": image_info.luma_stddev,
+            "luma_min": image_info.luma_min,
+            "luma_max": image_info.luma_max,
+        }
+    if settings is not None:
+        manifest["engine"] = _engine_version(settings)
+    if ddc_dir is not None:
+        manifest["ddc_dir"] = str(ddc_dir)
+    if ue_home is not None:
+        manifest["ue_home"] = str(ue_home)
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return manifest
 
 
 def _runtime_settings(runtime_lib_dir: Path | None) -> dict[str, Any]:
@@ -278,5 +300,9 @@ def _engine_version(settings: Settings) -> dict[str, Any]:
     version_path = settings.ue_root / "Engine/Build/Build.version"
     try:
         return json.loads(version_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"path": str(version_path), "error": "unavailable"}
+    except OSError as exc:
+        msg = f"Could not read UE Build.version: {version_path}"
+        raise FileNotFoundError(msg) from exc
+    except json.JSONDecodeError as exc:
+        msg = f"Could not parse UE Build.version: {version_path}"
+        raise ValueError(msg) from exc

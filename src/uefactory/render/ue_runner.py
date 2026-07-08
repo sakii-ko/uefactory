@@ -11,6 +11,11 @@ from pathlib import Path
 
 LOGGER = logging.getLogger(__name__)
 
+KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
+    "directory_watcher": ("LogDirectoryWatcher: Warning:",),
+    "missing_editor_icon": ("LogStreaming: Warning: Failed to read file", ".png"),
+}
+
 
 @dataclass(frozen=True)
 class LogSummary:
@@ -18,6 +23,8 @@ class LogSummary:
     errors: list[str]
     warning_count: int
     error_count: int
+    warning_noise_count: int = 0
+    warning_noise: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -100,12 +107,17 @@ def summarize_ue_log(log_path: Path, *, limit: int = 20) -> LogSummary:
     except OSError as exc:
         LOGGER.warning("Could not read UE log %s: %s", log_path, exc)
         return LogSummary(warnings=[], errors=[], warning_count=0, error_count=0)
+    warning_noise: dict[str, int] = {}
     for line in lines:
         if "Warning:" in line:
+            noise_reason = _warning_noise_reason(line)
+            if noise_reason is not None:
+                warning_noise[noise_reason] = warning_noise.get(noise_reason, 0) + 1
+                continue
             warning_count += 1
             if len(warnings) < limit:
                 warnings.append(line)
-        if "Error:" in line or "LogPython: Error:" in line:
+        if "Error:" in line:
             error_count += 1
             if len(errors) < limit:
                 errors.append(line)
@@ -114,7 +126,16 @@ def summarize_ue_log(log_path: Path, *, limit: int = 20) -> LogSummary:
         errors=errors,
         warning_count=warning_count,
         error_count=error_count,
+        warning_noise_count=sum(warning_noise.values()),
+        warning_noise=warning_noise,
     )
+
+
+def _warning_noise_reason(line: str) -> str | None:
+    for reason, markers in KNOWN_WARNING_NOISE_RULES.items():
+        if all(marker in line for marker in markers):
+            return reason
+    return None
 
 
 def _kill_process_group(process: subprocess.Popen[str]) -> None:
@@ -130,13 +151,17 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
 
 def _log_summary(result: UERunResult) -> None:
     LOGGER.info(
-        "UE process finished: returncode=%s duration=%.3fs log=%s warnings=%s errors=%s",
+        "UE process finished: returncode=%s duration=%.3fs log=%s warnings=%s "
+        "filtered_warning_noise=%s errors=%s",
         result.returncode,
         result.duration_sec,
         result.log_path,
         result.summary.warning_count,
+        result.summary.warning_noise_count,
         result.summary.error_count,
     )
+    if result.summary.warning_noise_count:
+        LOGGER.info("UE warning noise filtered: %s", result.summary.warning_noise)
     for line in result.summary.errors:
         LOGGER.error("UE error summary: %s", line)
     for line in result.summary.warnings:

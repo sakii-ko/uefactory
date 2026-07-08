@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 from PIL import Image, ImageDraw
 
-from uefactory.core.config import load_settings
-from uefactory.render.smoke import _validate_image, render_smoke
+from uefactory.core.config import Settings, load_settings
+from uefactory.render.smoke import _engine_version, _validate_image, render_smoke
 
 
 def test_validate_image_rejects_black_frame(tmp_path: Path) -> None:
@@ -39,6 +39,18 @@ def test_validate_image_accepts_nonuniform_lit_frame(tmp_path: Path) -> None:
 
     assert info.mean_luma > 5
     assert info.luma_stddev > 1
+
+
+def test_engine_version_missing_file_raises(tmp_path: Path) -> None:
+    settings = Settings(
+        project_root=tmp_path,
+        ue_root=tmp_path / "missing-engine",
+        data_dir=tmp_path / "data",
+        log_dir=tmp_path / "logs",
+    )
+
+    with pytest.raises(FileNotFoundError, match="Build.version"):
+        _engine_version(settings)
 
 
 @pytest.mark.ue

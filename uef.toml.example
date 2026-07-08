@@ -11,6 +11,7 @@ ddc_dir = "data/ddc"
 [doctor]
 min_free_vram_gib = 8
 nas_warn_write_mbps = 200
+write_test_mib = 512
 
 [hosts.4090]
 ssh_alias = "4090"
