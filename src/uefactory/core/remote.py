@@ -47,8 +47,14 @@ class RemoteCommandError(RuntimeError):
 
 
 class RemoteHost:
-    def __init__(self, config: HostConfig) -> None:
+    def __init__(
+        self,
+        config: HostConfig,
+        *,
+        local_delete_roots: Sequence[Path] | None = None,
+    ) -> None:
         self.config = config
+        self._local_delete_roots = tuple(root.resolve() for root in local_delete_roots or ())
 
     @classmethod
     def from_settings(cls, settings: Settings, name: str) -> RemoteHost:
@@ -58,7 +64,13 @@ class RemoteHost:
             available = ", ".join(sorted(settings.hosts)) or "(none)"
             msg = f"Unknown host {name!r}; configured hosts: {available}"
             raise KeyError(msg) from exc
-        return cls(config)
+        return cls(
+            config,
+            local_delete_roots=(
+                settings.data_dir,
+                settings.project_root / "out",
+            ),
+        )
 
     def run(
         self, command: str, *, timeout_sec: int = 60, check: bool = True
@@ -93,9 +105,11 @@ class RemoteHost:
         delete: bool = False,
     ) -> RemoteCommandResult:
         if delete:
-            for remote_source in remote_sources:
-                self._validate_delete_target(remote_source)
-            self.verify_sentinel(timeout_sec=60)
+            self._validate_local_delete_target(local_dest)
+            LOGGER.debug(
+                "Pull --delete guarded by local destination check: %s",
+                local_dest,
+            )
         argv = ["rsync", "-a", "-z", "--partial", "-e", self._rsync_ssh_transport()]
         if delete:
             argv.append("--delete")
@@ -169,6 +183,17 @@ class RemoteHost:
         if target != work_dir and work_dir not in target.parents:
             msg = f"Refusing --delete outside sentinel work_dir {work_dir}: {remote_path}"
             raise ValueError(msg)
+
+    def _validate_local_delete_target(self, local_path: Path | str) -> None:
+        if not self._local_delete_roots:
+            msg = "Refusing pull --delete without configured local delete roots"
+            raise ValueError(msg)
+        target = Path(local_path).resolve()
+        if any(target == root or root in target.parents for root in self._local_delete_roots):
+            return
+        roots = ", ".join(str(root) for root in self._local_delete_roots)
+        msg = f"Refusing pull --delete outside local roots ({roots}): {target}"
+        raise ValueError(msg)
 
 
 def remote_python_command(script: str, env: Mapping[str, str]) -> str:
