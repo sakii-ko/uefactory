@@ -102,7 +102,25 @@ CREATE TABLE artifacts (               -- 渲染/缩略图等产物索引
 
 已知备选:若 MRQ 通道在 headless 下有坑,退路是 SceneCapture2D + 后处理材质(记 ADR 再切换)。
 
-## 6. 性能与资源纪律
+## 6. 远程渲染节点(ADR-003)
+
+```
+ 本机(数据主库:catalog + data/ + out/)            远端节点(算力 + 暂存)
+ ┌─────────────────────────────┐                 ┌──────────────────────────┐
+ │ uef render --host 4090      │  rsync push     │ work_dir/(.uef_node 哨兵)│
+ │  └ RemoteHost(core/remote)  │ ──────────────► │  ├ engine/(一次 provision)│
+ │     · ControlMaster 复用     │  tmux 派发      │  ├ jobs/<job_id>/        │
+ │     · 状态轮询 ≥30s          │ ──────────────► │  │   job.json / status.json│
+ │                             │  rsync pull     │  │   out/(渲染输出)      │
+ │ out/renders/<job_id>/ ◄──── │ ◄────────────── │  └ (渲后清理 jobs/)      │
+ └─────────────────────────────┘                 └──────────────────────────┘
+```
+
+- 节点 profile 在 `uef.toml [hosts.<name>]`:ssh_alias、work_dir、engine_dir、gpu 数、暂存配额。
+- 渲染执行器只有一个抽象:`Executor(local | remote(host))`,JobSpec 与 UE 侧脚本完全不感知本地/远程差异——差异全部封装在"作业包推送 / 引擎路径 / 产物回收"三处。
+- 远端渲染输出永远写节点本地(或其自有存储),完成后一次性 rsync 回本机;禁止跨 WAN 写帧序列。
+
+## 7. 性能与资源纪律
 
 - 引擎冷启动贵(秒~分钟级):farm 的 worker 按"一次引擎启动处理一批资产"设计(引擎内循环),而不是每资产一进程;但 M1 先做正确,再做快。
 - DDC 共享:所有 worker 用同一 DDC 路径,避免重复编 shader。

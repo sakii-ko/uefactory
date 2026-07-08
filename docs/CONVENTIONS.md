@@ -84,7 +84,16 @@ uefactory/
 └── data/    (gitignore)     # catalog.db、下载缓存
 ```
 
-## 7. UE 侧专项规范
+## 7. 远程操作纪律(强制,背景见 ADR-003)
+
+- 一切 ssh / rsync / scp 只能经 `core/remote.py` 发起;review 中发现业务代码裸调 ssh 直接打回。
+- 连接必须复用:ControlMaster 选项由 `remote.py` 统一注入;多个远程操作能合并成一条批量命令的必须合并。**手工调试时也一样**——你在终端手敲 ssh 探测,请一次带全所有命令。
+- 预计 >60s 的远程任务必须进远端 tmux(`uef_<job_id>` 会话),通过远端状态 JSON 轮询(≥30s 间隔),不许保持前台 ssh 等待。
+- 破坏性操作(`rsync --delete`、`rm -rf`)只允许指向含 `.uef_node` 哨兵的目录,代码里强制校验,无例外。
+- 共享机器(4090)上:不 kill/renice 任何非本项目进程,不碰他人文件,不占满磁盘(写前检查剩余空间,doctor 有 WARN 就先清理再干活)。
+- 远端一切皆可丢:任何只存在于远端的状态都必须能从本机数据重建;产物落地以"已 rsync 回本机 NAS"为准。
+
+## 8. UE 侧专项规范
 
 - UE Python 脚本必须可独立重跑(幂等):重复执行不产生重复 actor/资产;入口函数 `main()`,顶层不放副作用代码。
 - 与 CLI 的参数传递:通过 `-ExecutePythonScript` 传参困难时,统一用 env var `UEF_JOB_FILE=<json路径>`,UE 内脚本读该 JSON——不要用位置参数字符串拼接。
