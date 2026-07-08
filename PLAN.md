@@ -4,8 +4,10 @@
 > 由 Planner 维护;Coder(同事)只执行「当前 Sprint」清单中的任务,不自行扩大范围。
 > 最后更新:2026-07-08(第 5 次) · 当前阶段:**M0 后半(远程节点)** · 状态:**T0.1–T0.5 正式 review 通过,已合入 main(tag `m0-core-done`)**
 > ✅ 正式 review:`docs/reviews/2026-07-08-formal-m0-core.md`(APPROVE;确定性渲染三连验证)。
-> **当前主线:T0.7(引擎 provision 双节点 + 远程冒烟渲染闭环)→ M0 完整验收(Owner)→
-> tag `v0.1.0` → M1。** F9 已复核通过(fail-closed 加分),T0.6 完全关闭;Q1–Q4 已归档(能收尽收)。
+> **当前主线:F10(屏幕调试文字污染,合并前必修)+ F11(清理证据进 manifest)→ Planner
+> 复核(含独立重跑远程 smoke)→ 合并 → M0 完整验收(Owner)→ tag `v0.1.0` → M1。**
+> T0.7 已 APPROVE-WITH-FIXES(l40s provision + 远程真场景渲染闭环成立,现场核查通过);
+> 4090 顺延至 M1 首任务(F12:原故障系瞬态,顺延理由为传输时长)。Q1–Q4 已归档。
 > 规则不变:DoD 验收对象不可自行替换;一次只推进一个任务。
 
 ---
