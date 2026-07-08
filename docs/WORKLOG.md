@@ -320,3 +320,52 @@
 - 待决问题:Q1-Q4 已登记在 `docs/QUESTIONS.md`,均不阻塞 M0 正式 review。
 
 REVIEW REQUESTED: feat/m0-skeleton 678ff46
+
+## [2026-07-08] T0.6 远程节点基建 — DONE
+- 分支/commit: feat/m0-remote @ 0fd6ae6
+- 做了什么:
+  - 新增 `core/remote.py`:统一封装 SSH/rsync/tmux,SSH 强制 ControlMaster/ControlPath/ControlPersist/BatchMode;rsync 固定 `-z --partial`;带 `--delete` 的 rsync 先校验远端 `.uef_node` 哨兵且目标必须在 `work_dir` 下。
+  - 新增 `uef node init <host>`:远端创建工作目录并写 `.uef_node` 哨兵;复跑保持同一 `node_id` 并返回 `status=existing`。
+  - 扩展 `uef doctor --host <name>`:将 sentinel/UE/GPU/Vulkan/disk/Python 探测打包成单条远端 Python 命令,输出与本地 doctor 同风格 JSON,并记录 `transport.ssh_connection_count=1`。
+  - 远端 probe 对 `vulkaninfo`/`nvidia-smi` 超时或 OSError 归类为 WARN,避免单个慢探测吞掉完整报告;4090/l40s 存储特判 WARN 已落地。
+- 验收产物:
+  - 幂等初始化:
+    - `.venv/bin/uef node init 4090 --json` 复跑 → `status=existing`,`work_dir=/home/lyf/uef`,`node_id=71ae9e4e8c814bf8bf7740e3c4b0b711`
+    - `.venv/bin/uef node init l40s --json` 复跑 → `status=existing`,`work_dir=/root/nas/bigdata1/cjw/uef`,`node_id=b7d2fa4bc1bb40339110cee10204fbe3`
+  - 远端 doctor:
+    - `.venv/bin/uef doctor --host 4090 --json` → JSON 合法,`status=WARN`,`transport.ssh_alias=4090`,`ssh_connection_count=1`,`command_duration_sec=27.01`
+      - checks:`node_sentinel=OK`,`unreal_engine=WARN`(engine 尚未 provision),`gpu=OK`(8x RTX 4090),`vulkan=OK`,`disk=WARN`(共享机器清理提示),`python=OK`
+    - `.venv/bin/uef doctor --host l40s --json` → JSON 合法,`status=WARN`,`transport.ssh_alias=l40s`,`ssh_connection_count=1`,`command_duration_sec=0.476`
+      - checks:`node_sentinel=OK`,`unreal_engine=WARN`(engine 尚未 provision),`gpu=OK`(1x L40S),`vulkan=OK`,`disk=WARN`(Ceph + 同路径陷阱提示),`python=OK`
+  - 单连接日志证据:
+    - `logs/20260708T103040Z_doctor_4090.log`: `Starting remote command: ssh` 计数 = 1
+    - `logs/20260708T103041Z_doctor_l40s.log`: `Starting remote command: ssh` 计数 = 1
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    28 files already formatted
+    Success: no issues found in 26 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 19 items / 1 deselected / 18 selected
+
+    tests/test_config.py ...                                                 [ 16%]
+    tests/test_doctor.py ......                                              [ 50%]
+    tests/test_remote.py ...                                                 [ 66%]
+    tests/test_smoke_render.py ....                                          [ 88%]
+    tests/test_tools.py .                                                    [ 94%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 18 passed, 1 deselected in 0.14s =======================
+    ```
+- 耗时/坑:
+  - 4090 首次远端 doctor 被 `vulkaninfo --summary` 慢探测打断;修正后 probe 把超时归为 WARN 并继续返回完整 JSON。本次最终 4090 `vulkaninfo` 在 25.205s 内成功。
+  - 两台远端当前均未 provision UE engine,所以 `unreal_engine` 为 WARN;这是 T0.7 范围,本轮未触碰。
+  - 未使用 `/root/nas/fastdata2` 存储远端产物或大数据;本地只读/写 repo、logs、`/tmp` 小 JSON。
+  - T0.7 仍冻结,未做 engine provision 或远程冒烟渲染。
+- 待决问题:无
+
+REVIEW REQUESTED: feat/m0-remote 0fd6ae6
