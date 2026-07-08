@@ -555,3 +555,53 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
   - 去掉空 OCIO 后 PNG sRGB quantization 仍会造成两跑 luma `0.001` 级漂移;最终用引擎自带 `simple.config.ocio` 的 `Utility - Linear - sRGB` 到自身 identity transform 消除随机漂移,且不产生 `OCIO INVALID` overlay。
   - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
 - 待决问题:无;T1.3 DoD 已达成,下一步按 PLAN 串行进入 T1.4 多通道 passes。
+
+## [2026-07-09] T1.4 多通道 passes — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `6ef07c1`
+- 做了什么:
+  - `examples/orbit8.yaml` 扩展为六通道:`beauty_lit`、`beauty_unlit`、`depth`、`normal`、`basecolor`、`object_mask`。
+  - JobSpec passes 校验改为支持显式 pass 白名单、拒绝未知 pass 和重复 pass。
+  - MRQ runtime executor 改为按 pass 串行提交 subjob,原始输出落到 `_mrq/<pass>/`,再规范化为 `<asset>/<pass>/frame_*.{png,exr}`。
+  - depth/mask 采用 16-bit half-float EXR;lit/unlit/normal/basecolor 采用 8-bit PNG。manifest 记录每通道格式、位深、物理通道数和逐帧校验值。
+  - 新增通道级校验器:depth 必须有梯度;normal 必须随 orbit 变化且编码范围合理;object_mask 必须是标量 stencil ID 且唯一值为背景+2 物体;lit/unlit 不得逐像素相同;basecolor/lit/unlit 均拒绝近黑或过度均匀帧。
+  - UE setup 给 cube/floor 设置 CustomDepth stencil 值 1/2,并生成 job-local post-process 材质读取 `PPI_CUSTOM_STENCIL / 255`,避免使用 UE `CustomStencil` 可视化调色板冒充 ID mask。
+- 验收产物:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 2400` → 退出码 0。
+  - 两次 run:
+    - `out/renders/20260708T215537Z/builtin_cube`
+    - `out/renders/20260708T215628Z/builtin_cube`
+  - 每次均产出 6 个 pass × 8 帧 + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`status=ok`,`render_kind=job`,`asset_id=builtin:cube`,`frames_found` 六通道均为 8,`setup_summary.error_count=0`,`setup_summary.warning_count=0`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]
+    ```
+  - 通道格式/首帧校验摘要:
+    ```text
+    beauty_lit    PNG 8-bit RGB   first_mean=[49.186, 49.052, 48.576]
+    beauty_unlit  PNG 8-bit RGB   first_mean=[105.84, 105.84, 105.84]
+    depth         EXR 16-bit RGBA  first_mean=[284.11804], unique_values=159
+    normal        PNG 8-bit RGB   first_mean=[0.0, 127.041, 127.965]
+    basecolor     PNG 8-bit RGB   first_mean=[32.741, 32.741, 32.741]
+    object_mask   EXR 16-bit RGBA  first_mean=[0.0039], unique_values=3, scalar_vector=True
+    ```
+  - 额外复核:用最终 `validate_render_pass()` 对两组产物重算 stable validation payload,两跑完全一致。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    40 files already formatted
+    Success: no issues found in 33 source files
+    collected 44 items / 1 deselected / 43 selected
+    43 passed, 1 deselected in 0.42s
+    ```
+- 耗时/坑:
+  - MRQ additional post-process material pass 不能关闭 main pass;`render_main_pass=False` 时 depth/material 输出为 0 帧。
+  - WorldDepth raw pass 名由引擎材质决定为 `FinalImageMovieRenderQueue_WorldDepth`;自定义 pass 名对 normal/basecolor/object_mask 生效。
+  - UE 内置 `CustomStencil.CustomStencil` 输出的是调色板颜色,首帧有 5 个颜色向量,不能作为 object ID mask;已改为 job-local `PPI_CUSTOM_STENCIL / 255` 标量材质。
+  - normal 是 world-normal buffer,orbit 下红/绿通道均值大幅变化,并非固定“偏蓝”外观;校验器改为验证 orbit-varying channel means 与蓝通道编码范围。
+  - MRQ EXR 实际写出 `RGBA`;manifest 如实记录物理通道数为 4,校验统计取第一通道标量值。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.4 DoD 已达成,下一步按 PLAN 串行进入 T1.5 光照预设。
