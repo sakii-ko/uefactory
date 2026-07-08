@@ -3,15 +3,18 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shlex
 import shutil
+import time
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from PIL import Image, ImageStat
 
 from uefactory.core.config import Settings
 from uefactory.core.paths import resolve_path, utc_timestamp
+from uefactory.core.remote import RemoteHost, remote_python_command
 from uefactory.render.ue_runner import UERunnerError, run_ue
 
 LOGGER = logging.getLogger(__name__)
@@ -173,6 +176,139 @@ def render_smoke(settings: Settings, out_root: Path, timeout_sec: int = 1800) ->
     )
 
 
+def render_smoke_remote(
+    *,
+    settings: Settings,
+    host: str,
+    out_root: Path,
+    timeout_sec: int = 1800,
+    poll_interval_sec: int = 30,
+) -> SmokeRenderResult:
+    remote = RemoteHost.from_settings(settings, host)
+    timestamp = utc_timestamp()
+    job_id = f"smoke_{remote.config.name}_{timestamp}"
+    run_dir = resolve_path(out_root, settings.project_root) / timestamp
+    run_dir.mkdir(parents=True, exist_ok=False)
+
+    project_package = _package_smoke_project(settings, run_dir / "project_package")
+    remote_run_dir = PurePosixPath(str(remote.config.work_dir)) / "jobs" / job_id
+    remote_project_dir = remote_run_dir / "project"
+
+    remote.run(
+        "\n".join(
+            [
+                "set -euo pipefail",
+                f"mkdir -p {shlex.quote(str(remote_run_dir))}",
+                f"mkdir -p {shlex.quote(str(remote_project_dir))}",
+            ]
+        ),
+        timeout_sec=60,
+    )
+    remote.rsync_push([f"{project_package}/"], f"{remote_project_dir}/", timeout_sec=3600)
+    command = remote_python_command(
+        _REMOTE_SMOKE_SCRIPT,
+        {
+            "UEF_HOST_NAME": remote.config.name,
+            "UEF_JOB_ID": job_id,
+            "UEF_WORK_DIR": str(remote.config.work_dir),
+            "UEF_ENGINE_DIR": str(remote.config.engine_dir),
+            "UEF_REMOTE_RUN_DIR": str(remote_run_dir),
+            "UEF_REMOTE_PROJECT_DIR": str(remote_project_dir),
+            "UEF_TIMEOUT_SEC": str(timeout_sec),
+        },
+    )
+    remote.tmux_start(job_id, command, timeout_sec=60)
+    status = _wait_for_remote_job(
+        remote,
+        job_id,
+        timeout_sec=timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+    )
+
+    remote.rsync_pull([f"{remote_run_dir}/"], run_dir, timeout_sec=3600, delete=True)
+    frame_path = run_dir / "frame_0000.png"
+    manifest_path = run_dir / "manifest.json"
+    ue_log_path = run_dir / "ue.log"
+    try:
+        if status.get("status") != "complete":
+            msg = f"Remote smoke failed on {host}: {status}"
+            raise RuntimeError(msg)
+        if not manifest_path.exists():
+            msg = f"Remote smoke did not return manifest: {manifest_path}"
+            raise RuntimeError(msg)
+        image_info = _validate_image(frame_path)
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["image"] = {
+            "path": str(frame_path),
+            "width": image_info.width,
+            "height": image_info.height,
+            "mean_luma": image_info.mean_luma,
+            "luma_stddev": image_info.luma_stddev,
+            "luma_min": image_info.luma_min,
+            "luma_max": image_info.luma_max,
+        }
+        manifest["local_validation"] = {"status": "ok", "validated_utc": utc_timestamp()}
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    finally:
+        remote.remove_tree(str(remote_run_dir), timeout_sec=60)
+
+    LOGGER.info(
+        "Remote smoke render produced %s via %s (mean_luma=%.3f)",
+        frame_path,
+        host,
+        image_info.mean_luma,
+    )
+    return SmokeRenderResult(
+        run_dir=run_dir,
+        frame_path=frame_path,
+        manifest_path=manifest_path,
+        ue_log_path=ue_log_path,
+        mean_luma=image_info.mean_luma,
+    )
+
+
+def _package_smoke_project(settings: Settings, package_dir: Path) -> Path:
+    source = settings.project_root / "ue/UEFBase"
+    project_path = source / "UEFBase.uproject"
+    config_dir = source / "Config"
+    python_dir = source / "Content/Python"
+    if not project_path.exists():
+        msg = f"UE project not found: {project_path}"
+        raise FileNotFoundError(msg)
+    if not python_dir.exists():
+        msg = f"UE Python directory not found: {python_dir}"
+        raise FileNotFoundError(msg)
+    if package_dir.exists():
+        shutil.rmtree(package_dir)
+    (package_dir / "Config").mkdir(parents=True)
+    (package_dir / "Content/Python").mkdir(parents=True)
+    shutil.copy2(project_path, package_dir / "UEFBase.uproject")
+    if config_dir.exists():
+        for config in config_dir.glob("*.ini"):
+            shutil.copy2(config, package_dir / "Config" / config.name)
+    for script in python_dir.glob("*.py"):
+        shutil.copy2(script, package_dir / "Content/Python" / script.name)
+    return package_dir
+
+
+def _wait_for_remote_job(
+    remote: RemoteHost,
+    job_id: str,
+    *,
+    timeout_sec: int,
+    poll_interval_sec: int,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        status = remote.tmux_status(job_id, timeout_sec=60)
+        if not status.get("tmux_live") and status.get("status") in {"complete", "failed"}:
+            return status
+        if time.monotonic() >= deadline:
+            msg = f"Remote job {job_id} timed out; last status={status}"
+            raise TimeoutError(msg)
+        time.sleep(poll_interval_sec)
+
+
 def _validate_image(frame_path: Path) -> ImageInfo:
     with Image.open(frame_path) as image:
         image.load()
@@ -306,3 +442,167 @@ def _engine_version(settings: Settings) -> dict[str, Any]:
     except json.JSONDecodeError as exc:
         msg = f"Could not parse UE Build.version: {version_path}"
         raise ValueError(msg) from exc
+
+
+_REMOTE_SMOKE_SCRIPT = r"""
+import json
+import os
+import shutil
+import subprocess
+import time
+import traceback
+from pathlib import Path
+
+host_name = os.environ["UEF_HOST_NAME"]
+job_id = os.environ["UEF_JOB_ID"]
+work_dir = Path(os.environ["UEF_WORK_DIR"])
+engine_dir = Path(os.environ["UEF_ENGINE_DIR"])
+run_dir = Path(os.environ["UEF_REMOTE_RUN_DIR"])
+project_dir = Path(os.environ["UEF_REMOTE_PROJECT_DIR"])
+timeout_sec = int(os.environ["UEF_TIMEOUT_SEC"])
+status_path = work_dir / "jobs" / job_id / "status.json"
+status_path.parent.mkdir(parents=True, exist_ok=True)
+
+frame_path = run_dir / "frame_0000.png"
+raw_frame_path = run_dir / "smoke_frame.png"
+manifest_path = run_dir / "manifest.json"
+ue_log_path = run_dir / "ue.log"
+job_path = run_dir / "job.json"
+project_path = project_dir / "UEFBase.uproject"
+script_path = project_dir / "Content/Python/uef_smoke.py"
+ddc_dir = work_dir / "ddc"
+ue_home = work_dir / "ue_home"
+
+
+def write_status(status, phase, **extra):
+    payload = {
+        "job_id": job_id,
+        "host": host_name,
+        "status": status,
+        "phase": phase,
+        "run_dir": str(run_dir),
+        "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    }
+    payload.update(extra)
+    tmp = status_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    tmp.replace(status_path)
+
+
+def summarize_log(path):
+    warnings = []
+    errors = []
+    warning_count = 0
+    error_count = 0
+    if not path.exists():
+        return {"warnings": [], "errors": [], "warning_count": 0, "error_count": 0}
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "Warning:" in line:
+            warning_count += 1
+            if len(warnings) < 20:
+                warnings.append(line)
+        if "Error:" in line:
+            error_count += 1
+            if len(errors) < 20:
+                errors.append(line)
+    return {
+        "warnings": warnings,
+        "errors": errors,
+        "warning_count": warning_count,
+        "error_count": error_count,
+    }
+
+
+try:
+    sentinel = work_dir / ".uef_node"
+    payload = json.loads(sentinel.read_text(encoding="utf-8"))
+    if payload.get("host") != host_name:
+        raise RuntimeError(f"sentinel host mismatch: {payload.get('host')} != {host_name}")
+    executable = engine_dir / "Engine/Binaries/Linux/UnrealEditor-Cmd"
+    version_path = engine_dir / "Engine/Build/Build.version"
+    if not executable.exists():
+        raise RuntimeError(f"UnrealEditor-Cmd is missing: {executable}")
+    if not version_path.exists():
+        raise RuntimeError(f"Build.version is missing: {version_path}")
+    run_dir.mkdir(parents=True, exist_ok=True)
+    ddc_dir.mkdir(parents=True, exist_ok=True)
+    ue_home.mkdir(parents=True, exist_ok=True)
+    job = {
+        "out_dir": str(run_dir),
+        "filename": raw_frame_path.name,
+        "render_kind": "scene",
+        "width": 1280,
+        "height": 720,
+        "remote_host": host_name,
+    }
+    job_path.write_text(json.dumps(job, indent=2, sort_keys=True), encoding="utf-8")
+    env = os.environ.copy()
+    env.update(
+        {
+            "HOME": str(ue_home),
+            "UEF_JOB_FILE": str(job_path),
+            "UE-LocalDataCachePath": str(ddc_dir),
+        }
+    )
+    command = [
+        str(executable),
+        str(project_path),
+        f"-ExecutePythonScript={script_path}",
+        "-unattended",
+        "-nopause",
+        "-nosplash",
+        "-RenderOffScreen",
+        "-stdout",
+        "-FullStdOutLogOutput",
+        "-NoSound",
+        f"-LocalDataCachePath={ddc_dir}",
+    ]
+    write_status("running", "rendering", command=command)
+    started = time.monotonic()
+    with ue_log_path.open("w", encoding="utf-8", errors="replace") as log_file:
+        result = subprocess.run(
+            command,
+            cwd=project_dir,
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    duration_sec = round(time.monotonic() - started, 3)
+    summary = summarize_log(ue_log_path)
+    if raw_frame_path.exists():
+        raw_frame_path.replace(frame_path)
+    manifest = {
+        "schema_version": 1,
+        "status": "ok" if result.returncode == 0 and frame_path.exists() else "failed",
+        "render_kind": "scene",
+        "job": job,
+        "remote_host": host_name,
+        "job_id": job_id,
+        "command": command,
+        "duration_sec": duration_sec,
+        "ue_log": str(ue_log_path),
+        "frame": str(frame_path),
+        "engine": json.loads(version_path.read_text(encoding="utf-8")),
+        "ddc_dir": str(ddc_dir),
+        "ue_summary": summary,
+        "returncode": result.returncode,
+    }
+    if result.returncode != 0:
+        manifest["error"] = f"UE exited with {result.returncode}"
+    elif not frame_path.exists():
+        manifest["error"] = f"Expected frame missing: {frame_path}"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    if manifest["status"] == "ok":
+        write_status("complete", "rendered", duration_sec=duration_sec, frame=str(frame_path))
+    else:
+        write_status("failed", "render_failed", manifest=str(manifest_path))
+except subprocess.TimeoutExpired as exc:
+    write_status("failed", "timeout", error=str(exc), traceback=traceback.format_exc())
+    raise
+except Exception as exc:
+    write_status("failed", "error", error=str(exc), traceback=traceback.format_exc())
+    raise
+"""

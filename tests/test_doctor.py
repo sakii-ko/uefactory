@@ -5,16 +5,10 @@ from pathlib import Path
 from subprocess import CompletedProcess, TimeoutExpired
 from typing import Any
 
-from uefactory.cli.doctor import (
-    _REMOTE_DOCTOR_SCRIPT,
-    CheckResult,
-    build_doctor_report,
-    build_remote_doctor_report,
-    check_disk,
-    check_gpu,
-)
+from uefactory.cli.doctor import CheckResult, build_doctor_report, check_disk, check_gpu
 from uefactory.core.config import DoctorConfig, HostConfig, Settings
 from uefactory.core.remote import RemoteCommandResult
+from uefactory.core.remote_probe import REMOTE_DOCTOR_SCRIPT, build_remote_doctor_report
 from uefactory.core.sysinfo import write_speed_mbps
 
 
@@ -211,7 +205,7 @@ def test_remote_doctor_script_warns_when_vulkaninfo_times_out(
     monkeypatch.setattr("shutil.which", fake_which)
     monkeypatch.setattr("subprocess.run", fake_run)
 
-    exec(_REMOTE_DOCTOR_SCRIPT, {})
+    exec(REMOTE_DOCTOR_SCRIPT, {})
 
     report = json.loads(capsys.readouterr().out)
     vulkan = next(check for check in report["checks"] if check["name"] == "vulkan")

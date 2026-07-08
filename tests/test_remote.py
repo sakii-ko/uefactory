@@ -177,6 +177,32 @@ def test_remote_from_settings_configures_local_delete_roots(
     assert calls[0][0] == "rsync"
 
 
+def test_tmux_status_requires_exact_live_marker(monkeypatch: Any) -> None:
+    def fake_run_local(
+        argv: list[str],
+        *,
+        timeout_sec: int,
+        check: bool,
+    ) -> RemoteCommandResult:
+        stdout = '{"status": "complete", "note": "__UEF_TMUX_LIVE__true"}\n__UEF_TMUX_LIVE__false\n'
+        return _result(argv, stdout=stdout)
+
+    monkeypatch.setattr("uefactory.core.remote._run_local", fake_run_local)
+    remote = RemoteHost(
+        HostConfig(
+            name="l40s",
+            ssh_alias="l40s",
+            work_dir=Path("/remote/work"),
+            engine_dir=Path("/remote/engine"),
+        )
+    )
+
+    status = remote.tmux_status("job-1")
+
+    assert status["status"] == "complete"
+    assert status["tmux_live"] is False
+
+
 def test_remote_run_wraps_timeout(monkeypatch: Any) -> None:
     def fake_subprocess_run(*args: Any, **kwargs: Any) -> None:
         raise subprocess.TimeoutExpired(args[0], kwargs["timeout"], output=b"partial")

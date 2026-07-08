@@ -168,8 +168,14 @@ class RemoteHost:
         )
         result = self.run(remote_command, timeout_sec=timeout_sec)
         payload = parse_json_stdout(result.stdout)
-        payload["tmux_live"] = "__UEF_TMUX_LIVE__true" in result.stdout
+        payload["tmux_live"] = "__UEF_TMUX_LIVE__true" in result.stdout.splitlines()
         return payload
+
+    def remove_tree(self, remote_path: Path | str, *, timeout_sec: int = 60) -> RemoteCommandResult:
+        self._validate_delete_target(remote_path)
+        self.verify_sentinel(timeout_sec=60)
+        command = f"rm -rf -- {shlex.quote(str(remote_path))}"
+        return self.run(command, timeout_sec=timeout_sec)
 
     def _rsync_ssh_transport(self) -> str:
         return " ".join(shlex.quote(part) for part in ["ssh", *SSH_CONTROL_OPTIONS])
