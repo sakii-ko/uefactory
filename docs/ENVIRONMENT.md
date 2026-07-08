@@ -28,6 +28,7 @@
 
 ## 项目路径约定
 - repo:`/root/nas/bigdata1/cjw/projs/uefactory`(git,main 分支)
+  - `/home/chijw/workspace/projs/uefactory` 是指向同一目录的 symlink(同 inode),**不是**第二份 checkout
 - 默认 env:`UEF_UE_ROOT=/root/nas/bigdata1/cjw/UnrealEngine_5.5.4`
 - 数据/输出:repo 下 `data/`、`out/`、`logs/`(均已 gitignore)
 

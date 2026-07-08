@@ -16,6 +16,7 @@ import typer
 
 from uefactory.cli._common import settings_from_context
 from uefactory.core.config import Settings
+from uefactory.core.remote_probe import build_remote_doctor_report
 from uefactory.core.sysinfo import (
     is_candidate_local_mount,
     is_network_fs,
@@ -43,9 +44,17 @@ def doctor(
         bool,
         typer.Option("--json", help="Emit machine-readable JSON instead of a text table."),
     ] = False,
+    host: Annotated[
+        str | None,
+        typer.Option("--host", help="Run doctor checks on a configured remote host."),
+    ] = None,
 ) -> None:
     settings = settings_from_context(ctx)
-    report = build_doctor_report(settings)
+    report = (
+        build_doctor_report(settings)
+        if host is None
+        else build_remote_doctor_report(settings, host)
+    )
     if json_output:
         typer.echo(json.dumps(report, indent=2, sort_keys=True))
     else:

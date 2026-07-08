@@ -320,3 +320,153 @@
 - 待决问题:Q1-Q4 已登记在 `docs/QUESTIONS.md`,均不阻塞 M0 正式 review。
 
 REVIEW REQUESTED: feat/m0-skeleton 678ff46
+
+## [2026-07-08] T0.6 远程节点基建 — DONE
+- 分支/commit: feat/m0-remote @ 0fd6ae6
+- 做了什么:
+  - 新增 `core/remote.py`:统一封装 SSH/rsync/tmux,SSH 强制 ControlMaster/ControlPath/ControlPersist/BatchMode;rsync 固定 `-z --partial`;带 `--delete` 的 rsync 先校验远端 `.uef_node` 哨兵且目标必须在 `work_dir` 下。
+  - 新增 `uef node init <host>`:远端创建工作目录并写 `.uef_node` 哨兵;复跑保持同一 `node_id` 并返回 `status=existing`。
+  - 扩展 `uef doctor --host <name>`:将 sentinel/UE/GPU/Vulkan/disk/Python 探测打包成单条远端 Python 命令,输出与本地 doctor 同风格 JSON,并记录 `transport.ssh_connection_count=1`。
+  - 远端 probe 对 `vulkaninfo`/`nvidia-smi` 超时或 OSError 归类为 WARN,避免单个慢探测吞掉完整报告;4090/l40s 存储特判 WARN 已落地。
+- 验收产物:
+  - 幂等初始化:
+    - `.venv/bin/uef node init 4090 --json` 复跑 → `status=existing`,`work_dir=/home/lyf/uef`,`node_id=71ae9e4e8c814bf8bf7740e3c4b0b711`
+    - `.venv/bin/uef node init l40s --json` 复跑 → `status=existing`,`work_dir=/root/nas/bigdata1/cjw/uef`,`node_id=b7d2fa4bc1bb40339110cee10204fbe3`
+  - 远端 doctor:
+    - `.venv/bin/uef doctor --host 4090 --json` → JSON 合法,`status=WARN`,`transport.ssh_alias=4090`,`ssh_connection_count=1`,`command_duration_sec=27.01`
+      - checks:`node_sentinel=OK`,`unreal_engine=WARN`(engine 尚未 provision),`gpu=OK`(8x RTX 4090),`vulkan=OK`,`disk=WARN`(共享机器清理提示),`python=OK`
+    - `.venv/bin/uef doctor --host l40s --json` → JSON 合法,`status=WARN`,`transport.ssh_alias=l40s`,`ssh_connection_count=1`,`command_duration_sec=0.476`
+      - checks:`node_sentinel=OK`,`unreal_engine=WARN`(engine 尚未 provision),`gpu=OK`(1x L40S),`vulkan=OK`,`disk=WARN`(Ceph + 同路径陷阱提示),`python=OK`
+  - 单连接日志证据:
+    - `logs/20260708T103040Z_doctor_4090.log`: `Starting remote command: ssh` 计数 = 1
+    - `logs/20260708T103041Z_doctor_l40s.log`: `Starting remote command: ssh` 计数 = 1
+  - 测试:`tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    28 files already formatted
+    Success: no issues found in 26 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 19 items / 1 deselected / 18 selected
+
+    tests/test_config.py ...                                                 [ 16%]
+    tests/test_doctor.py ......                                              [ 50%]
+    tests/test_remote.py ...                                                 [ 66%]
+    tests/test_smoke_render.py ....                                          [ 88%]
+    tests/test_tools.py .                                                    [ 94%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 18 passed, 1 deselected in 0.14s =======================
+    ```
+- 耗时/坑:
+  - 4090 首次远端 doctor 被 `vulkaninfo --summary` 慢探测打断;修正后 probe 把超时归为 WARN 并继续返回完整 JSON。本次最终 4090 `vulkaninfo` 在 25.205s 内成功。
+  - 两台远端当前均未 provision UE engine,所以 `unreal_engine` 为 WARN;这是 T0.7 范围,本轮未触碰。
+  - 未使用 `/root/nas/fastdata2` 存储远端产物或大数据;本地只读/写 repo、logs、`/tmp` 小 JSON。
+  - T0.7 仍冻结,未做 engine provision 或远程冒烟渲染。
+- 待决问题:无
+
+REVIEW REQUESTED: feat/m0-remote 0fd6ae6
+
+## [2026-07-08] T0.7 远程引擎 provision + 远程冒烟渲染 — DONE
+- 分支/commit:
+  - 基建: feat/m0-remote @ 8d86522
+  - l40s runtime 修复: feat/m0-remote @ d64848b
+- 做了什么:
+  - 新增 `uef node provision <host>`:engine zip 走 `rsync -z --partial` 上传,远端 tmux 等 ready marker 后解压,已存在且 `Build.version` 合法则幂等跳过。
+  - 新增 `uef render smoke --host <host>`:打包 `ue/UEFBase` 最小工程,推到远端 job 目录,tmux 后台执行 UE smoke,轮询 status JSON,拉回 frame/manifest/ue.log 后本地复用非全黑校验,最后通过受保护 `remove_tree()` 清理远端 job 暂存。
+  - 修复 l40s root SSH 下 UE 拒绝 root 启动:远端 prepare 创建/复用 `uef` 用户,用 `setfacl` 给 `/root` 最小 execute ACL,渲染前将 run_dir/DDC/UE_HOME 交给 `uef`,真正 UE 进程通过 `runuser -u uef -- env ...` 执行。
+  - 修复 Linux 大小写敏感引擎包兼容问题:prepare 幂等创建 shader 兼容 symlink(`Raytracing -> RayTracing`,`RaytracingSkylightRGS.usf -> RayTracingSkyLightRGS.usf`,`NiagaraStatelessModule_ScaleMeshSizebySpeed.ush -> NiagaraStatelessModule_ScaleMeshSizeBySpeed.ush`)。
+  - 扩展 UE log 摘要:预编译引擎缺可选 USD/FeaturePack 资源进入 `error_noise`;缺 PNG、USD `plugInfo.json` 写权限探针、只读 Engine Content 的 `WritePermissions.*` 探针进入 `warning_noise`;真实 `error_count/warning_count` 保持可审计。
+  - 完成 T0.6 MINOR:远程 doctor probe 已抽到 `core/remote_probe.py`;tmux live marker 改为整行精确匹配。
+- l40s provision 证据:
+  - 远端落点:`/root/nas/bigdata1/cjw/uef/engine/`(l40s 自己的 NAS,不是本机同路径)。
+  - tmux job:`provision_l40s_20260708T120419Z`,最终 `status=complete`,`phase=extracted`,`tmux_live=false`。
+  - 引擎版本:`5.5.4`,Build.version `BranchName=++UE5+Release-5.5`,`Changelist=40574608`。
+  - WAN 首次实测:`/root/nas/bigdata1/cjw/Linux_Unreal_Engine_5.5.4.zip` 27085247533 bytes,rsync duration `7567.029s`,带宽 `3.414 MiB/s`(`3.579 MB/s`)。
+  - l40s 缺 `unzip`;按 Owner 指示安装小工具 `unzip`。后续 root→`uef` 切换需要 ACL,安装小包 `acl` 以提供 `setfacl`。
+- l40s 远程 smoke 验收产物:
+  - 命令:`.venv/bin/uef render smoke --host l40s --timeout-sec 1800` → 退出码 0
+  - 图:`out/smoke/20260708T145219Z/frame_0000.png`(1280x720,`mean_luma=22.646`,`luma_stddev=30.431`,min/max=0/192)
+  - Manifest:`out/smoke/20260708T145219Z/manifest.json`
+    - `status=ok`,`render_kind=scene`,`remote_host=l40s`,`job_id=smoke_l40s_20260708T145219Z`
+    - `duration_sec=25.893`,`returncode=0`,`run_user=uef`
+    - `local_validation.status=ok`,`validated_utc=20260708T145251Z`
+    - `ue_summary.error_count=0`,`warning_count=0`
+    - `ue_summary.error_noise_count=14`(`missing_optional_usd_plugin=7`,`missing_feature_pack_screenshot=7`)
+    - `ue_summary.warning_noise_count=338`(`engine_content_write_permission_probe=124`,`missing_editor_icon=127`,`usd_plugin_metadata_write_permission=87`)
+  - UE log:`out/smoke/20260708T145219Z/ue.log`
+  - CLI log:`logs/20260708T145219Z_render_smoke.log`
+  - tmux/无前台 ssh 证据:
+    - `logs/20260708T145219Z_render_smoke.log` line 146:`tmux new-session -d -s uef_smoke_l40s_20260708T145219Z ...`
+    - status poll:14:52:20 与 14:52:50 两次短 `ssh ... tmux has-session` 查询,间隔约 30s;渲染期间无前台 UE SSH 进程挂住。
+  - 远端暂存清理:
+    - log line 426:`rm -rf -- /root/nas/bigdata1/cjw/uef/jobs/smoke_l40s_20260708T145219Z`
+    - 复核命令返回:`test ! -e /root/nas/bigdata1/cjw/uef/jobs/smoke_l40s_20260708T145219Z && echo cleaned` → `cleaned`
+- 4090 状态:
+  - 本轮多次轻量探测均失败:`kex_exchange_identification: Connection closed by remote host`,远端 `27.189.109.208 port 22` 在 SSH 握手阶段关闭连接。
+  - 未继续 hammer 4090;按 PLAN 允许顺延,4090 provision/smoke 作为 M1 首任务处理。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    29 files already formatted
+    Success: no issues found in 27 source files
+    ============================= test session starts ==============================
+    platform linux -- Python 3.13.13, pytest-9.1.1, pluggy-1.6.0
+    rootdir: /root/nas/bigdata1/cjw/projs/uefactory
+    configfile: pyproject.toml
+    testpaths: tests
+    collected 24 items / 1 deselected / 23 selected
+
+    tests/test_config.py ...                                                 [ 13%]
+    tests/test_doctor.py ......                                              [ 39%]
+    tests/test_remote.py ......                                              [ 65%]
+    tests/test_smoke_render.py ......                                        [ 91%]
+    tests/test_tools.py .                                                    [ 95%]
+    tests/test_ue_runner.py .                                                [100%]
+
+    ======================= 23 passed, 1 deselected in 0.15s =======================
+    ```
+- 耗时/坑:
+  - l40s SSH 用户是 root,UE 直接拒绝 root 运行;最终采用 root 编排 + 非 root `uef` 执行 UE 的边界。
+  - UE 5.5.4 预编译 Linux 包存在若干大小写不一致 shader 引用,在 Linux 大小写敏感 FS 上会导致 GlobalShaders fatal;prepare 阶段用 symlink 兼容,不改大 zip。
+  - 远程引擎目录 root-owned 且应保持只读;UE 对 Engine Content 的写权限探针、USD metadata 更新、缺可选模板截图均显式归类为 noise,不吞证据。
+  - 未使用 `/root/nas/fastdata2` 存储 engine、DDC、产物或临时大文件;大数据仍落 l40s 自己的 `/root/nas/bigdata1/cjw/uef/`。
+- 待决问题:无
+
+REVIEW REQUESTED: feat/m0-remote d64848b
+
+## [2026-07-08] T0.7 review #4 fixes(F10/F11/F12) — DONE
+- 分支/commit:
+  - 修复: feat/m0-remote @ f19bbeb
+- 做了什么:
+  - F10:在 `DefaultEngine.ini` 关闭 on-screen debug messages;`uef_smoke.py` 启动时执行 `DisableAllScreenMessages`,并在远景放置 `UEF_Smoke_Backdrop` 遮挡模板 skydome 暴露区域,避免 l40s offscreen capture 出现黄字污染。
+  - F11:远程 smoke 清理后把 `cleanup.removed_paths`、`cleanup.verified`、`verify_returncode` 写回本地 manifest;测试覆盖 cleanup manifest 证据。
+  - F11:清理 l40s 旧 provision 空目录 `/root/nas/bigdata1/cjw/uef/jobs/provision_l40s_20260708T120419Z`,复核 `test ! -e ... && printf cleaned` → `cleaned`。
+  - F12:4090 顺延理由按 review 修正为 WAN engine transfer 约 `3.414 MiB/s` 会占用数小时且 M0 收尾优先;本轮仍做轻量探测,结果为 `kex_exchange_identification: Connection closed by remote host`(rc=255,duration=1.109s),不再把 SSH 不可能连接作为顺延主理由。
+- 本地 smoke 复验:
+  - 命令:`.venv/bin/uef render smoke --timeout-sec 1800` → 退出码 0
+  - 图:`out/smoke/20260708T163651Z/frame_0000.png`(1280x720,`mean_luma=36.866`,`luma_stddev=15.877`,min/max=0/144);目检无 skydome/debug 文本。
+  - Manifest:`out/smoke/20260708T163651Z/manifest.json`,`status=ok`,`render_kind=scene`,`duration_sec=30.203`,`ue_summary.error_count=0`,`warning_count=0`。
+- l40s 远程 smoke 复验:
+  - 命令:`.venv/bin/uef render smoke --host l40s --timeout-sec 1800` → 退出码 0
+  - 图:`out/smoke/20260708T163802Z/frame_0000.png`(1280x720,`mean_luma=35.608`,`luma_stddev=11.88`,min/max=0/93);目检无 skydome/debug 文本。
+  - Manifest:`out/smoke/20260708T163802Z/manifest.json`
+    - `status=ok`,`render_kind=scene`,`remote_host=l40s`,`job_id=smoke_l40s_20260708T163802Z`,`run_user=uef`
+    - `local_validation.status=ok`,`validated_utc=20260708T163905Z`
+    - `cleanup.status=ok`,`cleanup.verified=true`,`cleanup.verify_returncode=0`
+    - `cleanup.removed_paths=["/root/nas/bigdata1/cjw/uef/jobs/smoke_l40s_20260708T163802Z"]`
+    - `ue_summary.error_count=0`,`warning_count=0`;noise 仍保留为 `error_noise_count=14`,`warning_noise_count=338`
+  - 无前台 SSH 挂住证据:CLI 只启动 `tmux new-session -d -s uef_smoke_l40s_20260708T163802Z`,随后 16:38:03/16:38:33/16:39:03 做短 status poll,拉回产物后 16:39:05 删除并复核远端 job 目录。
+- 测试:
+  - `tools/check.sh` → 退出码 0
+  - summary:`29 files already formatted`;`mypy` success;`23 passed, 1 deselected in 0.16s`
+- 耗时/坑:
+  - 直接删除模板 sky/atmosphere/fog/light actor 会让本地 SceneCapture 退回近黑图(`out/smoke/20260708T163413Z/frame_0000.png`,mean_luma=0.095),已废弃该方案;最终保留模板环境,只屏蔽/遮挡屏幕文本来源。
+  - 未使用 `/root/nas/fastdata2` 存储 engine、DDC、产物或临时大文件。
+- 待决问题:4090 provision/smoke 按 PLAN 顺延为 M1 首任务,顺延主因是 WAN 大包传输耗时与 M0 closeout 优先级。
+
+REVIEW REQUESTED: feat/m0-remote f19bbeb
