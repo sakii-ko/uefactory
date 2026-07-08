@@ -4,15 +4,14 @@
 - 验证:Planner 实跑 `tools/check.sh` → 全绿(5 passed, 1 deselected `ue`),与 WORKLOG 声称一致;
   通读全部 src/tests/tools/ue 代码;未跑 `uef render smoke`(T0.3 尚未完成)。
 - 总体评价:**架子搭得好**,ue_runner/config/log 三个核心模块干净、职责清楚。以下发现按严重度排序,
-  **F1–F3 必须在 T0.3 标记 DONE 之前修掉**,其余并入 T0.5 收尾。
+  **F2/F3 必须在 T0.3 标记 DONE 之前修掉**,其余并入 T0.5 收尾。
 
 ## 发现
 
-### [BLOCKER] F1 提交身份违规:作者 `chijw`、缺 `Role: Coder` trailer
-分支上 3 个 commit(7d933da、4dd0afa、2368513)作者为 `chijw`,且无 Role trailer,违反 CONVENTIONS §5。
-repo 已配 `user.name=sakii-ko`,大概率是 shell 里有 `GIT_AUTHOR_*` 环境变量或 `--author` 覆盖——先查明原因写进 WORKLOG。
-**修复**:`git rebase` 改写本分支 3 个 commit 的作者为 `sakii-ko <chijw2004@outlook.com>` 并补 `Role: Coder` trailer;
-Planner 特批本分支**一次性 force-push**(仅此分支、仅此一次,完成后在 WORKLOG 登记新旧 sha 对照)。
+### [WITHDRAWN] F1 提交身份 —— 撤回,不是问题
+Owner 澄清(2026-07-08):`chijw` 就是 Coder 的正式身份,`sakii-ko` 是 Planner 的身份。
+现有提交完全合规,**无需任何改写**。CONVENTIONS §5 已相应修订:作者字段即角色标识
+(sakii-ko=Planner,chijw=Coder),Role trailer 不再强制。此条为 Planner 误判,记 Planner 账上。
 
 ### [BLOCKER] F2 冒烟渲染的防假成功断言被自己的清屏色打穿
 `uef_smoke.py` 把 render target 清成 `(0.03, 0.05, 0.08)`,该底色本身的平均亮度就远超
@@ -73,7 +72,7 @@ manifest 里记录是否注入;(c)doctor 增加 `libvulkan.so.1` 可解析检查
 - 日志基建完全符合规范(argv/cwd/git sha/版本首行入日志)。
 
 ## 对 Coder 的下一步(顺序执行,勿扩散)
-1. 修 F1(身份改写 + force-push 本分支,特批已给);
+1. ~~F1~~ 已撤回,无需处理;
 2. 修 F2/F3(T0.3 的 DONE 前置条件),然后完成 T0.3 并按模板登记 WORKLOG;
 3. F4–F7 作为独立小 commit 修掉(每个一个 commit,好 review);
 4. F8 并入 T0.5 收尾;
