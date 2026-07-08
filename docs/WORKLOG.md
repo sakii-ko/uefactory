@@ -515,3 +515,43 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
   - setup log 里有 `LogOpenColorIOEditor: Display: Force-disable invalid viewport transform settings.` 的 Display 行,不是 warning/error。
   - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/mrq_spike`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
 - 待决问题:无;T1.2 DoD 已达成,下一步按 PLAN 串行进入 T1.3 JobSpec v1。
+
+## [2026-07-09] T1.3 JobSpec v1 + orbit 相机 — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `db6c179`
+- 做了什么:
+  - 新增 JobSpec v1 YAML 解析与显式校验,字段覆盖 `assets/camera/lighting/passes/output`;未知字段、缺字段和非法值均 fail-fast,错误信息带字段路径。
+  - 新增示例 `examples/orbit8.yaml`,当前按 PLAN 只允许 `assets: [builtin:cube]`、`camera.rig: orbit`、`lighting.preset: three_point`、`passes: [beauty_lit]`。
+  - 新增 `uef render job <job.yaml> [--verify-twice]`,输出 `out/renders/<run_id>/<asset>/<pass>/frame_*.png`、`manifest.json` 与 UE logs;manifest v2 记录 job 全文、相机、光照、帧 luma 和 UE warning/error summary。
+  - UE 侧脚本用 MRQ runtime executor 构建 Cube + floor + 三点光占位场景;单个 CineCameraActor 按 orbit 逐帧 key transform,走 `MoviePipelineDeferredPassBase` 输出 `beauty_lit` PNG。
+  - `ue_runner` 增加两类精确噪声过滤:Unreal Trace Server startup warning、MRQ 对 `out/renders/` 输出路径的 statfs probe warning;真实 warning/error summary 仍保持 fail-fast。
+- 验收产物:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 1800` → 退出码 0。
+  - 两次 run:
+    - `out/renders/20260708T205504Z/builtin_cube/beauty_lit`
+    - `out/renders/20260708T205549Z/builtin_cube/beauty_lit`
+  - 每次均产出 8 张 PNG + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`render_kind=job`,`status=ok`,`asset_id=builtin:cube`,`pass=beauty_lit`,`frames_expected=8`,`frames_found=8`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [49.064, 25.158, 34.813, 25.956, 15.026, 14.16, 12.705, 6.759]
+    ```
+  - 额外像素级复核:8 帧逐帧 `ImageChops.difference` 的 bbox 均为 `None`,mean diff 为 `0.0`,extrema 为 `(0, 0)`;两跑 PNG 像素完全一致。
+  - 日志中复查无 `OCIO INVALID`;OpenColorIO 只有 Display 级别的 resave 提示,不是 warning/error。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    38 files already formatted
+    Success: no issues found in 31 source files
+    collected 35 items / 1 deselected / 34 selected
+    34 passed, 1 deselected in 0.57s
+    ```
+- 耗时/坑:
+  - 初版多 camera cut section 会触发 Sequencer frame range ensure;修正 start/end 顺序后仍会让 MRQ 注册多个 shots,并伴随黑帧,最终改成单 camera cut + 单相机逐帧 key transform。
+  - T1.2 的空 OCIO workaround 在 lit pass 中会把黄色 `OCIO INVALID` 字样渲进图片,不能沿用。
+  - 单相机方案仍黑帧的根因是 Sequencer transform channel 的旋转顺序不是 Unreal `Rotator(pitch,yaw,roll)`;写入时按 `(roll,pitch,yaw)` 映射后画面恢复正常。
+  - 去掉空 OCIO 后 PNG sRGB quantization 仍会造成两跑 luma `0.001` 级漂移;最终用引擎自带 `simple.config.ocio` 的 `Utility - Linear - sRGB` 到自身 identity transform 消除随机漂移,且不产生 `OCIO INVALID` overlay。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.3 DoD 已达成,下一步按 PLAN 串行进入 T1.4 多通道 passes。
