@@ -651,3 +651,66 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
   - 初版 `none` 使用 DefaultLit + 弱 emissive,校验器拒绝近黑是正确的;后改为无灯光 + Unlit emissive 材质,并按 preset 定制 beauty 断言。
   - 本轮下载的 HDRI 是 1.7M 小样例,放在 `data/hdri/`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
 - 待决问题:无;T1.5 DoD 已达成,下一步按 PLAN 串行进入 T1.6 本地/远程统一执行器 + contact sheet + turntable。
+
+## [2026-07-09] T1.6 本地/远程统一执行器 + contact sheet + turntable — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `d919e73`
+- 做了什么:
+  - `uef render job <job.yaml> [--host l40s|4090]` 接入统一远程执行入口;JobSpec 与 UE 侧脚本仍共用本地同一份 job JSON,远端仅负责推包、tmux 执行、回收、清理。
+  - 每个 job 自动生成 `contact_sheet.png`、`index.html`、`turntable.mp4`;contact sheet 以 pass × view 网格展示 PNG/EXR 预览,turntable 使用 `ffmpeg` 合成 beauty_lit 视角序列。
+  - `uef doctor` 增加 ffmpeg 检测;缺失为 WARN,不自动安装。
+  - 远程 job 沿用 root 编排 + `uef` 非 root 用户运行 UE,并在本地校验后删除远端暂存目录;cleanup 写回 manifest。
+  - UE 日志过滤补充精确规则:`LogCore: Warning: Unable to statfs(.../_mrq/... errno=2)` 归类为 MRQ 输出路径探测噪声,不吞其它 statfs warning。
+- 本地验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+  - run:`out/renders/20260708T223645Z/builtin_cube`
+  - 产物:
+    - 六通道 × 8 帧:`beauty_lit`,`beauty_unlit`,`depth`,`normal`,`basecolor`,`object_mask` 均为 8。
+    - `contact_sheet.png` 115713 bytes
+    - `turntable.mp4` 28276 bytes
+    - `index.html` 2802 bytes
+  - manifest:`status=ok`,`render_kind=job`,`artifacts={contact_sheet.png,index.html,turntable.mp4}`。
+  - `frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`。
+- l40s 远程验收:
+  - 预检:`UEF_DOCTOR_WRITE_TEST_MIB=8 .venv/bin/uef doctor --host l40s --json` → 退出码 0;`unreal_engine/gpu/vulkan` 均 OK,`disk` 为预期 WARN(远端 `/root/nas/bigdata1` 是 l40s 自己的 Ceph)。
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --host l40s --timeout-sec 2400` → 退出码 0。
+  - run:`out/renders/20260708T224403Z/builtin_cube`
+  - 产物结构与本地一致:
+    - 六通道 × 8 帧均存在并通过本地 pass 校验。
+    - `contact_sheet.png` 115713 bytes
+    - `turntable.mp4` 28276 bytes
+    - `index.html` 2802 bytes
+  - manifest:
+    - `status=ok`,`remote_host=l40s`,`remote_job_id=render_l40s_20260708T224403Z`,`run_user=uef`
+    - `local_validation.status=ok`
+    - `cleanup.status=ok`,`cleanup.verified=true`,`cleanup.verify_returncode=0`
+    - `cleanup.removed_paths=["/root/nas/bigdata1/cjw/uef/jobs/render_l40s_20260708T224403Z"]`
+    - `ue_summary.error_count=0`,`ue_summary.warning_count=0`;`mrq_remote_output_path_probe=264` 被记录为 filtered noise。
+  - 无前台 SSH 挂住证据:CLI 只执行短 ssh/rsync 操作,远端渲染由 `tmux new-session -d -s uef_render_l40s_20260708T224403Z` 承载;本地随后仅轮询 `status.json`,完成后 rsync pull 并删除/复核远端 job 目录。
+- 本地 vs l40s 初步一致性:
+  ```text
+  view  local_luma  l40s_luma  delta_pct
+  0     49.046      49.046     0.00
+  1     77.297      77.297     0.00
+  2     34.791      34.791     0.00
+  3     25.941      25.941     0.00
+  4     15.010      15.010     0.00
+  5     14.156      14.156     0.00
+  6     12.701      12.701     0.00
+  7     60.521      60.521     0.00
+  ```
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    46 files already formatted
+    Success: no issues found in 39 source files
+    collected 54 items / 1 deselected / 53 selected
+    53 passed, 1 deselected in 0.53s
+    ```
+- 耗时/坑:
+  - 首次 l40s run `out/renders/20260708T223926Z/builtin_cube` 实际产出六通道且 cleanup 成功,但远程脚本把 MRQ `_mrq` 输出路径 `statfs` 探测 warning 当作真实 warning,状态被判 failed;补精确噪声规则后复跑通过。
+  - 4090 未跑:PLAN 已把 4090 作为机会性任务,本轮 T1.6 DoD 以 l40s 为远端必验节点。
+  - 本轮未使用 `/root/nas/fastdata2`;产物和 DDC 在本机 `bigdata1`,远端临时产物在 l40s 自己的 `/root/nas/bigdata1/cjw/uef/jobs/...` 且已清理。
+- 待决问题:无;T1.6 DoD 已达成,下一步按 PLAN 串行进入 T1.7 收尾。
