@@ -1,0 +1,18 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff
+        entry: .venv/bin/python -m ruff check
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format
+        entry: .venv/bin/python -m ruff format --check
+        language: system
+        types_or: [python, pyi]
+      - id: forbid-main-commit
+        name: forbid direct commits to main
+        entry: tools/forbid_main_commit.sh
+        language: script
+        stages: [pre-commit]

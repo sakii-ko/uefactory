@@ -2,11 +2,11 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由 Planner 维护;Coder(同事)只执行「当前 Sprint」清单中的任务,不自行扩大范围。
-> 最后更新:2026-07-08(第 4 次) · 当前阶段:**M0(骨架与冒烟渲染)** · 状态:**T0.1–T0.4 全部 DONE**
-> ✅ Review #4:`docs/reviews/2026-07-08-interim-4-f5-f7-done.md` —— F5/F6/F7 复审全部通过
-> (F5 的 WriteSpeedResult 反 fallback 范式可作后续样板)。
-> **当前主线:T0.5 收尾(F8 + review #3 两个 NIT + WORKLOG 汇总 + QUESTIONS 清点)→
-> `REVIEW REQUESTED` → Planner 正式全量 review → 合 main + tag v0.1.0 → 解冻 T0.6/T0.7。**
+> 最后更新:2026-07-08(第 5 次) · 当前阶段:**M0 后半(远程节点)** · 状态:**T0.1–T0.5 正式 review 通过,已合入 main(tag `m0-core-done`)**
+> ✅ 正式 review:`docs/reviews/2026-07-08-formal-m0-core.md`(APPROVE;确定性渲染三连验证)。
+> **当前主线:T0.6(远程基建 + 远程 doctor,新分支 `feat/m0-remote`)→ review → T0.7(引擎
+> provision + 远程冒烟)→ M0 完整验收(Owner)→ tag `v0.1.0`,然后进入 M1。**
+> Q1–Q4(资产获取拍板项)已呈 Owner,不阻塞当前主线。
 > 规则不变:DoD 验收对象不可自行替换;一次只推进一个任务。
 
 ---

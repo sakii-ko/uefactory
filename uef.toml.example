@@ -1,0 +1,26 @@
+[core]
+ue_root = "/root/nas/bigdata1/cjw/UnrealEngine_5.5.4"
+ue_home = "/root/nas/bigdata1/cjw/UE5Home"
+data_dir = "data"
+log_dir = "logs"
+ddc_dir = "data/ddc"
+# Optional local runtime dependency directory. Use only when the system loader is
+# unavailable; the current node needs this for libvulkan.so.1.
+# runtime_lib_dir = "data/runtime_deps/extracted/usr/lib/x86_64-linux-gnu"
+
+[doctor]
+min_free_vram_gib = 8
+nas_warn_write_mbps = 200
+write_test_mib = 512
+
+[hosts.4090]
+ssh_alias = "4090"
+work_dir = "/home/lyf/uef"
+engine_dir = "/home/lyf/uef/engine"
+gpu = "8x RTX 4090"
+
+[hosts.l40s]
+ssh_alias = "l40s"
+work_dir = "/root/nas/bigdata1/cjw/uef"
+engine_dir = "/root/nas/bigdata1/cjw/uef/engine"
+gpu = "1x L40S"

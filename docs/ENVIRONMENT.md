@@ -7,12 +7,14 @@
 - GPU:**NVIDIA H100 80GB HBM3**(driver 580.126.20, CUDA 13.0)。
   - ⚠️ 常驻进程 `miniconda3/envs/wm/bin/python3`(非本项目)占用 **~69 GiB** 显存,渲染可用余量约 12 GiB。**不得动这个进程。**
 - Vulkan:`/etc/vulkan/icd.d/nvidia_icd.json` 存在;`vulkaninfo` 未安装(想装需走 QUESTIONS)。
+  - 系统 `libvulkan.so.1` 也未安装,但当前用户无权限 `apt-get install`;本项目用 ignored `data/runtime_deps` 解包 `libvulkan1` 小依赖,并通过本地 `uef.toml` 的 `runtime_lib_dir` 显式注入 `LD_LIBRARY_PATH`。
 - **无 docker**;git 2.x 可用;系统 Python 3.13.13。
 
 ## 存储
 - `/root/nas/bigdata1`:CephFS NAS,577T 总 / **358T 空闲**。repo 就在这里。
 - ⚠️ `/home/chijw/workspace` **同样挂在这个 CephFS 上**——机器可能没有可写的本地盘,T0.1 doctor 需实测确认(遍历非网络挂载点 + 写速测试)。
-- DDC(UE DerivedDataCache)对 IO 敏感:若无本地盘,首次 shader 编译会很慢,耗时如实记录。
+- ⚠️ `/root/nas/fastdata2` 是昂贵的全闪共享盘,一般不允许存储大数据;除非 Owner 明确同意,不要把 DDC、渲染输出、引擎、资产缓存等大目录放到这里。只允许临时小文件/细碎小数据。
+- DDC(UE DerivedDataCache)对 IO 敏感:若无可用本地盘,DDC 放 `bigdata1` NAS 并把首次 shader 编译耗时如实记录;不要默认改用 `fastdata2`。
 
 ## Unreal Engine(已就位,不要重新下载)
 - **UE 5.5.4 预编译 Linux 版**:`/root/nas/bigdata1/cjw/UnrealEngine_5.5.4/`

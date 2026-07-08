@@ -20,6 +20,7 @@ ue/UEFBase/Binaries/
 ue/UEFBase/DerivedDataCache/
 ue/UEFBase/Intermediate/
 ue/UEFBase/Saved/
+ue/UEFBase/Config/DefaultInput.ini
 ue/UEFBase/Content/*
 !ue/UEFBase/Content/Python/
 
