@@ -23,6 +23,7 @@ def main() -> None:
     if world is None:
         raise RuntimeError("Could not get editor world")
 
+    unreal.SystemLibrary.execute_console_command(world, "DisableAllScreenMessages")
     _clear_existing(editor_actor_subsystem)
     _build_scene(editor_actor_subsystem)
 
@@ -60,10 +61,21 @@ def _load_job() -> dict:
 def _clear_existing(editor_actor_subsystem) -> None:
     for actor in list(editor_actor_subsystem.get_all_level_actors()):
         if unreal.Name("UEF_SMOKE") in actor.tags:
-            editor_actor_subsystem.destroy_actor(actor)
+            destroyed = editor_actor_subsystem.destroy_actor(actor)
+            if destroyed is False:
+                raise RuntimeError(f"Could not destroy actor {actor.get_actor_label()}")
 
 
 def _build_scene(editor_actor_subsystem) -> None:
+    # Template_Default can expose fallback skydome warning text in offscreen captures.
+    _spawn_mesh(
+        editor_actor_subsystem,
+        "/Engine/BasicShapes/Cube",
+        "UEF_Smoke_Backdrop",
+        (1200, 0, 520),
+        (0, 0, 0),
+        (0.2, 60, 30),
+    )
     _spawn_mesh(
         editor_actor_subsystem,
         "/Engine/BasicShapes/Plane",

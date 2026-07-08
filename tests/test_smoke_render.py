@@ -186,6 +186,11 @@ def test_remote_smoke_pulls_validated_frame_and_cleans_up(
     assert any(call.startswith("tmux:smoke_l40s_") for call in calls)
     assert any(call.startswith("pull:True:") for call in calls)
     assert any(call.startswith("remove:/remote/work/jobs/smoke_l40s_") for call in calls)
+    assert any("test ! -e /remote/work/jobs/smoke_l40s_" in call for call in calls)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["cleanup"]["status"] == "ok"
+    assert manifest["cleanup"]["verified"] is True
+    assert manifest["cleanup"]["removed_paths"][0].startswith("/remote/work/jobs/smoke_l40s_")
 
 
 @pytest.mark.ue

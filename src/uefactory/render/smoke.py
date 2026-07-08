@@ -233,6 +233,7 @@ def render_smoke_remote(
     frame_path = run_dir / "frame_0000.png"
     manifest_path = run_dir / "manifest.json"
     ue_log_path = run_dir / "ue.log"
+    cleanup_error: Exception | None = None
     try:
         if status.get("status") != "complete":
             msg = f"Remote smoke failed on {host}: {status}"
@@ -254,7 +255,15 @@ def render_smoke_remote(
         manifest["local_validation"] = {"status": "ok", "validated_utc": utc_timestamp()}
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     finally:
-        remote.remove_tree(str(remote_run_dir), timeout_sec=60)
+        cleanup, cleanup_error = _cleanup_remote_paths(remote, [remote_run_dir], timeout_sec=60)
+        try:
+            _record_remote_cleanup(manifest_path, cleanup)
+        except Exception as exc:
+            cleanup_error = cleanup_error or exc
+
+    if cleanup_error is not None:
+        msg = f"Remote smoke cleanup failed or could not be recorded for {remote_run_dir}"
+        raise RuntimeError(msg) from cleanup_error
 
     LOGGER.info(
         "Remote smoke render produced %s via %s (mean_luma=%.3f)",
@@ -269,6 +278,49 @@ def render_smoke_remote(
         ue_log_path=ue_log_path,
         mean_luma=image_info.mean_luma,
     )
+
+
+def _cleanup_remote_paths(
+    remote: RemoteHost,
+    remote_paths: list[PurePosixPath],
+    *,
+    timeout_sec: int,
+) -> tuple[dict[str, Any], Exception | None]:
+    cleanup: dict[str, Any] = {
+        "status": "ok",
+        "removed_paths": [str(path) for path in remote_paths],
+        "verified": False,
+        "cleaned_utc": utc_timestamp(),
+    }
+    try:
+        for remote_path in remote_paths:
+            remote.remove_tree(str(remote_path), timeout_sec=timeout_sec)
+        verify_command = "\n".join(
+            ["set -euo pipefail"]
+            + [f"test ! -e {shlex.quote(str(remote_path))}" for remote_path in remote_paths]
+        )
+        verify = remote.run(verify_command, timeout_sec=timeout_sec, check=False)
+        cleanup["verify_returncode"] = verify.returncode
+        cleanup["verified"] = verify.returncode == 0
+        if verify.returncode != 0:
+            cleanup["status"] = "failed"
+            cleanup["verify_stderr"] = verify.stderr[-2000:]
+            msg = f"Remote cleanup verification failed for {cleanup['removed_paths']}"
+            return cleanup, RuntimeError(msg)
+    except Exception as exc:
+        cleanup["status"] = "failed"
+        cleanup["error_type"] = type(exc).__name__
+        cleanup["error"] = str(exc)
+        return cleanup, exc
+    return cleanup, None
+
+
+def _record_remote_cleanup(manifest_path: Path, cleanup: dict[str, Any]) -> None:
+    if not manifest_path.exists():
+        return
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["cleanup"] = cleanup
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _prepare_remote_smoke_runtime(remote: RemoteHost, *, run_user: str) -> dict[str, Any]:
