@@ -769,4 +769,4 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
 - QUESTIONS 清点:`docs/QUESTIONS.md` 待批复为 `(暂无)`;Q1-Q4 均已归档并有 Owner/Planner 答复。
 - 待决问题:无;M1 当前分支已可请求 review。
 
-REVIEW REQUESTED: feat/m1-render PENDING_HEAD
+REVIEW REQUESTED: feat/m1-render 43d2163
