@@ -12,7 +12,8 @@
 ## 存储
 - `/root/nas/bigdata1`:CephFS NAS,577T 总 / **358T 空闲**。repo 就在这里。
 - ⚠️ `/home/chijw/workspace` **同样挂在这个 CephFS 上**——机器可能没有可写的本地盘,T0.1 doctor 需实测确认(遍历非网络挂载点 + 写速测试)。
-- DDC(UE DerivedDataCache)对 IO 敏感:若无本地盘,首次 shader 编译会很慢,耗时如实记录。
+- ⚠️ `/root/nas/fastdata2` 是昂贵的全闪共享盘,一般不允许存储大数据;除非 Owner 明确同意,不要把 DDC、渲染输出、引擎、资产缓存等大目录放到这里。只允许临时小文件/细碎小数据。
+- DDC(UE DerivedDataCache)对 IO 敏感:若无可用本地盘,DDC 放 `bigdata1` NAS 并把首次 shader 编译耗时如实记录;不要默认改用 `fastdata2`。
 
 ## Unreal Engine(已就位,不要重新下载)
 - **UE 5.5.4 预编译 Linux 版**:`/root/nas/bigdata1/cjw/UnrealEngine_5.5.4/`
