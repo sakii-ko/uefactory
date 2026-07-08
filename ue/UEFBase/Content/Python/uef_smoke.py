@@ -37,8 +37,7 @@ def main() -> None:
         render_target,
         unreal.LinearColor(0, 0, 0, 1),
     )
-    _draw_smoke_pattern(world, render_target, width, height)
-    time.sleep(0.25)
+    _capture_scene(editor_actor_subsystem, render_target)
 
     unreal.RenderingLibrary.export_render_target(
         world,
@@ -48,39 +47,6 @@ def main() -> None:
     )
     unreal.log(f"[UEF-SMOKE] out_dir files={sorted(os.listdir(out_dir))}")
     unreal.log(f"[UEF-SMOKE] wrote {out_dir / filename}")
-
-
-def _draw_smoke_pattern(world, render_target, width: int, height: int) -> None:
-    canvas, _, context = unreal.RenderingLibrary.begin_draw_canvas_to_render_target(
-        world,
-        render_target,
-    )
-    canvas.draw_box(
-        unreal.Vector2D(width * 0.08, height * 0.12),
-        unreal.Vector2D(width * 0.36, height * 0.68),
-        80.0,
-        unreal.LinearColor(0.95, 0.25, 0.16, 1.0),
-    )
-    canvas.draw_box(
-        unreal.Vector2D(width * 0.44, height * 0.18),
-        unreal.Vector2D(width * 0.42, height * 0.58),
-        120.0,
-        unreal.LinearColor(0.12, 0.75, 0.95, 1.0),
-    )
-    canvas.draw_line(
-        unreal.Vector2D(width * 0.12, height * 0.82),
-        unreal.Vector2D(width * 0.88, height * 0.22),
-        18.0,
-        unreal.LinearColor(1.0, 0.92, 0.18, 1.0),
-    )
-    canvas.draw_line(
-        unreal.Vector2D(width * 0.14, height * 0.24),
-        unreal.Vector2D(width * 0.92, height * 0.78),
-        10.0,
-        unreal.LinearColor(0.3, 1.0, 0.42, 1.0),
-    )
-    unreal.RenderingLibrary.end_draw_canvas_to_render_target(world, context)
-    unreal.log("[UEF-SMOKE] canvas smoke pattern rendered")
 
 
 def _load_job() -> dict:
@@ -105,16 +71,14 @@ def _build_scene(editor_actor_subsystem) -> None:
         (250, 0, 0),
         (0, 0, 0),
         (16, 16, 1),
-        "/Engine/EngineMaterials/EmissiveMeshMaterial",
     )
     _spawn_mesh(
         editor_actor_subsystem,
         "/Engine/BasicShapes/Cube",
         "UEF_Smoke_Cube",
-        (180, 0, 220),
+        (180, 0, 100),
         (0, 0, 0),
-        (4, 4, 4),
-        "/Engine/EngineMaterials/EmissiveMeshMaterial",
+        (2, 2, 2),
     )
     directional = editor_actor_subsystem.spawn_actor_from_class(
         unreal.DirectionalLight,
@@ -123,6 +87,7 @@ def _build_scene(editor_actor_subsystem) -> None:
     )
     directional.set_actor_label("UEF_Smoke_DirectionalLight")
     directional.tags = [unreal.Name("UEF_SMOKE")]
+    _set_movable(directional)
     directional.light_component.set_editor_property("intensity", 20.0)
 
     skylight = editor_actor_subsystem.spawn_actor_from_class(
@@ -132,7 +97,42 @@ def _build_scene(editor_actor_subsystem) -> None:
     )
     skylight.set_actor_label("UEF_Smoke_SkyLight")
     skylight.tags = [unreal.Name("UEF_SMOKE")]
+    _set_movable(skylight)
     skylight.light_component.set_editor_property("intensity", 5.0)
+    if hasattr(skylight.light_component, "recapture_sky"):
+        skylight.light_component.recapture_sky()
+
+
+def _capture_scene(editor_actor_subsystem, render_target) -> None:
+    capture = editor_actor_subsystem.spawn_actor_from_class(
+        unreal.SceneCapture2D,
+        unreal.Vector(-800, 0, 320),
+        unreal.Rotator(-12, 0, 0),
+    )
+    capture.set_actor_label("UEF_Smoke_SceneCapture2D")
+    capture.tags = [unreal.Name("UEF_SMOKE")]
+    _set_movable(capture)
+
+    component = getattr(capture, "capture_component2d", None) or getattr(
+        capture,
+        "scene_capture_component2d",
+        None,
+    )
+    if component is None:
+        raise RuntimeError("SceneCapture2D component is unavailable")
+    component.set_editor_property("texture_target", render_target)
+    component.set_editor_property("capture_source", unreal.SceneCaptureSource.SCS_FINAL_COLOR_LDR)
+    component.set_editor_property("fov_angle", 55.0)
+    component.set_editor_property("capture_every_frame", False)
+    component.set_editor_property("capture_on_movement", False)
+    component.set_editor_property("always_persist_rendering_state", True)
+
+    # A single offscreen capture can run before exposure/rendering state settles in headless editor.
+    component.capture_scene()
+    time.sleep(0.25)
+    component.capture_scene()
+    time.sleep(0.25)
+    unreal.log("[UEF-SMOKE] scene capture rendered")
 
 
 def _spawn_mesh(
@@ -151,6 +151,7 @@ def _spawn_mesh(
     )
     actor.set_actor_label(label)
     actor.tags = [unreal.Name("UEF_SMOKE")]
+    _set_movable(actor)
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
     if mesh is None:
         raise RuntimeError(f"Could not load mesh: {mesh_path}")
@@ -162,6 +163,25 @@ def _spawn_mesh(
         actor.static_mesh_component.set_material(0, material)
     actor.set_actor_scale3d(unreal.Vector(*scale))
     return actor
+
+
+def _set_movable(actor) -> None:
+    components = [
+        getattr(actor, "root_component", None),
+        getattr(actor, "static_mesh_component", None),
+        getattr(actor, "light_component", None),
+        getattr(actor, "capture_component2d", None),
+        getattr(actor, "scene_capture_component2d", None),
+    ]
+    seen = set()
+    for component in components:
+        if component is None or id(component) in seen:
+            continue
+        seen.add(id(component))
+        try:
+            component.set_editor_property("mobility", unreal.ComponentMobility.MOVABLE)
+        except Exception as exc:
+            unreal.log_warning(f"[UEF-SMOKE] could not set movable on {component}: {exc}")
 
 
 if __name__ == "__main__":

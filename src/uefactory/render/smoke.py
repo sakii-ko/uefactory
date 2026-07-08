@@ -57,6 +57,7 @@ def render_smoke(settings: Settings, out_root: Path, timeout_sec: int = 1800) ->
     job = {
         "out_dir": str(run_dir),
         "filename": raw_frame.name,
+        "render_kind": "scene",
         "width": 1280,
         "height": 720,
     }
@@ -224,6 +225,7 @@ def _manifest(
     return {
         "schema_version": 1,
         "status": status,
+        "render_kind": str(job.get("render_kind", "unknown")),
         "job": job,
         "command": command,
         "duration_sec": duration_sec,

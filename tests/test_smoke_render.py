@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -48,3 +49,6 @@ def test_smoke_render_end_to_end(tmp_path: Path) -> None:
     assert result.frame_path.exists()
     assert result.manifest_path.exists()
     assert result.mean_luma > 5
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["render_kind"] == "scene"
