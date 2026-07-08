@@ -98,7 +98,8 @@ def render_job_command(
     try:
         first = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
         typer.echo(f"Render job OK: {first.run_dir}")
-        typer.echo(f"Frames: {len(first.frame_paths)}")
+        typer.echo(f"Passes: {', '.join(first.frame_paths)}")
+        typer.echo(f"Frames/pass: {first.spec.frame_count}")
         typer.echo(f"Manifest: {first.manifest_path}")
         if verify_twice:
             second = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)

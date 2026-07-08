@@ -39,6 +39,7 @@ def _create_sequence(job: dict):
         unreal.EditorAssetLibrary.delete_asset(asset_path)
 
     materials = _create_materials(package_path)
+    _create_object_mask_material(package_path)
     sequence = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
         asset_name,
         package_path,
@@ -61,6 +62,7 @@ def _create_sequence(job: dict):
         location=(0, 0, 0),
         rotation=(0, 0, 0),
         scale=(1.0, 1.0, 1.0),
+        stencil_value=1,
     )
     _add_static_mesh_spawnable(
         sequence,
@@ -71,6 +73,7 @@ def _create_sequence(job: dict):
         location=(0, 0, -90),
         rotation=(0, 0, 0),
         scale=(5.0, 5.0, 0.05),
+        stencil_value=2,
     )
     _add_directional_light_spawnable(
         sequence,
@@ -149,6 +152,56 @@ def _create_lit_material(package_path: str, asset_name: str, color):
     return material
 
 
+def _create_object_mask_material(package_path: str):
+    asset_name = "UEF_ObjectMask_Mat"
+    asset_path = f"{package_path}/{asset_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        unreal.EditorAssetLibrary.delete_asset(asset_path)
+    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        asset_name,
+        package_path,
+        unreal.Material,
+        unreal.MaterialFactoryNew(),
+    )
+    if material is None:
+        raise RuntimeError(f"Could not create object mask material: {asset_path}")
+    material.set_editor_property("material_domain", unreal.MaterialDomain.MD_POST_PROCESS)
+    material.set_editor_property(
+        "blendable_location",
+        unreal.BlendableLocation.BL_REPLACING_TONEMAPPER,
+    )
+    stencil_node = unreal.MaterialEditingLibrary.create_material_expression(
+        material,
+        unreal.MaterialExpressionSceneTexture,
+        -400,
+        0,
+    )
+    stencil_node.set_editor_property("scene_texture_id", unreal.SceneTextureId.PPI_CUSTOM_STENCIL)
+    divide_node = unreal.MaterialEditingLibrary.create_material_expression(
+        material,
+        unreal.MaterialExpressionDivide,
+        -180,
+        0,
+    )
+    divisor = unreal.MaterialEditingLibrary.create_material_expression(
+        material,
+        unreal.MaterialExpressionConstant,
+        -360,
+        180,
+    )
+    divisor.set_editor_property("r", 255.0)
+    unreal.MaterialEditingLibrary.connect_material_expressions(stencil_node, "", divide_node, "A")
+    unreal.MaterialEditingLibrary.connect_material_expressions(divisor, "", divide_node, "B")
+    unreal.MaterialEditingLibrary.connect_material_property(
+        divide_node,
+        "",
+        unreal.MaterialProperty.MP_EMISSIVE_COLOR,
+    )
+    unreal.MaterialEditingLibrary.recompile_material(material)
+    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    return material
+
+
 def _add_static_mesh_spawnable(
     sequence,
     *,
@@ -159,6 +212,7 @@ def _add_static_mesh_spawnable(
     location: tuple[float, float, float],
     rotation: tuple[float, float, float],
     scale: tuple[float, float, float],
+    stencil_value: int,
 ):
     binding = sequence.add_spawnable_from_class(unreal.StaticMeshActor)
     binding.set_display_name(label)
@@ -172,6 +226,8 @@ def _add_static_mesh_spawnable(
         raise RuntimeError(f"Could not load mesh: {mesh_path}")
     component = actor.static_mesh_component
     component.set_static_mesh(mesh)
+    component.set_render_custom_depth(True)
+    component.set_custom_depth_stencil_value(int(stencil_value))
     material_slots = max(1, int(component.get_num_materials()))
     for material_index in range(material_slots):
         component.set_material(material_index, material)

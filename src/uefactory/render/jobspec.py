@@ -6,6 +6,8 @@ from typing import Any
 
 import yaml
 
+from uefactory.render.passes import SUPPORTED_PASSES
+
 
 class JobSpecError(ValueError):
     """Raised when a JobSpec YAML file is syntactically valid but unsupported."""
@@ -98,8 +100,16 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
     )
 
     passes = tuple(_string_list(root["passes"], "$.passes", min_len=1))
-    if passes != ("beauty_lit",):
-        raise JobSpecError("$.passes: T1.3 supports exactly ['beauty_lit']")
+    seen_passes: set[str] = set()
+    for index, pass_name in enumerate(passes):
+        if pass_name not in SUPPORTED_PASSES:
+            allowed_values = ", ".join(sorted(repr(item) for item in SUPPORTED_PASSES))
+            raise JobSpecError(
+                f"$.passes[{index}]: expected one of {allowed_values}, got {pass_name!r}"
+            )
+        if pass_name in seen_passes:
+            raise JobSpecError(f"$.passes[{index}]: duplicate pass {pass_name!r}")
+        seen_passes.add(pass_name)
 
     output_raw = _mapping(root["output"], "$.output")
     _require_keys(output_raw, {"dir"}, "$.output")

@@ -6,6 +6,7 @@ from re import escape
 import pytest
 
 from uefactory.render.jobspec import JobSpecError, parse_jobspec
+from uefactory.render.passes import PASS_ORDER
 
 
 def valid_jobspec() -> dict[str, object]:
@@ -37,6 +38,15 @@ def test_parse_jobspec_accepts_t13_orbit_cube() -> None:
     assert spec.output.dir == Path("out/renders")
 
 
+def test_parse_jobspec_accepts_t14_all_passes() -> None:
+    raw = valid_jobspec()
+    raw["passes"] = list(PASS_ORDER)
+
+    spec = parse_jobspec(raw, source_path=Path("examples/orbit8.yaml"))
+
+    assert spec.passes == PASS_ORDER
+
+
 @pytest.mark.parametrize(
     ("patch", "message"),
     [
@@ -48,7 +58,8 @@ def test_parse_jobspec_accepts_t13_orbit_cube() -> None:
         ({"camera": {"resolution": [640]}}, "$.camera.resolution"),
         ({"assets": ["chair_001"]}, "$.assets"),
         ({"lighting": {"preset": "hdri"}}, "$.lighting.preset"),
-        ({"passes": ["beauty_unlit"]}, "$.passes"),
+        ({"passes": ["not_a_pass"]}, "$.passes[0]"),
+        ({"passes": ["beauty_lit", "beauty_lit"]}, "$.passes[1]"),
     ],
 )
 def test_parse_jobspec_rejects_unsupported_or_invalid_values(

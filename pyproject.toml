@@ -9,6 +9,8 @@ description = "UE data factory CLI for headless Unreal Engine rendering"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "numpy>=2.0,<2.3",
+    "OpenEXR>=3.4,<4",
     "pillow>=10.0",
     "PyYAML>=6.0",
     "typer>=0.12",

@@ -5,11 +5,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageStat
-
 from uefactory.core.config import Settings
 from uefactory.core.paths import resolve_path, utc_timestamp
 from uefactory.render.jobspec import RenderJobSpec, load_jobspec
+from uefactory.render.passes import (
+    PassValidation,
+    assert_passes_distinct,
+    stable_validation_payload,
+    validate_render_pass,
+)
 from uefactory.render.smoke import _prepend_env_path, _runtime_settings
 from uefactory.render.ue_runner import UERunnerError, run_ue
 
@@ -20,9 +24,19 @@ class RenderJobResult:
     manifest_path: Path
     ue_log_path: Path
     setup_log_path: Path
-    frame_paths: list[Path]
-    frame_luma: list[float]
+    frame_paths: dict[str, list[Path]]
+    pass_validations: dict[str, PassValidation]
     spec: RenderJobSpec
+
+    @property
+    def frame_luma(self) -> list[float]:
+        beauty = self.pass_validations.get("beauty_lit")
+        if beauty is None:
+            return []
+        return [
+            round(frame.mean[0] * 0.2126 + frame.mean[1] * 0.7152 + frame.mean[2] * 0.0722, 3)
+            for frame in beauty.frames
+        ]
 
 
 def render_job(
@@ -34,7 +48,7 @@ def render_job(
     spec = load_jobspec(job_path)
     run_id = utc_timestamp()
     out_root = resolve_path(spec.output.dir, settings.project_root)
-    run_dir = out_root / run_id / spec.asset_id.replace(":", "_") / spec.passes[0]
+    run_dir = out_root / run_id / spec.asset_id.replace(":", "_")
     run_dir.mkdir(parents=True, exist_ok=False)
 
     manifest_path = run_dir / "manifest.json"
@@ -169,17 +183,33 @@ def render_job(
         )
         raise RuntimeError(f"Render job did not produce manifest; UE log: {ue_log_path}")
 
-    frame_paths = sorted(run_dir.glob("*.png"))
-    if len(frame_paths) != spec.frame_count:
-        error = (
-            f"Render job expected {spec.frame_count} frames, "
-            f"found {len(frame_paths)}; run={run_dir}"
+    frame_paths = {
+        pass_name: sorted((run_dir / pass_name).glob("frame_*.*")) for pass_name in spec.passes
+    }
+    pass_validations = {
+        pass_name: validate_render_pass(
+            pass_name,
+            paths,
+            expected_frames=spec.frame_count,
         )
-        raise RuntimeError(error)
-    frame_luma = [_mean_luma(path) for path in frame_paths]
-    if any(luma <= 5 for luma in frame_luma):
-        raise RuntimeError(f"Render job produced dark frame luma={frame_luma}; run={run_dir}")
+        for pass_name, paths in frame_paths.items()
+    }
+    if {"beauty_lit", "beauty_unlit"}.issubset(frame_paths):
+        assert_passes_distinct(
+            pass_frames=frame_paths,
+            first_pass="beauty_lit",
+            second_pass="beauty_unlit",
+        )
 
+    result = RenderJobResult(
+        run_dir=run_dir,
+        manifest_path=manifest_path,
+        ue_log_path=ue_log_path,
+        setup_log_path=setup_log_path,
+        frame_paths=frame_paths,
+        pass_validations=pass_validations,
+        spec=spec,
+    )
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest.update(
         {
@@ -191,31 +221,28 @@ def render_job(
             "runtime": runtime,
             "setup_summary": _summary_payload(setup_result),
             "ue_summary": _summary_payload(ue_result),
-            "frame_luma": frame_luma,
+            "frame_luma": result.frame_luma,
+            "passes": stable_validation_payload(pass_validations),
         }
     )
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
-    return RenderJobResult(
-        run_dir=run_dir,
-        manifest_path=manifest_path,
-        ue_log_path=ue_log_path,
-        setup_log_path=setup_log_path,
-        frame_paths=frame_paths,
-        frame_luma=frame_luma,
-        spec=spec,
-    )
+    return result
 
 
-def compare_job_luma(first: RenderJobResult, second: RenderJobResult) -> list[tuple[float, float]]:
+def compare_job_luma(first: RenderJobResult, second: RenderJobResult) -> dict[str, Any]:
+    if set(first.pass_validations) != set(second.pass_validations):
+        raise ValueError(
+            f"Pass mismatch: {sorted(first.pass_validations)} != {sorted(second.pass_validations)}"
+        )
+    first_payload = stable_validation_payload(first.pass_validations)
+    second_payload = stable_validation_payload(second.pass_validations)
+    if first_payload != second_payload:
+        raise RuntimeError("Render job pass validation payload mismatch")
     if len(first.frame_luma) != len(second.frame_luma):
         raise ValueError(
             f"Frame count mismatch: {len(first.frame_luma)} != {len(second.frame_luma)}"
         )
-    pairs = list(zip(first.frame_luma, second.frame_luma, strict=True))
-    mismatches = [(left, right) for left, right in pairs if left != right]
-    if mismatches:
-        raise RuntimeError(f"Render job luma mismatch: {mismatches}")
-    return pairs
+    return first_payload
 
 
 def _ue_job_payload(
@@ -277,13 +304,6 @@ def _raise_on_ue_summary(
         error = f"Render job {phase} UE log contains {warning_count} warning lines"
         _write_failure_manifest(manifest_path, ue_job, commands, error, runtime)
         raise RuntimeError(f"{error}; UE log: {log_path}")
-
-
-def _mean_luma(frame_path: Path) -> float:
-    with Image.open(frame_path) as image:
-        image.load()
-        stat = ImageStat.Stat(image.convert("RGB").convert("L"))
-    return round(float(stat.mean[0]), 3)
 
 
 def _write_failure_manifest(

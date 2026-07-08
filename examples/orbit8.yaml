@@ -11,5 +11,10 @@ lighting:
   preset: three_point
 passes:
   - beauty_lit
+  - beauty_unlit
+  - depth
+  - normal
+  - basecolor
+  - object_mask
 output:
   dir: out/renders
