@@ -1,8 +1,61 @@
 from __future__ import annotations
 
+import signal
 from pathlib import Path
+from typing import Any
 
-from uefactory.render.ue_runner import summarize_ue_log
+import pytest
+
+from uefactory.render.ue_runner import run_ue, summarize_ue_log
+
+
+def test_run_ue_kills_process_group_when_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class InterruptedProcess:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.wait_calls = 0
+            self.terminated = False
+
+        def wait(self, *, timeout: int) -> int:
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                raise KeyboardInterrupt
+            assert timeout == 10
+            self.terminated = True
+            return -signal.SIGTERM
+
+        def poll(self) -> int | None:
+            return -signal.SIGTERM if self.terminated else None
+
+    process = InterruptedProcess()
+    popen_kwargs: dict[str, Any] = {}
+    kill_calls: list[tuple[int, signal.Signals]] = []
+
+    def fake_popen(*args: Any, **kwargs: Any) -> InterruptedProcess:
+        popen_kwargs.update(kwargs)
+        return process
+
+    monkeypatch.setattr("uefactory.render.ue_runner.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "uefactory.render.ue_runner.os.killpg",
+        lambda pid, sig: kill_calls.append((pid, sig)),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        run_ue(
+            ["UnrealEditor", "project.uproject"],
+            cwd=tmp_path,
+            log_path=tmp_path / "ue.log",
+            timeout_sec=60,
+        )
+
+    assert popen_kwargs["start_new_session"] is True
+    assert kill_calls == [(process.pid, signal.SIGTERM)]
+    assert process.wait_calls == 2
 
 
 def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:

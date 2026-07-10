@@ -17,8 +17,13 @@ def main() -> None:
     frames = int(job["frames"])
     unreal.log(f"[UEF-RENDER-JOB] setup start out={out_dir} frames={frames} size={width}x{height}")
 
-    sequence = _create_sequence(job)
-    unreal.log(f"[UEF-RENDER-JOB] setup complete sequence={sequence.get_path_name()}")
+    map_path = _create_empty_level(job)
+    sequence, beauty_sequence = _create_sequences(job)
+    _save_current_level(map_path)
+    unreal.log(
+        f"[UEF-RENDER-JOB] setup complete map={map_path} "
+        f"sequence={sequence.get_path_name()} beauty_sequence={beauty_sequence.get_path_name()}"
+    )
 
 
 def _load_job() -> dict:
@@ -29,18 +34,99 @@ def _load_job() -> dict:
         return json.load(file)
 
 
-def _create_sequence(job: dict):
+def _create_empty_level(job: dict) -> str:
+    map_path = str(job["map_path"])
+    if unreal.EditorAssetLibrary.does_asset_exist(
+        map_path
+    ) and not unreal.EditorAssetLibrary.delete_asset(map_path):
+        raise RuntimeError(f"Could not replace render level: {map_path}")
+    level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    if level_editor is None or not level_editor.new_level(map_path, False):
+        raise RuntimeError(f"Could not create empty render level: {map_path}")
+    unreal.log(f"[UEF-RENDER-JOB] empty level={map_path}")
+    return map_path
+
+
+def _save_current_level(map_path: str) -> None:
+    level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
+    if level_editor is None or not level_editor.save_current_level():
+        raise RuntimeError(f"Could not save render level: {map_path}")
+
+
+def _save_asset(asset_path: str) -> None:
+    if not unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False):
+        raise RuntimeError(f"Could not save render asset: {asset_path}")
+
+
+def _create_sequences(job: dict):
     run_id = str(job["run_id"])
     package_path = f"/Game/UEF/RenderJobs/{run_id}"
-    asset_name = f"UEF_RenderJob_{run_id}"
-    asset_path = f"{package_path}/{asset_name}"
     unreal.EditorAssetLibrary.make_directory(package_path)
+    lighting = job["lighting"]
+    preset = str(lighting["preset"])
+    materials = _create_materials(package_path, lighting_preset=preset)
+    _create_object_mask_material(package_path)
+
+    lighting_assets: dict[str, object] = {}
+    if preset == "three_point":
+        _add_three_point_lighting()
+    elif preset == "hdri":
+        texture = _import_hdri_texture(package_path, str(lighting["hdri_file"]))
+        lighting_assets = {
+            "texture": texture,
+            "backdrop_material": _create_hdri_backdrop_material(package_path, texture),
+        }
+    elif preset == "none":
+        unreal.log("[UEF-RENDER-JOB] lighting preset none: no lights spawned")
+    else:
+        raise RuntimeError(f"Unsupported lighting preset: {preset}")
+
+    sequence = _create_sequence_asset(
+        job,
+        package_path=package_path,
+        asset_name=f"UEF_RenderJob_{run_id}",
+        materials=materials,
+        lighting_assets=lighting_assets,
+        include_hdri_backdrop=False,
+    )
+    if preset == "hdri":
+        beauty_sequence = _create_sequence_asset(
+            job,
+            package_path=package_path,
+            asset_name=f"UEF_RenderJobBeauty_{run_id}",
+            materials=materials,
+            lighting_assets=lighting_assets,
+            include_hdri_backdrop=True,
+        )
+    else:
+        beauty_sequence = sequence
+    expected_paths = {
+        "data": str(job["sequence_path"]),
+        "beauty": str(job.get("beauty_sequence_path", job["sequence_path"])),
+    }
+    actual_paths = {
+        "data": sequence.get_path_name(),
+        "beauty": beauty_sequence.get_path_name(),
+    }
+    if actual_paths != expected_paths:
+        raise RuntimeError(
+            f"Render sequence path mismatch: expected={expected_paths} actual={actual_paths}"
+        )
+    return sequence, beauty_sequence
+
+
+def _create_sequence_asset(
+    job: dict,
+    *,
+    package_path: str,
+    asset_name: str,
+    materials: dict[str, object],
+    lighting_assets: dict[str, object],
+    include_hdri_backdrop: bool,
+):
+    asset_path = f"{package_path}/{asset_name}"
     if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
         unreal.EditorAssetLibrary.delete_asset(asset_path)
-
-    lighting = job["lighting"]
-    materials = _create_materials(package_path, lighting_preset=str(lighting["preset"]))
-    _create_object_mask_material(package_path)
     sequence = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
         asset_name,
         package_path,
@@ -71,22 +157,26 @@ def _create_sequence(job: dict):
         label="UEF_Job_Floor",
         mesh_path="/Engine/BasicShapes/Cube",
         material=materials["floor"],
-        location=(0, 0, -90),
+        location=(0, 0, -52.5),
         rotation=(0, 0, 0),
         scale=(5.0, 5.0, 0.05),
         stencil_value=2,
     )
-    _configure_lighting(sequence, job, package_path)
+    _configure_sequence_lighting(
+        sequence,
+        job,
+        lighting_assets=lighting_assets,
+        include_hdri_backdrop=include_hdri_backdrop,
+    )
     _add_orbit_camera(sequence, job)
 
-    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    _save_asset(asset_path)
     unreal.log(f"[UEF-RENDER-JOB] sequence={asset_path}.{asset_name}")
     return sequence
 
 
 def _create_materials(package_path: str, *, lighting_preset: str) -> dict[str, object]:
     cube_emissive = 10.0 if lighting_preset == "none" else 0.0
-    floor_emissive = 3.0 if lighting_preset == "none" else 0.0
     return {
         "cube": _create_lit_material(
             package_path,
@@ -98,7 +188,7 @@ def _create_materials(package_path: str, *, lighting_preset: str) -> dict[str, o
             package_path,
             "UEF_Job_Floor_Mat",
             (0.42, 0.46, 0.50),
-            emissive_strength=floor_emissive,
+            emissive_strength=0.0,
         ),
     }
 
@@ -163,49 +253,58 @@ def _create_lit_material(
             unreal.MaterialProperty.MP_BASE_COLOR,
         )
     unreal.MaterialEditingLibrary.recompile_material(material)
-    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    _save_asset(asset_path)
     return material
 
 
-def _configure_lighting(sequence, job: dict, package_path: str) -> None:
-    lighting = job["lighting"]
-    preset = str(lighting["preset"])
+def _configure_sequence_lighting(
+    sequence,
+    job: dict,
+    *,
+    lighting_assets: dict[str, object],
+    include_hdri_backdrop: bool,
+) -> None:
+    preset = str(job["lighting"]["preset"])
     frames = int(job["frames"])
-    if preset == "three_point":
-        _add_three_point_lighting(sequence, frames=frames)
-    elif preset == "hdri":
-        texture = _import_hdri_texture(package_path, str(lighting["hdri_file"]))
+    if preset == "hdri":
+        texture = lighting_assets["texture"]
         _add_hdri_lighting(sequence, frames=frames, texture=texture)
-    elif preset == "none":
-        unreal.log("[UEF-RENDER-JOB] lighting preset none: no lights spawned")
-    else:
-        raise RuntimeError(f"Unsupported lighting preset: {preset}")
+        if include_hdri_backdrop:
+            _add_static_mesh_spawnable(
+                sequence,
+                frames=frames,
+                label="UEF_Job_HDRIBackdrop",
+                mesh_path="/HDRIBackdrop/Meshes/EnviroDome",
+                material=lighting_assets["backdrop_material"],
+                location=(0, 0, 0),
+                rotation=(0, 0, 0),
+                scale=(100.0, 100.0, 100.0),
+                stencil_value=None,
+                cast_shadow=False,
+            )
 
 
-def _add_three_point_lighting(sequence, *, frames: int) -> None:
-    _add_directional_light_spawnable(
-        sequence,
-        frames=frames,
+def _add_three_point_lighting() -> None:
+    # Fixed lights belong to the level instead of the sequence. Sequencer assigns
+    # spawnables random binding GUIDs, which can change equal-type light registration
+    # order and produce one-to-three-code-value FP16 accumulation differences.
+    _add_directional_light_actor(
         label="UEF_Job_KeyLight",
         location=(-250, -350, 500),
         rotation=(-50, 35, 0),
         intensity=8.0,
     )
-    _add_directional_light_spawnable(
-        sequence,
-        frames=frames,
+    _add_directional_light_actor(
         label="UEF_Job_FillLight",
         location=(350, 250, 350),
-        rotation=(-35, -140, 0),
+        rotation=(-35, -85, 0),
         intensity=2.0,
     )
-    _add_sky_light_spawnable(
-        sequence,
-        frames=frames,
-        label="UEF_Job_SkyLight",
-        location=(0, 0, 250),
-        rotation=(0, 0, 0),
-        intensity=1.0,
+    _add_directional_light_actor(
+        label="UEF_Job_RimLight",
+        location=(250, 350, 450),
+        rotation=(-25, 155, 0),
+        intensity=3.0,
     )
 
 
@@ -244,7 +343,54 @@ def _import_hdri_texture(package_path: str, hdri_file: str):
         raise RuntimeError(f"Could not import HDRI texture: {source}")
     if texture.get_class().get_name() != "TextureCube":
         raise RuntimeError(f"HDRI import did not produce TextureCube: {texture.get_path_name()}")
+    _save_asset(asset_path)
     return texture
+
+
+def _create_hdri_backdrop_material(package_path: str, texture):
+    asset_name = "UEF_HDRIBackdrop_Mat"
+    asset_path = f"{package_path}/{asset_name}"
+    if unreal.EditorAssetLibrary.does_asset_exist(asset_path):
+        unreal.EditorAssetLibrary.delete_asset(asset_path)
+    material = unreal.AssetToolsHelpers.get_asset_tools().create_asset(
+        asset_name,
+        package_path,
+        unreal.MaterialInstanceConstant,
+        unreal.MaterialInstanceConstantFactoryNew(),
+    )
+    if material is None:
+        raise RuntimeError(f"Could not create HDRI backdrop material: {asset_path}")
+    parent = unreal.load_asset("/HDRIBackdrop/Materials/MI_HDRI_Sky.MI_HDRI_Sky")
+    if parent is None:
+        raise RuntimeError("Could not load HDRIBackdrop sky material")
+    unreal.MaterialEditingLibrary.set_material_instance_parent(material, parent)
+    # UE 5.5's MaterialEditingLibrary setters mutate correctly but always return false.
+    # Verify the readback instead of trusting that broken return value.
+    unreal.MaterialEditingLibrary.set_material_instance_texture_parameter_value(
+        material,
+        unreal.Name("HDRI_Map"),
+        texture,
+    )
+    unreal.MaterialEditingLibrary.set_material_instance_scalar_parameter_value(
+        material,
+        unreal.Name("Intensity"),
+        1.0,
+    )
+    unreal.MaterialEditingLibrary.update_material_instance(material)
+    actual_texture = unreal.MaterialEditingLibrary.get_material_instance_texture_parameter_value(
+        material,
+        unreal.Name("HDRI_Map"),
+    )
+    actual_intensity = unreal.MaterialEditingLibrary.get_material_instance_scalar_parameter_value(
+        material,
+        unreal.Name("Intensity"),
+    )
+    if actual_texture is None or actual_texture.get_path_name() != texture.get_path_name():
+        raise RuntimeError("Could not set HDRI_Map on backdrop material")
+    if not math.isclose(float(actual_intensity), 1.0, rel_tol=0.0, abs_tol=1e-6):
+        raise RuntimeError("Could not set Intensity on backdrop material")
+    _save_asset(asset_path)
+    return material
 
 
 def _create_object_mask_material(package_path: str):
@@ -293,7 +439,7 @@ def _create_object_mask_material(package_path: str):
         unreal.MaterialProperty.MP_EMISSIVE_COLOR,
     )
     unreal.MaterialEditingLibrary.recompile_material(material)
-    unreal.EditorAssetLibrary.save_asset(asset_path, only_if_is_dirty=False)
+    _save_asset(asset_path)
     return material
 
 
@@ -307,12 +453,15 @@ def _add_static_mesh_spawnable(
     location: tuple[float, float, float],
     rotation: tuple[float, float, float],
     scale: tuple[float, float, float],
-    stencil_value: int,
+    stencil_value: int | None,
+    cast_shadow: bool = True,
+    tags: tuple[str, ...] = (),
 ):
     binding = sequence.add_spawnable_from_class(unreal.StaticMeshActor)
     binding.set_display_name(label)
     actor = _object_template(binding)
     actor.set_actor_label(label)
+    actor.set_editor_property("tags", [unreal.Name(tag) for tag in tags])
     _set_transform(actor, location, rotation, scale)
     _add_transform_track(binding, frames=frames, location=location, rotation=rotation, scale=scale)
     _set_movable(actor)
@@ -321,8 +470,12 @@ def _add_static_mesh_spawnable(
         raise RuntimeError(f"Could not load mesh: {mesh_path}")
     component = actor.static_mesh_component
     component.set_static_mesh(mesh)
-    component.set_render_custom_depth(True)
-    component.set_custom_depth_stencil_value(int(stencil_value))
+    component.set_editor_property("cast_shadow", bool(cast_shadow))
+    if stencil_value is None:
+        component.set_render_custom_depth(False)
+    else:
+        component.set_render_custom_depth(True)
+        component.set_custom_depth_stencil_value(int(stencil_value))
     material_slots = max(1, int(component.get_num_materials()))
     for material_index in range(material_slots):
         component.set_material(material_index, material)
@@ -351,6 +504,36 @@ def _add_directional_light_spawnable(
     actor.light_component.set_editor_property("intensity", intensity)
     actor.light_component.set_editor_property("cast_shadows", False)
     return binding
+
+
+def _add_directional_light_actor(
+    *,
+    label: str,
+    location: tuple[float, float, float],
+    rotation: tuple[float, float, float],
+    intensity: float,
+):
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    if actor_subsystem is None:
+        raise RuntimeError("EditorActorSubsystem is unavailable")
+    actor = actor_subsystem.spawn_actor_from_class(
+        actor_class=unreal.DirectionalLight,
+        location=unreal.Vector(*location),
+        rotation=unreal.Rotator(
+            pitch=rotation[0],
+            yaw=rotation[1],
+            roll=rotation[2],
+        ),
+        transient=False,
+    )
+    if actor is None:
+        raise RuntimeError(f"Could not spawn persistent directional light: {label}")
+    actor.set_actor_label(label)
+    _set_transform(actor, location, rotation, (1, 1, 1))
+    _set_movable(actor)
+    actor.light_component.set_editor_property("intensity", intensity)
+    actor.light_component.set_editor_property("cast_shadows", False)
+    return actor
 
 
 def _add_sky_light_spawnable(
@@ -508,7 +691,7 @@ def _configure_perspective_camera(actor, fov: float) -> None:
         raise RuntimeError(f"Camera actor has no camera component: {actor}")
     camera_component.set_editor_property("projection_mode", unreal.CameraProjectionMode.PERSPECTIVE)
     try:
-        camera_component.set_editor_property("field_of_view", float(fov))
+        camera_component.set_field_of_view(float(fov))
         return
     except Exception as field_error:
         try:
@@ -535,7 +718,14 @@ def _set_transform(
     scale: tuple[float, float, float],
 ) -> None:
     actor.set_actor_location(unreal.Vector(*location), False, True)
-    actor.set_actor_rotation(unreal.Rotator(*rotation), False)
+    actor.set_actor_rotation(
+        unreal.Rotator(
+            pitch=rotation[0],
+            yaw=rotation[1],
+            roll=rotation[2],
+        ),
+        False,
+    )
     actor.set_actor_scale3d(unreal.Vector(*scale))
 
 

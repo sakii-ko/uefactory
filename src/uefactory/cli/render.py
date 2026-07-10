@@ -6,7 +6,7 @@ from typing import Annotated
 import typer
 
 from uefactory.cli._common import settings_from_context
-from uefactory.render.job import compare_job_luma, render_job, render_job_remote
+from uefactory.render.job import compare_job_outputs, render_job, render_job_remote
 from uefactory.render.jobspec import JobSpecError
 from uefactory.render.mrq_spike import compare_spike_luma, render_mrq_spike
 from uefactory.render.smoke import render_smoke, render_smoke_remote
@@ -91,7 +91,10 @@ def render_job_command(
     ] = 1800,
     verify_twice: Annotated[
         bool,
-        typer.Option("--verify-twice", help="Run twice and require identical frame luma."),
+        typer.Option(
+            "--verify-twice",
+            help="Run twice and require identical decoded pass outputs.",
+        ),
     ] = False,
     host: Annotated[
         str | None,
@@ -123,7 +126,7 @@ def render_job_command(
             typer.echo(f"Index: {first.artifacts.index_html}")
         if verify_twice:
             second = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
-            compare_job_luma(first, second)
+            compare_job_outputs(first, second)
             typer.echo(f"Render job repeat OK: {second.run_dir}")
     except JobSpecError as exc:
         typer.echo(f"Invalid JobSpec {job_path}: {exc}", err=True)

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import html
+import math
+import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -14,13 +16,17 @@ from PIL import Image, ImageDraw, ImageFont
 class RenderArtifacts:
     contact_sheet: Path
     index_html: Path
-    turntable_mp4: Path
+    turntable_mp4: Path | None
 
-    def manifest_payload(self, *, run_dir: Path) -> dict[str, str]:
+    def manifest_payload(self, *, run_dir: Path) -> dict[str, str | None]:
         return {
-            "contact_sheet": _relative_or_absolute(self.contact_sheet, run_dir),
-            "index_html": _relative_or_absolute(self.index_html, run_dir),
-            "turntable_mp4": _relative_or_absolute(self.turntable_mp4, run_dir),
+            "contact_sheet": _relative_run_path(self.contact_sheet, run_dir),
+            "index_html": _relative_run_path(self.index_html, run_dir),
+            "turntable_mp4": (
+                _relative_run_path(self.turntable_mp4, run_dir)
+                if self.turntable_mp4 is not None
+                else None
+            ),
         }
 
 
@@ -32,9 +38,12 @@ def create_render_artifacts(
 ) -> RenderArtifacts:
     contact_sheet = run_dir / "contact_sheet.png"
     index_html = run_dir / "index.html"
-    turntable_mp4 = run_dir / "turntable.mp4"
+    beauty_frames = frame_paths.get("beauty_lit")
+    turntable_mp4: Path | None = None
     create_contact_sheet(frame_paths=frame_paths, output_path=contact_sheet)
-    create_turntable(frame_paths=frame_paths["beauty_lit"], output_path=turntable_mp4)
+    if beauty_frames:
+        turntable_mp4 = run_dir / "turntable.mp4"
+        create_turntable(frame_paths=beauty_frames, output_path=turntable_mp4)
     create_index_html(
         run_dir=run_dir,
         manifest_path=manifest_path,
@@ -100,38 +109,81 @@ def create_contact_sheet(
     sheet.save(output_path)
 
 
-def create_turntable(*, frame_paths: list[Path], output_path: Path, framerate: int = 12) -> None:
+def create_turntable(
+    *,
+    frame_paths: list[Path],
+    output_path: Path,
+    framerate: int = 12,
+    duration_sec: float = 4.0,
+) -> None:
     if not frame_paths:
         raise ValueError("Cannot build turntable without frames")
+    if framerate <= 0:
+        raise ValueError("Turntable framerate must be positive")
+    if duration_sec <= 0:
+        raise ValueError("Turntable duration must be positive")
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
         raise FileNotFoundError("ffmpeg not found; run `uef doctor` and install ffmpeg")
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    duration_sec = max(4.0, duration_sec)
+    input_framerate = len(frame_paths) / duration_sec
+    output_frame_count = math.ceil(duration_sec * framerate)
     pattern = frame_paths[0].parent / "frame_%04d.png"
     command = [
         ffmpeg,
         "-y",
+        "-stream_loop",
+        "-1",
         "-framerate",
-        str(framerate),
+        f"{input_framerate:.6g}",
         "-i",
         str(pattern),
         "-vf",
         "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-r",
+        str(framerate),
+        "-frames:v",
+        str(output_frame_count),
         "-c:v",
         "libx264",
         "-pix_fmt",
         "yuv420p",
+        "-movflags",
+        "+faststart",
         str(output_path),
     ]
-    result = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stderr = _output_tail(exc.stderr)
+        raise RuntimeError(
+            f"ffmpeg timed out while creating turntable {output_path} after {exc.timeout}s; "
+            f"command: {shlex.join(command)}; stderr: {stderr or '<empty>'}"
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"ffmpeg could not create turntable {output_path}: {exc}; "
+            f"command: {shlex.join(command)}"
+        ) from exc
     if result.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed with {result.returncode}: {result.stderr[-1000:]}")
+        raise RuntimeError(
+            f"ffmpeg failed while creating turntable {output_path} with exit code "
+            f"{result.returncode}; command: {shlex.join(command)}; "
+            f"stdout: {_output_tail(result.stdout) or '<empty>'}; "
+            f"stderr: {_output_tail(result.stderr) or '<empty>'}"
+        )
+    if not output_path.is_file():
+        raise RuntimeError(
+            f"ffmpeg reported success but did not create turntable {output_path}; "
+            f"command: {shlex.join(command)}"
+        )
 
 
 def create_index_html(
@@ -140,16 +192,26 @@ def create_index_html(
     manifest_path: Path,
     frame_paths: dict[str, list[Path]],
     contact_sheet: Path,
-    turntable_mp4: Path,
+    turntable_mp4: Path | None,
     output_path: Path,
 ) -> None:
     rows = []
     for pass_name, paths in frame_paths.items():
         links = " ".join(
-            f'<a href="{html.escape(_relative_or_absolute(path, run_dir))}">{index:02d}</a>'
+            f'<a href="{html.escape(_relative_run_path(path, run_dir))}">{index:02d}</a>'
             for index, path in enumerate(paths)
         )
         rows.append(f"<tr><th>{html.escape(pass_name)}</th><td>{links}</td></tr>")
+    if turntable_mp4 is None:
+        turntable_html = (
+            '<p class="turntable-skipped">Turntable skipped: beauty_lit not rendered.</p>'
+        )
+    else:
+        turntable_html = (
+            '<p><video controls loop src="'
+            f"{html.escape(_relative_run_path(turntable_mp4, run_dir))}"
+            '"></video></p>'
+        )
     output_path.write_text(
         "\n".join(
             [
@@ -167,12 +229,10 @@ def create_index_html(
                 "</head>",
                 "<body>",
                 "<h1>UEFactory Render Job</h1>",
-                f'<p><a href="{html.escape(_relative_or_absolute(manifest_path, run_dir))}">'
+                f'<p><a href="{html.escape(_relative_run_path(manifest_path, run_dir))}">'
                 "manifest.json</a></p>",
-                '<p><video controls loop src="'
-                f"{html.escape(_relative_or_absolute(turntable_mp4, run_dir))}"
-                '"></video></p>',
-                f'<p><img src="{html.escape(_relative_or_absolute(contact_sheet, run_dir))}" '
+                turntable_html,
+                f'<p><img src="{html.escape(_relative_run_path(contact_sheet, run_dir))}" '
                 'alt="contact sheet"></p>',
                 "<table>",
                 *rows,
@@ -215,8 +275,16 @@ def _exr_preview(pass_name: str, frame_path: Path) -> Image.Image:
     return Image.fromarray(scaled.astype("uint8"), mode="L").convert("RGB")
 
 
-def _relative_or_absolute(path: Path, root: Path) -> str:
+def _relative_run_path(path: Path, run_dir: Path) -> str:
     try:
-        return path.relative_to(root).as_posix()
+        return path.resolve().relative_to(run_dir.resolve()).as_posix()
     except ValueError:
-        return str(path)
+        raise ValueError(f"Artifact path must be inside run directory {run_dir}: {path}") from None
+
+
+def _output_tail(output: str | bytes | None, limit: int = 1000) -> str:
+    if output is None:
+        return ""
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    return output[-limit:].strip()

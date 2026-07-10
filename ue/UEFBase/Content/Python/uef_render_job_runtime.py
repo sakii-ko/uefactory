@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import time
+import traceback
 from pathlib import Path
 
 import unreal
@@ -73,29 +74,33 @@ class UEFRenderJobRuntimeExecutor(unreal.MoviePipelinePythonHostExecutor):
     def execute_delayed(self, in_pipeline_queue):
         global _PIPELINE_QUEUE
         del in_pipeline_queue
-        _STATE["started_at"] = time.monotonic()
-        _STATE["job"] = _load_job()
-        _STATE["job_index"] = 0
-        _STATE["success"] = True
-        job = _STATE["job"]
-        out_dir = Path(job["out_dir"])
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            _STATE["started_at"] = time.monotonic()
+            _STATE["job"] = _load_job()
+            _STATE["job_index"] = 0
+            _STATE["success"] = True
+            job = _STATE["job"]
+            out_dir = Path(job["out_dir"])
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-        camera = job["camera"]
-        width, height = camera["resolution"]
-        frames = int(job["frames"])
-        sequence_path = str(job["sequence_path"])
-        passes = list(job["passes"])
-        unreal.log(
-            f"[UEF-RENDER-JOB-RUNTIME] render start out={out_dir} "
-            f"passes={passes} frames={frames} size={width}x{height} sequence={sequence_path}"
-        )
+            camera = job["camera"]
+            width, height = camera["resolution"]
+            frames = int(job["frames"])
+            sequence_path = str(job["sequence_path"])
+            passes = list(job["passes"])
+            unreal.log(
+                f"[UEF-RENDER-JOB-RUNTIME] render start out={out_dir} "
+                f"passes={passes} frames={frames} size={width}x{height} "
+                f"sequence={sequence_path}"
+            )
 
-        _PIPELINE_QUEUE = unreal.new_object(unreal.MoviePipelineQueue, outer=self)
-        for pass_name in passes:
-            _configure_pipeline_job(_PIPELINE_QUEUE, job, pass_name)
+            _PIPELINE_QUEUE = unreal.new_object(unreal.MoviePipelineQueue, outer=self)
+            for pass_name in passes:
+                _configure_pipeline_job(_PIPELINE_QUEUE, job, pass_name)
 
-        _start_next_pipeline(self)
+            _start_next_pipeline(self)
+        except Exception as exc:
+            _finish_executor_failure(self, context="initialization", error=exc)
 
     @unreal.ufunction(override=True)
     def on_begin_frame(self):
@@ -115,21 +120,68 @@ class UEFRenderJobRuntimeExecutor(unreal.MoviePipelinePythonHostExecutor):
         job = _STATE["job"]
         self.active_movie_pipeline = None
         _STATE["job_index"] = int(_STATE["job_index"]) + 1
-        if _start_next_pipeline(self):
+        try:
+            if _start_next_pipeline(self):
+                return
+        except Exception as exc:
+            _finish_executor_failure(self, context="starting next pass", error=exc)
             return
 
         out_dir = Path(job["out_dir"])
-        _normalize_outputs(job)
-        _write_manifest(
-            out_dir,
-            job,
-            time.monotonic() - float(_STATE["started_at"]),
-            bool(_STATE["success"]),
-        )
-        unreal.log(f"[UEF-RENDER-JOB-RUNTIME] render finished success={bool(_STATE['success'])}")
-        global _PIPELINE_QUEUE
-        _PIPELINE_QUEUE = None
-        self.on_executor_finished_impl()
+        error: str | None = None
+        try:
+            _normalize_outputs(job)
+        except Exception as exc:
+            _STATE["success"] = False
+            error = f"Output normalization failed: {type(exc).__name__}: {exc}"
+            unreal.log_error(f"[UEF-RENDER-JOB-RUNTIME] {error}\n{traceback.format_exc()}")
+        if error is None and not bool(_STATE["success"]):
+            error = "Movie Render Queue reported unsuccessful output"
+        try:
+            _write_manifest(
+                out_dir,
+                job,
+                time.monotonic() - float(_STATE["started_at"]),
+                bool(_STATE["success"]),
+                error=error,
+            )
+        except Exception as exc:
+            unreal.log_error(
+                "[UEF-RENDER-JOB-RUNTIME] Failed to write final manifest: "
+                f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+            )
+        finally:
+            unreal.log(
+                f"[UEF-RENDER-JOB-RUNTIME] render finished success={bool(_STATE['success'])}"
+            )
+            global _PIPELINE_QUEUE
+            _PIPELINE_QUEUE = None
+            self.on_executor_finished_impl()
+
+
+def _finish_executor_failure(executor, *, context: str, error: Exception) -> None:
+    global _PIPELINE_QUEUE
+    _STATE["success"] = False
+    message = f"Runtime {context} failed: {type(error).__name__}: {error}"
+    unreal.log_error(f"[UEF-RENDER-JOB-RUNTIME] {message}\n{traceback.format_exc()}")
+    job = _STATE.get("job")
+    if isinstance(job, dict) and job.get("out_dir"):
+        try:
+            _write_manifest(
+                Path(job["out_dir"]),
+                job,
+                time.monotonic() - float(_STATE["started_at"]),
+                False,
+                error=message,
+            )
+        except Exception as manifest_error:
+            unreal.log_error(
+                "[UEF-RENDER-JOB-RUNTIME] Failed to write failure manifest: "
+                f"{type(manifest_error).__name__}: {manifest_error}"
+            )
+    executor.active_movie_pipeline = None
+    _PIPELINE_QUEUE = None
+    executor.on_executor_finished_impl()
 
 
 def _start_next_pipeline(executor) -> bool:
@@ -137,10 +189,11 @@ def _start_next_pipeline(executor) -> bool:
     job_index = int(_STATE["job_index"])
     if job_index >= len(jobs):
         return False
+    world = executor.get_last_loaded_world()
     unreal.log(f"[UEF-RENDER-JOB-RUNTIME] starting MRQ subjob {job_index + 1}/{len(jobs)}")
     executor.active_movie_pipeline = unreal.new_object(
         executor.target_pipeline_class,
-        outer=executor.get_last_loaded_world(),
+        outer=world,
         base_type=unreal.MoviePipeline,
     )
     executor.active_movie_pipeline.on_movie_pipeline_work_finished_delegate.add_function_unique(
@@ -163,7 +216,12 @@ def _configure_pipeline_job(queue, job: dict, pass_name: str):
     frames = int(job["frames"])
 
     pipeline_job = queue.allocate_new_job(unreal.MoviePipelineExecutorJob)
-    pipeline_job.sequence = unreal.SoftObjectPath(str(job["sequence_path"]))
+    sequence_path = (
+        job.get("beauty_sequence_path", job["sequence_path"])
+        if pass_name in {"beauty_lit", "beauty_unlit"}
+        else job["sequence_path"]
+    )
+    pipeline_job.sequence = unreal.SoftObjectPath(str(sequence_path))
     pipeline_job.author = "UEFactory render job"
     pipeline_job.job_name = f"UEF_{job['run_id']}_{pass_name}"
 
@@ -182,7 +240,12 @@ def _configure_pipeline_job(queue, job: dict, pass_name: str):
     _configure_render_pass(config, pass_name, pass_config)
     color_setting = config.find_or_add_setting_by_class(unreal.MoviePipelineColorSetting)
     color_setting.set_editor_property("disable_tone_curve", True)
-    _configure_identity_ocio(color_setting)
+    if pass_name in {"beauty_lit", "beauty_unlit"}:
+        _configure_display_ocio(color_setting)
+    elif pass_name in {"normal", "basecolor"}:
+        _configure_linear_ocio(color_setting)
+    else:
+        color_setting.ocio_configuration.set_editor_property("is_enabled", False)
     anti_aliasing = config.find_or_add_setting_by_class(unreal.MoviePipelineAntiAliasingSetting)
     anti_aliasing.set_editor_property("spatial_sample_count", 1)
     anti_aliasing.set_editor_property("temporal_sample_count", 1)
@@ -274,6 +337,7 @@ def _normalize_outputs(job: dict) -> None:
             )
         for index, raw_frame in enumerate(raw_frames):
             shutil.copy2(raw_frame, final_dir / f"frame_{index:04d}.{extension}")
+    shutil.rmtree(out_dir / "_mrq")
 
 
 def _load_job() -> dict:
@@ -284,7 +348,31 @@ def _load_job() -> dict:
         return json.load(file)
 
 
-def _configure_identity_ocio(color_setting) -> None:
+def _configure_display_ocio(color_setting) -> None:
+    _configure_ocio_transform(
+        color_setting,
+        destination_name="Output - sRGB Monitor - UE Emulation",
+        destination_index=7,
+        destination_family="Output",
+    )
+
+
+def _configure_linear_ocio(color_setting) -> None:
+    _configure_ocio_transform(
+        color_setting,
+        destination_name="Utility - Reference",
+        destination_index=0,
+        destination_family="Utility",
+    )
+
+
+def _configure_ocio_transform(
+    color_setting,
+    *,
+    destination_name: str,
+    destination_index: int,
+    destination_family: str,
+) -> None:
     config = unreal.new_object(unreal.OpenColorIOConfiguration, outer=color_setting)
     config_path = unreal.FilePath()
     config_path.set_editor_property(
@@ -292,14 +380,33 @@ def _configure_identity_ocio(color_setting) -> None:
         "{Engine}/Plugins/Compositing/OpenColorIO/Content/OCIO/simple.config.ocio",
     )
     config.set_editor_property("configuration_file", config_path)
+
+    source_name = "Utility - Linear - sRGB"
+    source = _ocio_color_space(source_name, 2, "Utility")
+    destination = _ocio_color_space(
+        destination_name,
+        destination_index,
+        destination_family,
+    )
+    # UE creates transforms only between distinct entries in DesiredColorSpaces.
+    # A same-space "identity" leaves the conversion invalid and burns a yellow
+    # OCIO INVALID diagnostic into every output frame. Valid display/data transforms
+    # also bypass UE's regular sRGB 8-bit quantizer, which adds random dither.
+    config.set_editor_property("desired_color_spaces", [source, destination])
     config.reload_existing_colorspaces(True)
 
-    source = _ocio_color_space("Utility - Linear - sRGB", 2, "Utility")
-    destination = _ocio_color_space("Utility - Linear - sRGB", 2, "Utility")
+    desired = {
+        item.get_editor_property("color_space_name"): item
+        for item in config.get_editor_property("desired_color_spaces")
+    }
+    missing = {source_name, destination_name} - desired.keys()
+    if missing:
+        raise RuntimeError(f"OCIO config is missing required color spaces: {sorted(missing)}")
+
     color_configuration = color_setting.ocio_configuration.color_configuration
     color_configuration.set_editor_property("configuration_source", config)
-    color_configuration.set_editor_property("source_color_space", source)
-    color_configuration.set_editor_property("destination_color_space", destination)
+    color_configuration.set_editor_property("source_color_space", desired[source_name])
+    color_configuration.set_editor_property("destination_color_space", desired[destination_name])
     color_setting.ocio_configuration.set_editor_property(
         "color_configuration",
         color_configuration,
@@ -349,7 +456,14 @@ def _add_determinism_cvars(pipeline_job) -> None:
         cvars.add_or_update_console_variable(name, float(value))
 
 
-def _write_manifest(out_dir: Path, job: dict, duration_sec: float, success: bool) -> None:
+def _write_manifest(
+    out_dir: Path,
+    job: dict,
+    duration_sec: float,
+    success: bool,
+    *,
+    error: str | None = None,
+) -> None:
     pass_frames = {
         pass_name: sorted(str(path) for path in (out_dir / pass_name).glob("frame_*.*"))
         for pass_name in job["passes"]
@@ -374,6 +488,8 @@ def _write_manifest(out_dir: Path, job: dict, duration_sec: float, success: bool
         "frame_paths": pass_frames,
         "executor": "UEFRenderJobRuntimeExecutor",
     }
+    if error is not None:
+        payload["error"] = error
     (out_dir / "manifest.json").write_text(
         json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",

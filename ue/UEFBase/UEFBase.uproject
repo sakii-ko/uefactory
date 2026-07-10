@@ -13,8 +13,24 @@
 			"Enabled": true
 		},
 		{
+			"Name": "HDRIBackdrop",
+			"Enabled": true
+		},
+		{
 			"Name": "SequencerScripting",
 			"Enabled": true
+		},
+		{
+			"Name": "EditorTelemetry",
+			"Enabled": false
+		},
+		{
+			"Name": "EditorPerformance",
+			"Enabled": false
+		},
+		{
+			"Name": "StudioTelemetry",
+			"Enabled": false
 		},
 		{
 			"Name": "OnlineSubsystem",

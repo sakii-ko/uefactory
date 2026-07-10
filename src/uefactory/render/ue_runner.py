@@ -126,6 +126,10 @@ def run_ue(
             )
             _kill_process_group(process)
             returncode = process.wait(timeout=30)
+        except BaseException:
+            LOGGER.warning("UE process interrupted; killing process group")
+            _kill_process_group(process)
+            raise
     duration_sec = time.monotonic() - start
     summary = summarize_ue_log(log_path)
     result = UERunResult(
@@ -205,6 +209,7 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
     except (ProcessLookupError, subprocess.TimeoutExpired):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
 
 
 def _log_summary(result: UERunResult) -> None:
