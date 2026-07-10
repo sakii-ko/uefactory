@@ -2,9 +2,9 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-10(第 11 次) · 当前阶段:**M2 已通过正式 review,等待 release ref 更新** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.7 正式审计 APPROVE**
-> **当前主线:T2.7 文档/版本收尾 → M2 正式 review → 修复审计问题
-> → Conventional Commits → 合入 `main` → tag `v0.3.0`。**
+> 最后更新:2026-07-10(第 12 次) · 当前阶段:**M2 `v0.3.0` 发布完成,M3 待启动** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 已通过正式审计、合入 `main` 并标记 `v0.3.0`**
+> **当前主线:M3 持续获取——PolyHaven adapter 打样 → Objaverse LVIS 灌库 →
+> 质量门禁/去重 → 每日增量调度与 24h 无人值守验收。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
 
@@ -52,14 +52,14 @@
 |---|---|---|
 | **M0 骨架与冒烟渲染** | `uef` CLI 骨架、`uef doctor`、headless 渲出第一张非全黑图 | pytest 全绿;`out/smoke/` 有 PNG + manifest + 日志 |
 | **M1 渲染服务 v1** | JobSpec(YAML)→ MRQ 渲染:六 pass、orbit 相机、三种光照、contact sheet/MP4;本地/远程同一入口 | **已通过正式审计**:六通道 × 8 视角;本地重复运行及本地↔l40s 共 48 帧解码像素哈希完全一致;HDRI/none 视觉验收与失败清理通过 |
-| **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图;Owner 追加外部 scene-level 兼容 | 至少 10 个杂源模型一键入库(当前实验证 11 个),catalog 可查,缩略图正确;开放场景可持久构建/重载/渲染 |
+| **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图;Owner 追加外部 scene-level 兼容 | **已通过正式审计并发布 `v0.3.0`**:11 个杂源模型一键入库,catalog 可查,缩略图正确;8 个开放场景可持久构建/重载/渲染 |
 | **M3 持续获取** | 按 `docs/ASSET_ACQUISITION.md` 五腿战略:PolyHaven adapter 打样 → Objaverse LVIS 灌库 → 质量门禁/去重 → 每日增量调度 | 无人值守跑 24h;license 三档(open/nc/ue-only)全程可追溯;catalog stats 报告可读 |
 | **M4 农场化** | 作业队列、**多节点池调度**(本机 + 4090 + l40s)、失败重试、HTML 统计报告 | 100 资产 × 全通道批渲无人值守完成(跨节点),报告可读 |
 | **M5 UnrealZoo 化(后议)** | 交互控制 / 场景组合 / gym 接口 | 待 Owner 定义 |
 
 每个里程碑完成 = DoD 证据齐全 + 正式 review 通过 + 可追溯提交/合并 + tag `vX.Y.0`。
 
-## 4. 当前 Sprint:M2 任务清单(资产摄取)
+## 4. 已完成 Sprint:M2 任务清单(资产摄取)
 
 > M0 已验收并标记 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`。M1 的修正版证据、正式审计和渲染数据契约见
 > `docs/WORKLOG.md`、`docs/reviews/2026-07-10-formal-m1-render.md` 与 ADR-004。
@@ -142,11 +142,11 @@
 - [x] 正式 review #1 的两个 scene MAJOR 已关闭:standalone scene render 持完整 generation lease；
   scene package evidence 覆盖 root 下完整 regular-file tree 并在 finalize 后精确复验。
 - [x] WORKLOG 追加所有真实命令、耗时、失败修正、产物路径;新增 M2 正式 review,无高/中未解决项。
-- [ ] Conventional Commits 推送分支,合入 `main`,打 `v0.3.0`。
+- [x] Conventional Commits 推送分支,以 `--no-ff` 合入 `main`,打 annotated tag `v0.3.0` 并推送远端。
 
 **任务顺序**:T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 → T2.6A → T2.7。
 实现时允许为测试并行准备样例和 catalog,但不允许用未经过前序门禁的结果冒充后序 DoD。
-分支:M1 收口后切 `feat/m2-ingest`。
+实现分支:`feat/m2-ingest`;最终提交 `3f46bda`,合并提交 `f140f51`。下一 Sprint 在新的 M3 功能分支启动。
 
 ## 5. 风险与已知约束
 

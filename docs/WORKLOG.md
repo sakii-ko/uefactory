@@ -1083,3 +1083,23 @@ REVIEW REQUESTED: feat/m1-render 43d2163
   353,907,808 bytes 新闭包复算、standalone 16 帧/日志/cleanup/lease 与文档逐项一致。
 - 决定:允许 `feat/m2-ingest` 以 `--no-ff` 合入 `main`；release bookkeeping commit 作为
   `v0.3.0` tag target。此条只关闭正式 review，实际 merge/tag/ref push 在后续 release 记录中登记。
+
+## [2026-07-10] M2 merge 与 `v0.3.0` release — COMPLETE
+
+- 正式放行依据:`docs/reviews/2026-07-10-formal-m2-ingest.md`,最终结论 `APPROVE`,未遗留
+  BLOCKER/MAJOR/MINOR/NIT。功能分支最终提交为
+  `3f46bda17f0788795bfcc3268014a65fbb9bd5de`。
+- 实际合并:在同步后的 `main` 执行 `git merge --no-ff feat/m2-ingest`；合并提交为
+  `f140f51a81a85fc8ea379b8e0b8e7501fb18a552`,无冲突。随后以本节所在的 release bookkeeping
+  提交作为最终 `v0.3.0` tag target,不再修改 M2 功能代码。
+- 发布验证基线:
+  - 最终功能代码全量 `TMPDIR=$PWD/data/tmp tools/check.sh`:Ruff check/format、Mypy 全绿,
+    `691 passed,2 deselected in 82.64s`;独立 reviewer 另行复跑同样得到 `691 passed,2 deselected`。
+  - 11 模型 fresh/skip、11 张 contact sheet、64 package files / 68,910,435 bytes、66 artifacts
+    与 catalog 三方一致；8 scene generations 共 566 package files / 353,907,808 bytes、72 artifacts,
+    且全部 contact sheets 已由执行代理及独立 reviewer 视觉复核。
+  - review 修复后的 standalone scene render 成功,16 帧像素 hash 与基线一致；渲染后 lease 可立即
+    重取,`IngestTransactions`、`SceneTransactions`、`RenderJobs` 无残留。
+- 发布引用约束:本 release bookkeeping commit 是 annotated tag `v0.3.0` 的 peeled target；发布后
+  `origin/main`、本地 `main` 与 `v0.3.0^{}` 必须完全相同,CLI 版本必须为 `0.3.0`。提交后立即创建、
+  推送并逐项核验这些引用；不以新的 post-tag 文档提交移动发布目标。
