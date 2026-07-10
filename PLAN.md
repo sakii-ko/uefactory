@@ -2,7 +2,7 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-10(第 8 次) · 当前阶段:**M2 收尾与正式 review** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.6 真实验收**
+> 最后更新:2026-07-10(第 9 次) · 当前阶段:**M2 正式 review** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.6A 最终真实验收与证据审计**
 > **当前主线:T2.7 文档/版本收尾 → M2 正式 review → 修复审计问题
 > → Conventional Commits → 合入 `main` → tag `v0.3.0`。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
@@ -92,7 +92,8 @@
   material/texture 数、bounds、引擎版本、日志摘要与耗时。
 - [x] 进程失败、warning/error、零 mesh/零三角形、缺 package 都 fail closed;重复导入幂等且不会叠资产。
 - **DoD(已达成)**:11/11 经真实 UE 5.5.4 headless 导入;主日志均观察到 Interchange
-  start/completed 且零未过滤 error/warning;每个 package 均由独立 UE 进程重载并提交事务。
+  start/completed 且零未过滤 error/warning;每个 package 均由独立 UE 进程重载并提交事务，
+  finalize 前后完整 path/size/file SHA-256 闭包一致。
 
 ### T2.4 规范化与质量门禁 `#ingest`
 
@@ -119,8 +120,9 @@
 - [x] 一条 batch 命令完成 manifest 校验 → catalog raw → UE import → 门禁 → thumbnail → catalog imported。
 - [x] 中途失败可安全重跑,已成功项不重复工作;最终生成 JSON + HTML 汇总和 11 资产 contact sheet。
 - [x] 跑纯逻辑全量测试、真实 UE 集成测试,并至少随机独立重载 3 个 package 验证持久化。
-- **DoD(已达成)**:11 个杂源 FBX/glTF/GLB 一键入库;`catalog list/show/stats` 可查;11 组缩略图视觉正确;
-  manifest、数据库和磁盘三方一致。
+- **DoD(已达成)**:最终 fresh batch 11/11 `render_ok`,立即重跑 11/11 `skipped` 且不启动 UE；
+  `catalog list/show/stats` 可查,11 组缩略图视觉正确；64 个 UE package files / 68,910,435 bytes
+  的完整闭包、66 artifacts、manifest、数据库和磁盘三方一致。
 
 ### T2.6A Owner 追加:scene-level / BlackMyth 兼容 `#scene` `#blackmyth`
 
@@ -130,7 +132,8 @@
 - [x] 8 个开放许可场景全部 `render_ok`:748 个 scene objects、72 个 scene artifacts;
   逐 scene contact sheet 已检查。research-only 样例不冒充开放发布资产。
 - **DoD(已达成)**:`UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth` 实测扫描
-  14 records、0 quarantine;9/9 YAML 可解析;8 个开放场景真实 build/reload/finalize/thumbnail 通过。
+  14 records、0 quarantine;9/9 YAML 可解析;8 个开放场景在当前 portable SceneSpec SHA 上重新
+  build/reload/finalize/thumbnail,严格审计为 748 objects / 72 artifacts 且逐张视觉通过。
 
 ### T2.7 收尾与正式 review
 

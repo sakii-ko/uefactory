@@ -118,13 +118,39 @@ independent reload process
   reload package and require exact object/mesh/material/texture payload
          │
          ▼
+host package evidence
+  recursively hash the complete destination tree
+  bind sorted repo-relative path + size + SHA-256 into one bundle digest
+         │
+         ▼
 independent finalize process
   recheck host-approved payload, delete transaction/backup, state = committed
+  (does not resave the approved destination)
+         │
+         ▼
+post-commit host validation
+  rehash the complete package tree and require byte-for-byte equality
 ```
 
 任何 reversible 阶段失败都会恢复 backup 或删除新 destination。finalize 支持一次独立重试；
 若结果跨过不可逆 commit 点仍不明确，则再启 UE inspect process，以 package payload 和 transaction
-目录状态判定 `pre_commit`、`committed` 或 `in_doubt`，不会猜测成功。
+目录状态判定 `pre_commit`、`committed` 或 `in_doubt`，不会猜测成功。不可逆 commit 后若 package
+字节复验不一致，宿主会写 durable `failed` manifest 并明确记录 `committed/no rollback`，绝不把
+已经无法安全回滚的状态伪装成成功。
+
+`ue_package_bundle` 使用 `ue_ingested_package_bundle_v1`：递归覆盖
+`ue/UEFBase/Content/UEF/Ingested/<asset_id>/` 下全部常规文件，每项记录排序后的 repo-relative
+POSIX path、正整数 size 与文件 SHA-256，再以 domain-separated canonical JSON 计算
+`package_bundle_sha256`。收集器拒绝 symlink、路径逃逸、空/非 regular 文件，要求每个 imported
+object 的 `.uasset` 都在闭包中，并以两次目录扫描和两次文件 hash 检测采集期间的增删改。import
+artifact 保存完整闭包；thumbnail generation 保存闭包 digest；skip、model render 和 catalog commit
+都会重算当前磁盘字节，不能靠旧 manifest 自证。
+
+同一个 `asset_id` 的 staging、import/reload/finalize、catalog 更新、thumbnail 和 model render 由
+`data/locks/assets/<asset_id>.lock` 的跨进程 `flock` 串行化。锁在 owning thread 内可重入，但其他
+thread/process 只会得到明确 busy；busy 结果不得改写 catalog。fork child 会丢弃继承的 registry
+与 file handle，避免把父进程 guard 或 lease 误当成自己的锁。builtin 与 scene render 使用各自
+生命周期，不进入 model asset lock。
 
 ### 2.5 “归一化”的实际边界
 
@@ -153,6 +179,7 @@ hierarchy 烘焙归一化。
   的 Box 明确允许 `texture_count=0`；
 - source-structure payload 与 canonical digest 精确匹配，且不得声称 hierarchy preserved；
 - primary、独立 reload 和 finalize 的完整 asset payload 一致，transaction 为 `committed`；
+- 完整 package tree 的 path/size/file SHA-256 与 bundle digest 在 finalize 前后精确一致；
 - UE 日志的有效 warning/error 计数为零；已分类的 directory-watcher 等噪声单独记录。
 
 FBX 在引擎导入后按 `fbx_filename_pbr_v2` 连接 base color、normal、roughness、metallic，记录
@@ -180,11 +207,15 @@ hash-valid 的 thumbnail artifact generation。catalog 中一个 `render_ok` 字
 
 2026-07-10 fresh acceptance 证据：
 
-- `out/ingest_batches/20260710T124132Z_96b7fdcc/manifest.json`：11/11 `render_ok`；
+- `out/ingest_batches/20260710T145337Z_d8eef9c2/manifest.json`：11/11 `render_ok`；
 - 同批 `report/contact_sheet.png` 与 `report/index.html`：11 个模型视觉报告；
-- `out/ingest_batches/20260710T130709Z_c465126e/manifest.json`：立即重跑 11/11 `skipped`；
-- `out/ingest/20260710T130421Z_96445590/khronos_box/manifest.json`：Box schema v2、
-  source graph digest、0 source textures、quality v2 和 committed transaction。
+- `out/ingest_batches/20260710T152241Z_4eaa416b/manifest.json`：立即重跑 11/11 `skipped`，
+  没有启动 UE；
+- `data/catalog_m2_package_release.db`：11 个 `render_ok`、66 artifacts，SQLite integrity/FK clean；
+- 11 个 package roots 的完整闭包为 64 files / 68,910,435 bytes，fresh manifest、catalog artifact
+  与当前磁盘重算结果三方相同；
+- `out/ingest/20260710T152035Z_ed073d49/khronos_box/manifest.json`：Box schema v2、
+  source graph digest、0 source textures、quality v2、committed transaction 与最终 package bytes。
 
 ## 5. Catalog schema v3
 

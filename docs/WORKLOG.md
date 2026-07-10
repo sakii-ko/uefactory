@@ -927,3 +927,105 @@ REVIEW REQUESTED: feat/m1-render 43d2163
   - 当前没有遗留 UE/batch 进程或 ingest transaction。未使用 `/root/nas/fastdata2` 存放大数据。
 - 正式 review 前最终门禁:`TMPDIR=$PWD/data/tmp tools/check.sh && git diff --check && uef --version`
   退出码 0;Ruff check/format、Mypy 全绿,`642 passed,2 deselected in 58.80s`,CLI 输出 `0.3.0`。
+
+## [2026-07-10] M2 package-byte / concurrency 纠错与 release 复验 — REVIEW READY
+
+- 说明:本节是对上方 “IMPLEMENTED / REVIEW PENDING” 阶段记录的**追加修正**。旧 fresh/scene
+  运行仍是历史事实,但不能替代本节在最终代码上的重建、包字节闭包和并发审计。
+- 独立审计发现并关闭的 release 问题:
+  - portable SceneSpec 改为 `root_env + relative path` 后,旧 scene catalog generation 仍绑定旧 spec
+    SHA；8 个开放场景全部重新 build/reload/finalize/thumbnail,不沿用失配 generation。
+  - 旧 model skip/render 证据能确认 imported object/package inventory,但没有把当前磁盘上每个 UE
+    package 文件的 bytes 绑定到 generation。现用 `ue_ingested_package_bundle_v1` 递归记录排序后的
+    repo-relative path、size、file SHA-256 和 domain-separated bundle digest；拒绝 symlink、路径逃逸、
+    空/非 regular 文件和采集期间增删改。import artifact 保存完整闭包,thumbnail 保存 bundle digest,
+    skip/render/catalog commit 均重算当前磁盘。
+  - finalize 原先会在 host 收集 evidence 后再次保存 destination,存在“验证后改写”窗口。现 finalize
+    只清 transaction/backup,不重存 destination；宿主在不可逆 commit 后再完整重算 package bytes。
+    不一致会写 durable failed manifest 并标明 committed/no rollback,绝不误报成功。
+  - 同一 `asset_id` 的并发 batch/render 原先可能交错 generation。现 outer lease 覆盖 staging、
+    existing/skip、UE transaction、catalog 与 thumbnail；model render 持锁到产物完成。其他
+    thread/process busy 时返回明确单资产失败且不改 catalog。fork child 重置继承 guard/handle；
+    relative `data_dir` 统一解析为 absolute。真实 thread/process/fork contention、late failure、
+    KeyboardInterrupt release 与 catalog byte-for-byte unchanged 均有回归。
+- 对应提交与独立复核:
+  - `e95de22 fix(ingest): bind skips to package bytes`
+  - `876a61a fix(ingest): serialize asset generations`
+  - package/concurrency reviewer 最终结论 `APPROVE`,BLOCKER/MAJOR/MINOR 均无；补充复验
+    related tests、真实 fork timeout、relative data path、Ruff、Mypy 与 `git diff --check` 全绿。
+
+### 8 个 BlackMyth/open scene 在当前 SceneSpec 上重建
+
+- 命令族(每个 YAML 各执行一次):
+  - `UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth TMPDIR=$PWD/data/tmp uv run uef scene build examples/scenes/<scene>.yaml --database data/catalog.db --timeout-sec 1800 --json`
+  - `UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth TMPDIR=$PWD/data/tmp uv run uef scene thumbnail <scene_id> --database data/catalog.db --timeout-sec 1800 --json`
+- 当前 generation 的 build / render manifests:
+  - `bm_fantasy_diorama`:
+    `out/scene_builds/20260710T134109Z_382164d2/bm_fantasy_diorama/manifest.json` /
+    `out/scene_thumbnails/20260710T134406Z_9a6c3e94/scene_bm_fantasy_diorama/manifest.json`
+  - `bm_player_home`:
+    `out/scene_builds/20260710T134517Z_e484c095/bm_player_home/manifest.json` /
+    `out/scene_thumbnails/20260710T134635Z_622aca8d/scene_bm_player_home/manifest.json`
+  - `bm_cake_house`:
+    `out/scene_builds/20260710T134739Z_8b44de8c/bm_cake_house/manifest.json` /
+    `out/scene_thumbnails/20260710T134919Z_6203475c/scene_bm_cake_house/manifest.json`
+  - `bm_old_church_ruins`:
+    `out/scene_builds/20260710T135016Z_7057250a/bm_old_church_ruins/manifest.json` /
+    `out/scene_thumbnails/20260710T135231Z_85397dae/scene_bm_old_church_ruins/manifest.json`
+  - `bm_thunderclap_temple`:
+    `out/scene_builds/20260710T135332Z_799918ef/bm_thunderclap_temple/manifest.json` /
+    `out/scene_thumbnails/20260710T135516Z_26a2b981/scene_bm_thunderclap_temple/manifest.json`
+  - `bm_zelda_tilt_brush_forest`:
+    `out/scene_builds/20260710T135608Z_841de62d/bm_zelda_tilt_brush_forest/manifest.json` /
+    `out/scene_thumbnails/20260710T135753Z_e20ae7ca/scene_bm_zelda_tilt_brush_forest/manifest.json`
+  - `bm_zelda_temple_ruins`:
+    `out/scene_builds/20260710T135902Z_21f92851/bm_zelda_temple_ruins/manifest.json` /
+    `out/scene_thumbnails/20260710T140738Z_52b262b6/scene_bm_zelda_temple_ruins/manifest.json`
+  - `bm_rpg_lowpoly_arena`:
+    `out/scene_builds/20260710T141100Z_3edb1316/bm_rpg_lowpoly_arena/manifest.json` /
+    `out/scene_thumbnails/20260710T141342Z_d1da946f/scene_bm_rpg_lowpoly_arena/manifest.json`
+- 严格 catalog/package/artifact 审计:`AUDIT_OK scenes=8 objects=748 artifacts=72`。合计 748 actors、
+  323 meshes、2,143,989 triangles、85 materials、142 textures、566 UE package files；8 个当前
+  SceneSpec SHA、source SHA、build inventory、artifact bytes/params 与磁盘 package 均一致。
+- 执行代理打开全部 8 个总/逐 scene contact sheets 和代表性 selected thumbnail：构图完整、视角
+  可区分、mask 与主体一致,无裁切/空帧/背景泄漏。fantasy 的 0 texture、Tilt Brush painterly forest、
+  Zelda 白色笔触外观来自源素材；RPG 场景是 kit lineup,均未被误判为渲染故障。与 portable 改动前
+  视觉基准相比,fantasy sheet bytes 相同,其余 7 个 normalized RMSE 仅
+  `0.0000985–0.002314`,无可见回归。
+
+### 最终 11 模型真实 UE fresh + immediate skip
+
+- 获取预检:`TMPDIR=$PWD/data/tmp uv run uef acquire models --json` →
+  `11 models / 34 files / 60,003,947 bytes / downloaded=0 / reused=34`。
+- fresh 命令:
+  `TMPDIR=$PWD/data/tmp uv run uef ingest batch examples/m2_assets.yaml --database data/catalog_m2_package_release.db --timeout-sec 1800 --json`。
+- fresh batch:`out/ingest_batches/20260710T145337Z_d8eef9c2/manifest.json`,约 28m46s,
+  `status=ok`,11/11 `render_ok`;report:
+  `out/ingest_batches/20260710T145337Z_d8eef9c2/report/{contact_sheet.png,index.html}`。
+- 同命令立即复跑:`out/ingest_batches/20260710T152241Z_4eaa416b/manifest.json`,11/11
+  `skipped`,所有 ingest/thumbnail manifest 为 null,没有 UE log/进程启动。fresh 与 skip 的 11 张
+  selected thumbnail、11 张 asset sheet 和总 contact sheet SHA-256 全部一致。
+- release DB:`integrity_check=ok`,FK clean,11 assets / 66 artifacts / 全部 `render_ok`；来源
+  Khronos=6、Poly Haven=5,许可 CC0-1.0=10、CC-BY-4.0=1。64 个 package files / 68,910,435
+  bytes 对 11 个 package roots 构成完整闭包；manifest、import artifact 与当前磁盘重算三方一致。
+  总模型统计为 52,458 triangles / 13 materials。
+- 11/11 primary/reload/finalize 与 thumbnail setup/render 的未过滤 warning/error 均为 0；每个
+  primary `ue.log` 都同时包含 Interchange start importing source / import completed。所有 source
+  structure、quality checks、artifact hashes、176 个 beauty/mask frames 的物理格式、decoded pixel
+  stats、stencil coverage、frame margin、background contamination 与 subject-area validation 均重新
+  解码通过。
+- 执行代理打开最新总 contact sheet 与全部 11 张 8-view beauty/mask asset sheets：11 个模型均
+  居中、完整、落地；薄侧面视角符合几何，mask 逐帧贴合，无空帧、严重裁切、overlay 或背景泄漏。
+- hygiene 审计发现并清理一组只属于 `out/m2_probes/finalize/...` 的孤立诊断包
+  `/Game/UEF/Ingested/finalize_commit_probe`；最终 Ingested 根精确等于 DB 的 11 assets，
+  `IngestTransactions`、`SceneTransactions`、`RenderJobs` 均为空。只读 SQLite 审计自身产生的空
+  `-wal`/`-shm` sidecar 也在连接关闭并确认无占用后清理。
+
+### 当前自动化门禁
+
+- package/lock 修复后的全量 `TMPDIR=$PWD/data/tmp tools/check.sh`：Ruff check/format、Mypy 全绿，
+  `675 passed,2 deselected in 72.45s`。
+- `git diff --check`、`uef --version` 与 package/concurrency 独立复核均通过；版本为 `0.3.0`。
+- release 文档落地后的全量门禁再次通过：100 files formatted、Mypy 91 source files 全绿，
+  `675 passed,2 deselected in 139.12s`。
+- 本节状态为 `REVIEW READY`；正式 M2 全范围 review、merge 与 tag 仍须由后续追加记录关闭。

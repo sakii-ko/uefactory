@@ -79,9 +79,10 @@ TMPDIR=$PWD/data/tmp .venv/bin/uef ingest batch examples/m2_assets.yaml \
 - `out/ingest_batches/<run_id>/report/asset_sheets/<asset_id>.png`
 
 紧接着原样重跑同一命令应得到 11 个 `skipped`。跳过不是只看 catalog 状态：bundle/content
-哈希、manifest/artifact v2、`m2_static_mesh_v2` 质量证据、源结构证据、UE package 和完整缩略图
-产物组都必须仍然精确匹配；任一证据过期或被篡改都会重新导入或重新渲染。若只想调试导入，
-可显式加 `--no-thumbnails`。
+哈希、manifest/artifact v2、`m2_static_mesh_v2` 质量证据、源结构证据、完整 UE package
+path/size/file SHA-256 闭包和缩略图产物组都必须仍然精确匹配；任一证据过期或被篡改都会重新
+导入或重新渲染。同一 `asset_id` 的导入、catalog、缩略图与模型渲染还会由跨进程 lease
+串行化，冲突任务不会覆盖已成功 generation。若只想调试导入，可显式加 `--no-thumbnails`。
 
 常用 catalog 查询：
 
@@ -93,10 +94,14 @@ TMPDIR=$PWD/data/tmp .venv/bin/uef catalog show khronos_box \
   --database data/catalog_m2.db --json
 ```
 
-2026-07-10 的 M2 fresh acceptance 已验证 11/11 `render_ok`，随后同命令 11/11
-`skipped`；获取清单为 34 个文件、60,003,947 bytes。11 份 UE 5.5.4 fresh import 日志都记录了
-实际 `LogInterchangeEngine` 导入，但稳定入口契约仍是 `AssetImportTask` 自动选择引擎 importer，
-而不是把 Interchange 写死为宿主 API。无纹理的 CC-BY-4.0 `khronos_box` 记录
+2026-07-10 的最终 M2 fresh acceptance 位于
+`out/ingest_batches/20260710T145337Z_d8eef9c2/manifest.json`，已验证 11/11 `render_ok`；立即重跑
+`out/ingest_batches/20260710T152241Z_4eaa416b/manifest.json` 为 11/11 `skipped` 且没有启动 UE。
+`data/catalog_m2_package_release.db` 为 11 assets / 66 artifacts，11 个 UE package roots 的完整
+字节闭包为 64 files / 68,910,435 bytes。获取清单为 34 个文件、60,003,947 bytes。11 份 UE
+5.5.4 fresh import 日志都记录了实际 `LogInterchangeEngine` 导入，但稳定入口契约仍是
+`AssetImportTask` 自动选择引擎 importer，而不是把 Interchange 写死为宿主 API。无纹理的
+CC-BY-4.0 `khronos_box` 记录
 `texture_count=0`，其 GLB 源图有 2 个 node、1 条 child edge、深度 2 和 1 个非 identity
 local transform；UE v1 输出明确是单 StaticMesh 扁平化，未声称保存源 hierarchy。
 
