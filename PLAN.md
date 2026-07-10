@@ -2,9 +2,9 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-10(第 7 次) · 当前阶段:**M2 资产摄取** · 已完成:**M0 `v0.1.0`;M1 正式审计通过,待里程碑提交/合并/tag**
-> **当前主线:T2.1 ingest 契约与样例集 → T2.2 SQLite catalog → T2.3 UE headless 导入
-> → T2.4 规范化/质量门禁 → T2.5 缩略图 → T2.6 十资产端到端验收 → T2.7 收尾。**
+> 最后更新:2026-07-10(第 8 次) · 当前阶段:**M2 收尾与正式 review** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.6 真实验收**
+> **当前主线:T2.7 文档/版本收尾 → M2 正式 review → 修复审计问题
+> → Conventional Commits → 合入 `main` → tag `v0.3.0`。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
 
@@ -52,7 +52,7 @@
 |---|---|---|
 | **M0 骨架与冒烟渲染** | `uef` CLI 骨架、`uef doctor`、headless 渲出第一张非全黑图 | pytest 全绿;`out/smoke/` 有 PNG + manifest + 日志 |
 | **M1 渲染服务 v1** | JobSpec(YAML)→ MRQ 渲染:六 pass、orbit 相机、三种光照、contact sheet/MP4;本地/远程同一入口 | **已通过正式审计**:六通道 × 8 视角;本地重复运行及本地↔l40s 共 48 帧解码像素哈希完全一致;HDRI/none 视觉验收与失败清理通过 |
-| **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图 | 10 个杂源模型一键入库,catalog 可查,缩略图正确 |
+| **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图;Owner 追加外部 scene-level 兼容 | 至少 10 个杂源模型一键入库(当前实验证 11 个),catalog 可查,缩略图正确;开放场景可持久构建/重载/渲染 |
 | **M3 持续获取** | 按 `docs/ASSET_ACQUISITION.md` 五腿战略:PolyHaven adapter 打样 → Objaverse LVIS 灌库 → 质量门禁/去重 → 每日增量调度 | 无人值守跑 24h;license 三档(open/nc/ue-only)全程可追溯;catalog stats 报告可读 |
 | **M4 农场化** | 作业队列、**多节点池调度**(本机 + 4090 + l40s)、失败重试、HTML 统计报告 | 100 资产 × 全通道批渲无人值守完成(跨节点),报告可读 |
 | **M5 UnrealZoo 化(后议)** | 交互控制 / 场景组合 / gym 接口 | 待 Owner 定义 |
@@ -61,68 +61,85 @@
 
 ## 4. 当前 Sprint:M2 任务清单(资产摄取)
 
-> M0 已验收并标记 `v0.1.0`。M1 的修正版证据、正式审计和渲染数据契约见
+> M0 已验收并标记 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`。M1 的修正版证据、正式审计和渲染数据契约见
 > `docs/WORKLOG.md`、`docs/reviews/2026-07-10-formal-m1-render.md` 与 ADR-004。
 > M2 的验收对象是**真实本地 FBX/glTF/GLB 资产**,不是内置 cube 或伪造 catalog 行。
 
-### T2.1 IngestSpec 与十资产样例集 `#ingest` `#acquire`
+### T2.1 IngestSpec 与至少十资产样例集(当前 11 个) `#ingest` `#acquire`
 
-- [ ] 定义严格的 ingest manifest:本地路径、稳定 `asset_id`、名称、source/source URL、SPDX 风格
+- [x] 定义严格的 ingest manifest:本地路径、稳定 `asset_id`、名称、source/source URL、SPDX 风格
   license、tags;未知/缺失字段 fail fast,license 不允许为空。
-- [ ] 准备至少 10 个可再分发的开放许可样例,覆盖 FBX 与 glTF/GLB、带/不带贴图、不同尺度与层级;
+- [x] 准备至少 10 个可再分发的开放许可样例,覆盖 FBX 与 glTF/GLB、带/不带贴图、不同尺度与层级;
   原始大文件放 `data/raw/`,git 仅记录小型 manifest、来源与许可证证据。
-- [ ] 下载必须可重入,校验 size + SHA-256,临时文件原子改名;失败不得伪装为已获取。
-- **DoD**:一条命令可准备/校验样例集;10 个条目均有来源、license、内容 hash,重复执行不重复下载。
+- [x] 下载必须可重入,校验 size + SHA-256,临时文件原子改名;失败不得伪装为已获取。
+- **DoD(已达成)**:一条命令可准备/校验样例集;当前 11 个条目(6 GLB + 5 FBX、34 files、
+  60,003,947 bytes)均有来源、license、内容 hash;重复执行 `downloaded=0,reused=34`。
 
 ### T2.2 SQLite catalog v1 `#catalog`
 
-- [ ] 用标准库 `sqlite3` 落地 versioned schema 与迁移:assets、artifacts,外键开启;路径存相对路径;
+- [x] 用标准库 `sqlite3` 落地 versioned schema 与迁移:assets、artifacts,外键开启;路径存相对路径;
   asset/license/status/source/hash/timestamp 约束入库级强制。
-- [ ] CLI 至少支持 `catalog init/list/show/stats`;查询支持 id、status、source、license、tag。
-- [ ] upsert 必须事务化;同 hash 重复资产可检测,失败导入保留结构化 error 而不污染 imported 状态。
-- **DoD**:空库初始化幂等;十资产 raw 记录可查;非法 license/状态、重复 id/hash 与事务回滚均有反例测试。
+- [x] CLI 至少支持 `catalog init/list/show/stats`;查询支持 id、status、source、license、tag。
+- [x] upsert 必须事务化;同 hash 重复资产可检测,失败导入保留结构化 error 而不污染 imported 状态。
+- **DoD(已达成)**:schema v3 空库初始化幂等;11 资产可查;非法 license/状态、重复 id/hash 与
+  事务回滚均有反例测试;release DB `integrity_check=ok`,FK clean。
 
 ### T2.3 UE 5.5.4 headless 导入 `#ingest` `#ue`
 
-- [ ] `uef ingest asset|batch` 生成 JSON 作业,经统一 `run_ue` 调 UE Python;优先使用 Interchange,
+- [x] `uef ingest asset|batch` 生成 JSON 作业,经统一 `run_ue` 调 UE Python;优先使用 Interchange,
   必要时按格式使用受控 fallback,不得依赖 Editor GUI。
-- [ ] 输出到 `/Game/UEF/Ingested/<asset_id>/`,写 import manifest:package paths、mesh 数、三角形数、
+- [x] 输出到 `/Game/UEF/Ingested/<asset_id>/`,写 import manifest:package paths、mesh 数、三角形数、
   material/texture 数、bounds、引擎版本、日志摘要与耗时。
-- [ ] 进程失败、warning/error、零 mesh/零三角形、缺 package 都 fail closed;重复导入幂等且不会叠资产。
-- **DoD**:至少一份 FBX 与一份 glTF/GLB 经真实 UE headless 导入成功,日志零未过滤 error/warning,
-  package 能由独立 UE 进程重新加载。
+- [x] 进程失败、warning/error、零 mesh/零三角形、缺 package 都 fail closed;重复导入幂等且不会叠资产。
+- **DoD(已达成)**:11/11 经真实 UE 5.5.4 headless 导入;主日志均观察到 Interchange
+  start/completed 且零未过滤 error/warning;每个 package 均由独立 UE 进程重载并提交事务。
 
 ### T2.4 规范化与质量门禁 `#ingest`
 
-- [ ] 统一厘米/米换算、Z-up、pivot 落地与可配置缩放;保留源变换信息以便追溯。
-- [ ] 自动门禁至少覆盖:有限非零 bounds、三角形数 > 0、合理尺度、材质槽/纹理引用可解析、无 NaN;
+- [x] 统一厘米/米换算、Z-up、pivot 落地与可配置缩放;保留源变换信息以便追溯。当前精确边界为
+  source conversion 委托 UE importer、package pivot 保留、render actor 应用可配置 scale 与
+  bounds bottom-center framing;glTF/GLB 保存 canonical graph/TRS,FBX 明确 delegated/unavailable。
+- [x] 自动门禁至少覆盖:有限非零 bounds、三角形数 > 0、合理尺度、材质槽/纹理引用可解析、无 NaN;
   失败进入 `failed`/quarantine 并记录规则版本与原因。
-- [ ] 不把“导入命令退出 0”等同于质量通过;为每条门禁制作失败 fixture。
-- **DoD**:十资产全部得到确定的 imported 或可解释 failed 结果;用于 M2 验收的 10 个全部过门禁。
+- [x] 不把“导入命令退出 0”等同于质量通过;为每条门禁制作失败 fixture。
+- **DoD(已达成)**:11 个验收资产全部通过 `m2_static_mesh_v2`;quality policy、完整 check 集合与
+  source-structure digest 进入 skip key;Box 作为 0-texture/hierarchical 反例通过。
 
 ### T2.5 Catalog ↔ render 与缩略图闭环 `#catalog` `#render`
 
-- [ ] JobSpec 支持 catalog `asset_id`,UE setup 加载已导入 StaticMesh,自动按 bounds 构图、落地并赋 stencil;
+- [x] JobSpec 支持 catalog `asset_id`,UE setup 加载已导入 StaticMesh,自动按 bounds 构图、落地并赋 stencil;
   `builtin:cube` 仅保留回归用途。
-- [ ] 每个 imported 资产生成至少一张标准 beauty 缩略图和 object mask;缩略图/manifest 作为 artifacts 入 catalog。
-- [ ] 复用 M1 的解码像素、格式、mask/bounds 校验;图像必须由执行代理逐张或 contact sheet 亲眼审阅。
-- **DoD**:十资产缩略图均非黑、主体完整、不穿地/严重裁切,mask 与主体一致;catalog 路径均可解析。
+- [x] 每个 imported 资产生成至少一张标准 beauty 缩略图和 object mask;缩略图/manifest 作为 artifacts 入 catalog。
+- [x] 复用 M1 的解码像素、格式、mask/bounds 校验;图像必须由执行代理逐张或 contact sheet 亲眼审阅。
+- **DoD(已达成)**:11 资产各有 8-view beauty/mask 与 5 个 thumbnail artifacts;均非黑、主体完整、
+  不穿地/严重裁切,mask 一致;执行代理已逐 contact sheet 检查。
 
-### T2.6 十资产一键端到端验收 `#ingest` `#catalog` `#ue`
+### T2.6 至少十资产一键端到端验收(当前 11 个) `#ingest` `#catalog` `#ue`
 
-- [ ] 一条 batch 命令完成 manifest 校验 → catalog raw → UE import → 门禁 → thumbnail → catalog imported。
-- [ ] 中途失败可安全重跑,已成功项不重复工作;最终生成 JSON + HTML 汇总和 10 资产 contact sheet。
-- [ ] 跑纯逻辑全量测试、真实 UE 集成测试,并至少随机独立重载 3 个 package 验证持久化。
-- **DoD**:10 个杂源 FBX/glTF/GLB 一键入库;`catalog list/show/stats` 可查;10 张缩略图视觉正确;
+- [x] 一条 batch 命令完成 manifest 校验 → catalog raw → UE import → 门禁 → thumbnail → catalog imported。
+- [x] 中途失败可安全重跑,已成功项不重复工作;最终生成 JSON + HTML 汇总和 11 资产 contact sheet。
+- [x] 跑纯逻辑全量测试、真实 UE 集成测试,并至少随机独立重载 3 个 package 验证持久化。
+- **DoD(已达成)**:11 个杂源 FBX/glTF/GLB 一键入库;`catalog list/show/stats` 可查;11 组缩略图视觉正确;
   manifest、数据库和磁盘三方一致。
+
+### T2.6A Owner 追加:scene-level / BlackMyth 兼容 `#scene` `#blackmyth`
+
+- [x] 外部 BlackMyth 目录只读扫描;license 分层/隔离,source root 显式传入,示例不硬编码本机路径。
+- [x] SceneSpec → persistent UE level → 独立 reload/finalize → schema v3 catalog generation,
+  保留逐 actor mesh/transform/bounds inventory。
+- [x] 8 个开放许可场景全部 `render_ok`:748 个 scene objects、72 个 scene artifacts;
+  逐 scene contact sheet 已检查。research-only 样例不冒充开放发布资产。
+- **DoD(已达成)**:`UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth` 实测扫描
+  14 records、0 quarantine;9/9 YAML 可解析;8 个开放场景真实 build/reload/finalize/thumbnail 通过。
 
 ### T2.7 收尾与正式 review
 
-- [ ] README 增加 ingest/catalog 五分钟路径;ARCHITECTURE 将 M2 schema/数据流由草案改为实装契约。
+- [x] README 增加 ingest/catalog 五分钟路径;ARCHITECTURE 将 M2 schema/数据流由草案改为实装契约。
+- [x] package/CLI/lock 版本统一为 `0.3.0`,并有版本漂移回归测试。
 - [ ] WORKLOG 追加所有真实命令、耗时、失败修正、产物路径;新增 M2 正式 review,无高/中未解决项。
 - [ ] Conventional Commits 推送分支,合入 `main`,打 `v0.3.0`。
 
-**任务顺序**:T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 → T2.7。
+**任务顺序**:T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 → T2.6A → T2.7。
 实现时允许为测试并行准备样例和 catalog,但不允许用未经过前序门禁的结果冒充后序 DoD。
 分支:M1 收口后切 `feat/m2-ingest`。
 
