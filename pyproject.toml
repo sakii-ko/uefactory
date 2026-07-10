@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "uefactory"
-version = "0.1.0"
+version = "0.3.0"
 description = "UE data factory CLI for headless Unreal Engine rendering"
 readme = "README.md"
 requires-python = ">=3.11"
