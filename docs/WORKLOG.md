@@ -1071,3 +1071,15 @@ REVIEW REQUESTED: feat/m1-render 43d2163
     lease 可立即重取,`RenderJobs` 无残留。
 - 当前状态:两个 MAJOR 均有代码、反例、全量回归、现有 8 generation 字节复核和真实 UE/视觉
   证据；等待独立 reviewer 对 `7da5c42` 之后的文档基线复核，未在复核前合并/tag。
+
+## [2026-07-10] M2 正式复审 — APPROVE
+
+- 审查对象:`feat/m2-ingest @ d9dc14de9ba587ee44f650c3b5c72a5d61d00054`。
+- 独立 reviewer 复核 7da5c42 的代码/反例和 d9dc14d 的证据文档；结论 `APPROVE`，
+  BLOCKER/MAJOR/MINOR/NIT 均为 0。正式报告:
+  `docs/reviews/2026-07-10-formal-m2-ingest.md`。
+- reviewer 独立结果:changed-related `231 passed in 19.06s`；全量
+  `691 passed,2 deselected`；Ruff/format/Mypy/`git diff --check` 全绿；8 场景 566 files /
+  353,907,808 bytes 新闭包复算、standalone 16 帧/日志/cleanup/lease 与文档逐项一致。
+- 决定:允许 `feat/m2-ingest` 以 `--no-ff` 合入 `main`；release bookkeeping commit 作为
+  `v0.3.0` tag target。此条只关闭正式 review，实际 merge/tag/ref push 在后续 release 记录中登记。

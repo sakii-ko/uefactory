@@ -2,7 +2,7 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-10(第 10 次) · 当前阶段:**M2 正式 review 修复复核** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.6A 最终真实验收与首轮 review 修复**
+> 最后更新:2026-07-10(第 11 次) · 当前阶段:**M2 已通过正式 review,等待 release ref 更新** · 已完成:**M0 `v0.1.0`;M1 已合入 `main` 并标记 `v0.2.0`;M2 T2.1–T2.7 正式审计 APPROVE**
 > **当前主线:T2.7 文档/版本收尾 → M2 正式 review → 修复审计问题
 > → Conventional Commits → 合入 `main` → tag `v0.3.0`。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
@@ -141,7 +141,7 @@
 - [x] package/CLI/lock 版本统一为 `0.3.0`,并有版本漂移回归测试。
 - [x] 正式 review #1 的两个 scene MAJOR 已关闭:standalone scene render 持完整 generation lease；
   scene package evidence 覆盖 root 下完整 regular-file tree 并在 finalize 后精确复验。
-- [ ] WORKLOG 追加所有真实命令、耗时、失败修正、产物路径;新增 M2 正式 review,无高/中未解决项。
+- [x] WORKLOG 追加所有真实命令、耗时、失败修正、产物路径;新增 M2 正式 review,无高/中未解决项。
 - [ ] Conventional Commits 推送分支,合入 `main`,打 `v0.3.0`。
 
 **任务顺序**:T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 → T2.6A → T2.7。
