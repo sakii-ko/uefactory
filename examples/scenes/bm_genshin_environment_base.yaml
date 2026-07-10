@@ -1,0 +1,38 @@
+schema_version: 1
+# Compatibility status: persistent build/reload/finalize succeeds, but thumbnail
+# remains quarantined because 11/12 visible meshes use one BLEND material that
+# does not write custom depth (observed stencil coverage 1/12). Do not count this
+# scene as render_ok until transparent-material masks are solved generically.
+scene_id: bm_genshin_environment_base
+name: Genshin Impact Inspired Environment Base
+kind: interchange_scene
+source:
+  # Scanner evidence: 2,753,728 bytes; SHA-256
+  # 6f8f8609e7a8eeffbe846c28052c8b0c697f4642c686da733e8ecec13262c166.
+  path: asset-library/derived/47d73d36066ddb62/47d73d36066ddb62.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: aee72b0ad9c44c28ba04a0013b70fc03
+  source_url: https://sketchfab.com/3d-models/aee72b0ad9c44c28ba04a0013b70fc03
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: José Castanheira — Character model base inspired in Genshin Impact
+expected:
+  mesh_count: 12
+  material_count: 2
+  texture_count: 7
+  triangle_count: 4969
+build:
+  map_path: /Game/UEF/Scenes/bm_genshin_environment_base/L_bm_genshin_environment_base
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -24
+  distance_multiplier: 1.25
+render:
+  no_auto_floor: true
+  # The grass material is translucent and may not write custom depth consistently.
+  minimum_object_stencil_coverage: 0.75
+  maximum_background_contamination_ratio: 0.005

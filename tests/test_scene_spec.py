@@ -636,6 +636,8 @@ def test_checked_example_scene_specs_have_complete_provenance_and_expected_count
     expected = {
         "bm_cake_house": (127, 10, 13, 35550, "open", True),
         "bm_fantasy_diorama": (6, 2, 0, 10216, "open", True),
+        "bm_genshin_challenge_post": (3, 3, 7, 1416, "open", True),
+        "bm_genshin_environment_base": (12, 2, 7, 4969, "open", True),
         "bm_lys_piandian": (1, 42, 0, 177610, "nc", False),
         "bm_old_church_ruins": (60, 16, 46, 355661, "open", True),
         "bm_player_home": (22, 10, 11, 39187, "open", True),
