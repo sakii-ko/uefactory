@@ -1,5 +1,8 @@
 # 协作信号协议(SIGNALS)
 
+> **状态:Legacy。** 2026-07-10 起执行代理统一负责 plan + execution,不再以本协议作为工作门禁;
+> 本文仅保留历史协作机制说明,旧信号与旧 WORKLOG 记录仍可追溯。
+>
 > 目的:Planner 与 Coder 直接互相通知"轮到你了",Owner 不再中转消息。
 > **信号只是门铃,内容一律在文档里**(PLAN.md / WORKLOG.md / docs/reviews/ / QUESTIONS.md)。
 > message 字段最多一两句话 + 文档路径;想写长内容 = 先写文档,再发信号。

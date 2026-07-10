@@ -131,6 +131,7 @@ class RemoteHost:
     def tmux_start(
         self, job_id: str, command: str, *, timeout_sec: int = 60
     ) -> RemoteCommandResult:
+        _validate_job_id(job_id)
         session = _tmux_session_name(job_id)
         status_path = PurePosixPath(str(self.config.work_dir)) / "jobs" / job_id / "status.json"
         remote_command = "\n".join(
@@ -149,6 +150,7 @@ class RemoteHost:
         return self.run(remote_command, timeout_sec=timeout_sec)
 
     def tmux_status(self, job_id: str, *, timeout_sec: int = 60) -> dict[str, Any]:
+        _validate_job_id(job_id)
         session = _tmux_session_name(job_id)
         status_path = PurePosixPath(str(self.config.work_dir)) / "jobs" / job_id / "status.json"
         remote_command = "\n".join(
@@ -170,6 +172,20 @@ class RemoteHost:
         payload = parse_json_stdout(result.stdout)
         payload["tmux_live"] = "__UEF_TMUX_LIVE__true" in result.stdout.splitlines()
         return payload
+
+    def tmux_stop(self, job_id: str, *, timeout_sec: int = 60) -> RemoteCommandResult:
+        _validate_job_id(job_id)
+        session = _tmux_session_name(job_id)
+        command = remote_python_command(
+            _STOP_REMOTE_JOB_SCRIPT,
+            {
+                "UEF_HOST_NAME": self.config.name,
+                "UEF_WORK_DIR": str(self.config.work_dir),
+                "UEF_JOB_ID": job_id,
+                "UEF_TMUX_SESSION": session,
+            },
+        )
+        return self.run(command, timeout_sec=timeout_sec)
 
     def remove_tree(self, remote_path: Path | str, *, timeout_sec: int = 60) -> RemoteCommandResult:
         self._validate_delete_target(remote_path)
@@ -289,8 +305,16 @@ def _decode_timeout_output(value: str | bytes | None) -> str:
 
 
 def _tmux_session_name(job_id: str) -> str:
-    safe = "".join(char if char.isalnum() or char in {"_", "-"} else "_" for char in job_id)
-    return f"uef_{safe}"
+    _validate_job_id(job_id)
+    return f"uef_{job_id}"
+
+
+def _validate_job_id(job_id: str) -> None:
+    if not job_id or any(
+        not (character.isascii() and (character.isalnum() or character in {"_", "-"}))
+        for character in job_id
+    ):
+        raise ValueError(f"Unsafe remote job id: {job_id!r}")
 
 
 _VERIFY_SENTINEL_SCRIPT = r"""
@@ -307,4 +331,171 @@ payload = json.loads(sentinel.read_text(encoding="utf-8"))
 if payload.get("host") != host_name:
     raise SystemExit(f"sentinel host mismatch: {payload.get('host')} != {host_name}")
 print(json.dumps(payload, sort_keys=True))
+"""
+
+
+_STOP_REMOTE_JOB_SCRIPT = r"""
+import json
+import os
+import signal
+import subprocess
+import time
+from pathlib import Path
+
+host_name = os.environ["UEF_HOST_NAME"]
+work_dir = Path(os.environ["UEF_WORK_DIR"])
+job_id = os.environ["UEF_JOB_ID"]
+session = os.environ["UEF_TMUX_SESSION"]
+status_path = work_dir / "jobs" / job_id / "status.json"
+sentinel = work_dir / ".uef_node"
+stop_grace_sec = float(os.environ.get("UEF_STOP_GRACE_SEC", "10"))
+
+
+def process_identity(pid):
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return {
+        "pgrp": int(fields[2]),
+        "session": int(fields[3]),
+        "start_ticks": int(fields[19]),
+    }
+
+
+def group_is_live(pgid):
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def wait_for_group_exit(pgid, timeout):
+    deadline = time.monotonic() + timeout
+    while group_is_live(pgid) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return not group_is_live(pgid)
+
+
+if not sentinel.exists():
+    raise SystemExit(f"missing sentinel: {sentinel}")
+sentinel_payload = json.loads(sentinel.read_text(encoding="utf-8"))
+if sentinel_payload.get("host") != host_name:
+    raise SystemExit(
+        f"sentinel host mismatch: {sentinel_payload.get('host')} != {host_name}"
+    )
+if sentinel_payload.get("work_dir") != str(work_dir):
+    raise SystemExit(
+        "sentinel work_dir mismatch: "
+        f"{sentinel_payload.get('work_dir')} != {work_dir}"
+    )
+
+status = None
+if status_path.exists():
+    status = json.loads(status_path.read_text(encoding="utf-8"))
+    if status.get("job_id") != job_id:
+        raise SystemExit(
+            f"job status mismatch: {status.get('job_id')} != {job_id}"
+        )
+
+session_exists = (
+    subprocess.run(
+        ["tmux", "has-session", "-t", session],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    ).returncode
+    == 0
+)
+if status is None and session_exists:
+    raise RuntimeError(
+        f"refusing to kill live tmux session {session}: job status is missing"
+    )
+
+killed_pgid = None
+status_is_terminal = status is not None and status.get("status") in {"complete", "failed"}
+if status is not None and not status_is_terminal:
+    pid = status.get("pid")
+    pgid = status.get("pgid")
+    start_ticks = status.get("process_start_ticks")
+    if not all(type(value) is int for value in (pid, pgid, start_ticks)):
+        raise RuntimeError(
+            f"refusing to report nonterminal remote job {job_id} stopped: "
+            "PID/PGID/start-ticks identity is missing or invalid; "
+            f"status={status}; tmux_live={session_exists}"
+        )
+    if pid <= 1 or pid != pgid:
+        raise RuntimeError(
+            f"refusing to report nonterminal remote job {job_id} stopped: "
+            f"unsafe recorded process identity pid={pid} pgid={pgid}; "
+            f"tmux_live={session_exists}"
+        )
+    identity = process_identity(pid)
+    if identity is None:
+        raise RuntimeError(
+            f"refusing to report nonterminal remote job {job_id} stopped: "
+            f"recorded PID {pid} is no longer available, so UE process exit "
+            f"cannot be verified; tmux_live={session_exists}"
+        )
+    if not (
+        identity["pgrp"] == pgid
+        and identity["session"] == pgid
+        and identity["start_ticks"] == start_ticks
+    ):
+        raise RuntimeError(
+            f"refusing to signal recorded PID {pid} for nonterminal remote job {job_id}: "
+            "process identity mismatch (possible PID reuse); "
+            f"expected pgid/session/start_ticks={pgid}/{pgid}/{start_ticks}, "
+            f"actual={identity['pgrp']}/{identity['session']}/{identity['start_ticks']}; "
+            f"tmux_live={session_exists}"
+        )
+
+    killed_pgid = pgid
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    if not wait_for_group_exit(pgid, stop_grace_sec):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if not wait_for_group_exit(pgid, stop_grace_sec):
+            raise RuntimeError(f"UE process group {pgid} did not exit")
+
+if status is not None and session_exists:
+    subprocess.run(["tmux", "kill-session", "-t", session], check=True)
+    deadline = time.monotonic() + stop_grace_sec
+    while time.monotonic() < deadline:
+        if (
+            subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError(f"tmux session {session} did not exit")
+
+print(
+    json.dumps(
+        {
+            "job_id": job_id,
+            "killed_pgid": killed_pgid,
+            "status_found": status is not None,
+            "status_was_terminal": status_is_terminal,
+            "tmux_session": session,
+            "tmux_was_live": session_exists,
+        },
+        sort_keys=True,
+    )
+)
 """

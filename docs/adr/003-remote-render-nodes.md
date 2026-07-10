@@ -14,3 +14,8 @@
   - (+)节点可随时增删(未来 `duan`/`jz2` 也能纳入);容器重建、磁盘清理都不伤数据;
   - (−)WAN 带宽成为成本:作业包必须最小化(只传该作业需要的资产),产物压缩回传;
   - farm(M4)按"节点池"抽象:每节点 profile(GPU 数、显存、暂存配额、并发上限)进 `uef.toml [hosts.*]`。
+
+- **修订(2026-07-10,M1 正式审计)**:清理远端 job tree 前还必须证明执行进程已经停止。
+  非终态 status 只有在 PID=PGID、session id 和 `/proc` start ticks 全部匹配时才允许
+  TERM → KILL 该进程组并等待退出;身份缺失、PID 消失或疑似 PID 复用一律 fail closed,
+  不杀不确定进程、不删除远端目录。terminal status 可按 runner 已完成的生命周期契约清理。

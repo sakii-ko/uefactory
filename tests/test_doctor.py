@@ -38,6 +38,10 @@ def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
         lambda settings: CheckResult("disk", "OK", "disk ok", {}),
     )
     monkeypatch.setattr(
+        "uefactory.cli.doctor.check_ffmpeg",
+        lambda: CheckResult("ffmpeg", "OK", "ffmpeg ok", {}),
+    )
+    monkeypatch.setattr(
         "uefactory.cli.doctor.check_python",
         lambda: CheckResult("python", "OK", "python ok", {}),
     )
@@ -55,6 +59,7 @@ def test_doctor_json_schema(monkeypatch: Any, tmp_path: Path) -> None:
         "gpu",
         "vulkan",
         "disk",
+        "ffmpeg",
         "python",
     ]
     assert all({"name", "status", "message", "details"} <= set(check) for check in report["checks"])

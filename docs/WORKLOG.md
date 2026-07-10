@@ -470,3 +470,357 @@ REVIEW REQUESTED: feat/m0-remote d64848b
 - 待决问题:4090 provision/smoke 按 PLAN 顺延为 M1 首任务,顺延主因是 WAN 大包传输耗时与 M0 closeout 优先级。
 
 REVIEW REQUESTED: feat/m0-remote f19bbeb
+
+## [2026-07-09] T1.2 MRQ headless 可行性 spike — DONE
+- 分支/commit:
+  - 实现: feat/m1-render @ 0218a75
+- T1.1 机会性探测:
+  - 本工作日已做一次 4090 轻量探测,不继续 hammer。
+  - 命令:通过 `RemoteHost.from_settings(settings, "4090").run("printf ok", timeout_sec=20, check=False)`。
+  - 结果:`returncode=255`,`duration_sec=0.099`;stderr 为 `kex_exchange_identification: Connection closed by remote host` / `Connection closed by 27.189.109.208 port 22`。
+- 做了什么:
+  - 新增 `uef render mrq-spike [--verify-twice]`,只做 T1.2 spike,不扩展 JobSpec 封装。
+  - UE 侧用 `-ExecutePythonScript=uef_mrq_spike.py -NullRHI` 幂等创建 `/Game/UEF/MRQSpike/UEF_MRQ_Spike` LevelSequence 和测试材质;渲染侧用 `/Engine/Maps/Entry -game -RenderOffScreen` + `MoviePipelinePythonHostExecutor` 启动 MRQ runtime executor。
+  - LevelSequence 使用 spawnable CineCameraActor、Cube backdrop/foreground、灯光与显式 transform tracks;输出 `MoviePipelineDeferredPass_Unlit` + PNG。
+  - 为 MRQ legacy PNG 路径设置 `MoviePipelineColorSetting.disable_tone_curve=True` 且启用空 OCIO configuration,让 PNG 输出避开 sRGB half-float quantization 的随机 dither;setup/render summary 均无真实 warning/error。
+  - `ue_runner` 增加两类已知 UE 噪声过滤:`/Engine/PythonTypes` 加载探测 warning、MRQ output path statfs 探测 warning,并补单测。
+- 验收产物:
+  - 命令:`.venv/bin/uef render mrq-spike --verify-twice` → 退出码 0。
+  - 两次 run:
+    - `out/mrq_spike/20260708T201149Z`
+    - `out/mrq_spike/20260708T201234Z`
+  - 每次均产出 8 张 PNG + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`render_kind=mrq_spike`,`status=ok`,`frames_expected=8`,`frames_found=8`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [212.111, 212.111, 212.111, 212.111, 212.111, 212.111, 212.111, 212.111]
+    ```
+  - 额外像素级复核:8 帧逐帧 `ImageChops.difference` 的 bbox 均为 `None`,extrema 全为 `((0, 0), (0, 0), (0, 0))`;两跑 PNG 像素完全一致。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    33 files already formatted
+    Success: no issues found in 28 source files
+    collected 24 items / 1 deselected / 23 selected
+    23 passed, 1 deselected in 0.58s
+    ```
+- 可行路径/必需 flags:
+  - setup:`UnrealEditor-Cmd UEFBase.uproject -ExecutePythonScript=uef_mrq_spike.py -unattended -nopause -nosplash -NullRHI -stdout -FullStdOutLogOutput -NoSound -LocalDataCachePath=data/ddc`
+  - render:`UnrealEditor-Cmd UEFBase.uproject /Engine/Maps/Entry -game -RenderOffScreen -unattended -nopause -nosplash -stdout -FullStdOutLogOutput -NoSound -NoLoadingScreen -windowed -resx=640 -resy=360 -LocalDataCachePath=data/ddc -MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor -ExecutorPythonClass=/Engine/PythonTypes.UEFMRQSpikeRuntimeExecutor -LevelSequence=/Game/UEF/MRQSpike/UEF_MRQ_Spike.UEF_MRQ_Spike`
+- 耗时/坑:
+  - editor/PIE MRQ 路径能出图,但 `QUIT_EDITOR` 后出现 `munmap_chunk()/invalid pointer`;已放弃该路径,改用 runtime PythonHostExecutor。
+  - runtime executor 直接跑模板地图会混入默认天空/地面并有轻微 luma drift;改为 `/Engine/Maps/Entry` 后,必须给 spawnable 显式 transform tracks,否则输出全黑。
+  - UE 5.5 legacy MRQ PNG 输出源码中对 sRGB half-float 8-bit quantization 会加随机噪声;这是前期两跑 luma 差 `0.001-0.004` 的根因。当前用 ColorSetting/OCIO 规避后像素级一致。
+  - setup log 里有 `LogOpenColorIOEditor: Display: Force-disable invalid viewport transform settings.` 的 Display 行,不是 warning/error。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/mrq_spike`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.2 DoD 已达成,下一步按 PLAN 串行进入 T1.3 JobSpec v1。
+
+## [2026-07-09] T1.3 JobSpec v1 + orbit 相机 — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `db6c179`
+- 做了什么:
+  - 新增 JobSpec v1 YAML 解析与显式校验,字段覆盖 `assets/camera/lighting/passes/output`;未知字段、缺字段和非法值均 fail-fast,错误信息带字段路径。
+  - 新增示例 `examples/orbit8.yaml`,当前按 PLAN 只允许 `assets: [builtin:cube]`、`camera.rig: orbit`、`lighting.preset: three_point`、`passes: [beauty_lit]`。
+  - 新增 `uef render job <job.yaml> [--verify-twice]`,输出 `out/renders/<run_id>/<asset>/<pass>/frame_*.png`、`manifest.json` 与 UE logs;manifest v2 记录 job 全文、相机、光照、帧 luma 和 UE warning/error summary。
+  - UE 侧脚本用 MRQ runtime executor 构建 Cube + floor + 三点光占位场景;单个 CineCameraActor 按 orbit 逐帧 key transform,走 `MoviePipelineDeferredPassBase` 输出 `beauty_lit` PNG。
+  - `ue_runner` 增加两类精确噪声过滤:Unreal Trace Server startup warning、MRQ 对 `out/renders/` 输出路径的 statfs probe warning;真实 warning/error summary 仍保持 fail-fast。
+- 验收产物:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 1800` → 退出码 0。
+  - 两次 run:
+    - `out/renders/20260708T205504Z/builtin_cube/beauty_lit`
+    - `out/renders/20260708T205549Z/builtin_cube/beauty_lit`
+  - 每次均产出 8 张 PNG + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`render_kind=job`,`status=ok`,`asset_id=builtin:cube`,`pass=beauty_lit`,`frames_expected=8`,`frames_found=8`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [49.064, 25.158, 34.813, 25.956, 15.026, 14.16, 12.705, 6.759]
+    ```
+  - 额外像素级复核:8 帧逐帧 `ImageChops.difference` 的 bbox 均为 `None`,mean diff 为 `0.0`,extrema 为 `(0, 0)`;两跑 PNG 像素完全一致。
+  - 日志中复查无 `OCIO INVALID`;OpenColorIO 只有 Display 级别的 resave 提示,不是 warning/error。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    38 files already formatted
+    Success: no issues found in 31 source files
+    collected 35 items / 1 deselected / 34 selected
+    34 passed, 1 deselected in 0.57s
+    ```
+- 耗时/坑:
+  - 初版多 camera cut section 会触发 Sequencer frame range ensure;修正 start/end 顺序后仍会让 MRQ 注册多个 shots,并伴随黑帧,最终改成单 camera cut + 单相机逐帧 key transform。
+  - T1.2 的空 OCIO workaround 在 lit pass 中会把黄色 `OCIO INVALID` 字样渲进图片,不能沿用。
+  - 单相机方案仍黑帧的根因是 Sequencer transform channel 的旋转顺序不是 Unreal `Rotator(pitch,yaw,roll)`;写入时按 `(roll,pitch,yaw)` 映射后画面恢复正常。
+  - 去掉空 OCIO 后 PNG sRGB quantization 仍会造成两跑 luma `0.001` 级漂移;最终用引擎自带 `simple.config.ocio` 的 `Utility - Linear - sRGB` 到自身 identity transform 消除随机漂移,且不产生 `OCIO INVALID` overlay。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.3 DoD 已达成,下一步按 PLAN 串行进入 T1.4 多通道 passes。
+
+## [2026-07-09] T1.4 多通道 passes — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `6ef07c1`
+- 做了什么:
+  - `examples/orbit8.yaml` 扩展为六通道:`beauty_lit`、`beauty_unlit`、`depth`、`normal`、`basecolor`、`object_mask`。
+  - JobSpec passes 校验改为支持显式 pass 白名单、拒绝未知 pass 和重复 pass。
+  - MRQ runtime executor 改为按 pass 串行提交 subjob,原始输出落到 `_mrq/<pass>/`,再规范化为 `<asset>/<pass>/frame_*.{png,exr}`。
+  - depth/mask 采用 16-bit half-float EXR;lit/unlit/normal/basecolor 采用 8-bit PNG。manifest 记录每通道格式、位深、物理通道数和逐帧校验值。
+  - 新增通道级校验器:depth 必须有梯度;normal 必须随 orbit 变化且编码范围合理;object_mask 必须是标量 stencil ID 且唯一值为背景+2 物体;lit/unlit 不得逐像素相同;basecolor/lit/unlit 均拒绝近黑或过度均匀帧。
+  - UE setup 给 cube/floor 设置 CustomDepth stencil 值 1/2,并生成 job-local post-process 材质读取 `PPI_CUSTOM_STENCIL / 255`,避免使用 UE `CustomStencil` 可视化调色板冒充 ID mask。
+- 验收产物:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 2400` → 退出码 0。
+  - 两次 run:
+    - `out/renders/20260708T215537Z/builtin_cube`
+    - `out/renders/20260708T215628Z/builtin_cube`
+  - 每次均产出 6 个 pass × 8 帧 + `manifest.json` + `ue.log` + `ue_setup.log`。
+  - manifest 关键字段:`status=ok`,`render_kind=job`,`asset_id=builtin:cube`,`frames_found` 六通道均为 8,`setup_summary.error_count=0`,`setup_summary.warning_count=0`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`。
+  - 两跑 `frame_luma` 完全一致:
+    ```text
+    [49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]
+    ```
+  - 通道格式/首帧校验摘要:
+    ```text
+    beauty_lit    PNG 8-bit RGB   first_mean=[49.186, 49.052, 48.576]
+    beauty_unlit  PNG 8-bit RGB   first_mean=[105.84, 105.84, 105.84]
+    depth         EXR 16-bit RGBA  first_mean=[284.11804], unique_values=159
+    normal        PNG 8-bit RGB   first_mean=[0.0, 127.041, 127.965]
+    basecolor     PNG 8-bit RGB   first_mean=[32.741, 32.741, 32.741]
+    object_mask   EXR 16-bit RGBA  first_mean=[0.0039], unique_values=3, scalar_vector=True
+    ```
+  - 额外复核:用最终 `validate_render_pass()` 对两组产物重算 stable validation payload,两跑完全一致。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    40 files already formatted
+    Success: no issues found in 33 source files
+    collected 44 items / 1 deselected / 43 selected
+    43 passed, 1 deselected in 0.42s
+    ```
+- 耗时/坑:
+  - MRQ additional post-process material pass 不能关闭 main pass;`render_main_pass=False` 时 depth/material 输出为 0 帧。
+  - WorldDepth raw pass 名由引擎材质决定为 `FinalImageMovieRenderQueue_WorldDepth`;自定义 pass 名对 normal/basecolor/object_mask 生效。
+  - UE 内置 `CustomStencil.CustomStencil` 输出的是调色板颜色,首帧有 5 个颜色向量,不能作为 object ID mask;已改为 job-local `PPI_CUSTOM_STENCIL / 255` 标量材质。
+  - normal 是 world-normal buffer,orbit 下红/绿通道均值大幅变化,并非固定“偏蓝”外观;校验器改为验证 orbit-varying channel means 与蓝通道编码范围。
+  - MRQ EXR 实际写出 `RGBA`;manifest 如实记录物理通道数为 4,校验统计取第一通道标量值。
+  - 本轮只使用本机 NAS repo、`data/ddc` 与 `out/renders`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.4 DoD 已达成,下一步按 PLAN 串行进入 T1.5 光照预设。
+
+## [2026-07-09] T1.5 光照预设 — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `9024c89`
+- 做了什么:
+  - JobSpec lighting 扩展为 `preset ∈ {three_point, hdri, none}`;`hdri` 可指定 `lighting.hdri`,默认 `studio_small_03_1k`。
+  - 新增 `uef acquire hdri`,从 PolyHaven files API 下载 1k HDRI 到 `data/hdri/`,写 metadata,记录 source URL/license/md5,并校验已存在文件。
+  - UE setup 按 lighting preset 幂等构建灯光:
+    - `three_point`:保留三点光 + SkyLight。
+    - `hdri`:导入 job 指定 `.hdr` 为 TextureCube,绑定到 SkyLight specified cubemap。
+    - `none`:不 spawn 任何灯光,给 cube/floor 使用 unlit emissive 材质,用于无外部光下验证发光材质。
+  - 新增 `examples/orbit8_hdri.yaml`、`examples/orbit8_none.yaml`;校验器支持 `none` preset 的发光区域断言,不再用全局平均 luma 拒绝小面积发光体。
+- HDRI 获取:
+  - 命令:`.venv/bin/uef acquire hdri --asset-id studio_small_03 --resolution 1k` → 退出码 0。
+  - 产物:
+    - `data/hdri/studio_small_03_1k.hdr`(1.7M,不入 git)
+    - `data/hdri/studio_small_03_1k.json`(metadata,不入 git)
+  - metadata:license=`CC0`,source=`https://dl.polyhaven.org/file/ph-assets/HDRIs/hdr/1k/studio_small_03_1k.hdr`,md5=`74e6ef69ea9024c2cc25b3a7de8ec2f7`。
+- 验收产物:
+  - three_point 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T220541Z/builtin_cube`
+    - `frames_found`:六通道均为 8;`frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`
+  - hdri 命令:`.venv/bin/uef render job examples/orbit8_hdri.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T220645Z/builtin_cube`
+    - `frames_found.beauty_lit=8`;`frame_luma=[254.536, 198.764, 110.994, 141.161, 159.926, 140.906, 99.452, 133.575]`
+  - none 命令:`.venv/bin/uef render job examples/orbit8_none.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T221403Z/builtin_cube`
+    - `frames_found.beauty_lit=8`;`frame_luma=[0.461, 81.116, 0.461, 0.461, 0.461, 0.461, 0.461, 81.116]`
+    - `none` 画面低平均亮度但有 emissive 高亮区域;校验条件为每帧 `max > 32` 且非均匀,不是全局平均 luma。
+  - 三个 run 的 `setup_summary.error_count=0`,`setup_summary.warning_count=0`,`ue_summary.error_count=0`,`ue_summary.warning_count=0`;仅有既有 UE 噪声被过滤。
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    43 files already formatted
+    Success: no issues found in 36 source files
+    collected 51 items / 1 deselected / 50 selected
+    50 passed, 1 deselected in 0.51s
+    ```
+- 耗时/坑:
+  - PolyHaven API 不带 User-Agent 会返回 403;下载器显式设置 `UEFactory/<version> research downloader`。
+  - UE headless 导入 `studio_small_03_1k.hdr` 会生成 `TextureCube`,可直接作为 SkyLight cubemap。
+  - 初版 `none` 使用 DefaultLit + 弱 emissive,校验器拒绝近黑是正确的;后改为无灯光 + Unlit emissive 材质,并按 preset 定制 beauty 断言。
+  - 本轮下载的 HDRI 是 1.7M 小样例,放在 `data/hdri/`;未使用 `/root/nas/fastdata2` 存储引擎、DDC、产物或临时大文件。
+- 待决问题:无;T1.5 DoD 已达成,下一步按 PLAN 串行进入 T1.6 本地/远程统一执行器 + contact sheet + turntable。
+
+## [2026-07-09] T1.6 本地/远程统一执行器 + contact sheet + turntable — DONE
+
+- 分支/commit:
+  - 实现:`feat/m1-render` @ `d919e73`
+- 做了什么:
+  - `uef render job <job.yaml> [--host l40s|4090]` 接入统一远程执行入口;JobSpec 与 UE 侧脚本仍共用本地同一份 job JSON,远端仅负责推包、tmux 执行、回收、清理。
+  - 每个 job 自动生成 `contact_sheet.png`、`index.html`、`turntable.mp4`;contact sheet 以 pass × view 网格展示 PNG/EXR 预览,turntable 使用 `ffmpeg` 合成 beauty_lit 视角序列。
+  - `uef doctor` 增加 ffmpeg 检测;缺失为 WARN,不自动安装。
+  - 远程 job 沿用 root 编排 + `uef` 非 root 用户运行 UE,并在本地校验后删除远端暂存目录;cleanup 写回 manifest。
+  - UE 日志过滤补充精确规则:`LogCore: Warning: Unable to statfs(.../_mrq/... errno=2)` 归类为 MRQ 输出路径探测噪声,不吞其它 statfs warning。
+- 本地验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+  - run:`out/renders/20260708T223645Z/builtin_cube`
+  - 产物:
+    - 六通道 × 8 帧:`beauty_lit`,`beauty_unlit`,`depth`,`normal`,`basecolor`,`object_mask` 均为 8。
+    - `contact_sheet.png` 115713 bytes
+    - `turntable.mp4` 28276 bytes
+    - `index.html` 2802 bytes
+  - manifest:`status=ok`,`render_kind=job`,`artifacts={contact_sheet.png,index.html,turntable.mp4}`。
+  - `frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`。
+- l40s 远程验收:
+  - 预检:`UEF_DOCTOR_WRITE_TEST_MIB=8 .venv/bin/uef doctor --host l40s --json` → 退出码 0;`unreal_engine/gpu/vulkan` 均 OK,`disk` 为预期 WARN(远端 `/root/nas/bigdata1` 是 l40s 自己的 Ceph)。
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --host l40s --timeout-sec 2400` → 退出码 0。
+  - run:`out/renders/20260708T224403Z/builtin_cube`
+  - 产物结构与本地一致:
+    - 六通道 × 8 帧均存在并通过本地 pass 校验。
+    - `contact_sheet.png` 115713 bytes
+    - `turntable.mp4` 28276 bytes
+    - `index.html` 2802 bytes
+  - manifest:
+    - `status=ok`,`remote_host=l40s`,`remote_job_id=render_l40s_20260708T224403Z`,`run_user=uef`
+    - `local_validation.status=ok`
+    - `cleanup.status=ok`,`cleanup.verified=true`,`cleanup.verify_returncode=0`
+    - `cleanup.removed_paths=["/root/nas/bigdata1/cjw/uef/jobs/render_l40s_20260708T224403Z"]`
+    - `ue_summary.error_count=0`,`ue_summary.warning_count=0`;`mrq_remote_output_path_probe=264` 被记录为 filtered noise。
+  - 无前台 SSH 挂住证据:CLI 只执行短 ssh/rsync 操作,远端渲染由 `tmux new-session -d -s uef_render_l40s_20260708T224403Z` 承载;本地随后仅轮询 `status.json`,完成后 rsync pull 并删除/复核远端 job 目录。
+- 本地 vs l40s 初步一致性:
+  ```text
+  view  local_luma  l40s_luma  delta_pct
+  0     49.046      49.046     0.00
+  1     77.297      77.297     0.00
+  2     34.791      34.791     0.00
+  3     25.941      25.941     0.00
+  4     15.010      15.010     0.00
+  5     14.156      14.156     0.00
+  6     12.701      12.701     0.00
+  7     60.521      60.521     0.00
+  ```
+- 测试:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    46 files already formatted
+    Success: no issues found in 39 source files
+    collected 54 items / 1 deselected / 53 selected
+    53 passed, 1 deselected in 0.53s
+    ```
+- 耗时/坑:
+  - 首次 l40s run `out/renders/20260708T223926Z/builtin_cube` 实际产出六通道且 cleanup 成功,但远程脚本把 MRQ `_mrq` 输出路径 `statfs` 探测 warning 当作真实 warning,状态被判 failed;补精确噪声规则后复跑通过。
+  - 4090 未跑:PLAN 已把 4090 作为机会性任务,本轮 T1.6 DoD 以 l40s 为远端必验节点。
+  - 本轮未使用 `/root/nas/fastdata2`;产物和 DDC 在本机 `bigdata1`,远端临时产物在 l40s 自己的 `/root/nas/bigdata1/cjw/uef/jobs/...` 且已清理。
+- 待决问题:无;T1.6 DoD 已达成,下一步按 PLAN 串行进入 T1.7 收尾。
+
+## [2026-07-09] T1.7 M1 收尾 — DONE
+
+- 分支/commit:
+  - 禁用在线请求:`feat/m1-render` @ `10b9fe2`
+  - README/配置样例:`feat/m1-render` @ `15a47a0`
+- 做了什么:
+  - 在 UE project config 层关闭 headless 在线请求源头:`[HTTP] bEnableHttp=False`,
+    `bUseNullHttp=True`,同时关闭 StudioTelemetry 硬件/OS 数据发送。
+  - 新增 `tests/test_ue_project_config.py`,把 HTTP/OnlineSubsystem/Analytics/StudioTelemetry
+    的离线约束变成回归测试。
+  - README 补「五分钟上手」:安装、`uef.toml`、doctor、本地六通道 job、HDRI job、l40s
+    远程 job、产物查看路径。
+  - `uef.toml.example` 补运行数据路径、doctor 写入测试、l40s 同路径陷阱和 `/root/nas/fastdata2`
+    不放大数据的注释。
+- 验收产物:
+  - `tools/check.sh` → 退出码 0,summary:
+    ```text
+    All checks passed!
+    47 files already formatted
+    Success: no issues found in 40 source files
+    collected 55 items / 1 deselected / 54 selected
+    54 passed, 1 deselected in 0.52s
+    ```
+  - 本机 smoke:
+    - 命令:`.venv/bin/uef render smoke --timeout-sec 1800` → 退出码 0。
+    - run:`out/smoke/20260708T225415Z`
+    - manifest:`status=ok`,`render_kind=scene`,`ue_summary.warning_count=0`,`ue_summary.error_count=0`,
+      `mean_luma=36.866`。
+    - 复查 `ue.log`:无 `LogHttp`、proxy、libcurl、HTTP request failed 匹配。
+  - 本机六通道 job:
+    - 命令:`.venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800` → 退出码 0。
+    - run:`out/renders/20260708T225541Z/builtin_cube`
+    - 六通道 × 8 帧均产出;`contact_sheet.png`、`turntable.mp4`、`index.html` 均存在。
+    - manifest:`status=ok`,`ue_summary.warning_count=0`,`ue_summary.error_count=0`,
+      `frame_luma=[49.046, 77.297, 34.791, 25.941, 15.01, 14.156, 12.701, 60.521]`。
+    - 复查 `ue.log`/`ue_setup.log`:无 `LogHttp`、proxy、libcurl、HTTP request failed 匹配。
+- M1 汇总:
+  - T1.2 证明 MRQ headless 路线可行并保持确定性;T1.3 落地严格 JobSpec + orbit camera。
+  - T1.4 完成 lit/unlit/depth/normal/basecolor/object_mask 六通道和通道级校验。
+  - T1.5 完成 `three_point`/`hdri`/`none` 光照预设及最小 HDRI acquire。
+  - T1.6 完成本地/远程统一入口、l40s 跑通、contact sheet、index.html、turntable mp4 和远端清理。
+  - T1.7 关闭 UE 在线请求源头,补齐 README/配置样例,清点 QUESTIONS。
+- 给 M2(资产 ingest)的建议:
+  - 先用一个小型本地 glTF/FBX 样例贯通 import → catalog → thumbnail → JobSpec asset id 替换
+    `builtin:cube`;不要一上来接 Objaverse 全量。
+  - catalog 从第一版开始记录 source URI、license、license tier、original filename、content hash、
+    import status、UE package path、thumbnail path;license 字段保持 NOT NULL。
+  - 资产缓存、导入产物和缩略图默认继续放 `data/` 与 `out/`,不要使用 `/root/nas/fastdata2` 承载大缓存。
+  - 复用 M1 的 render validator 作为 ingest smoke:每个新导入资产至少跑一帧 beauty_lit + object_mask,
+    及时暴露尺度、材质、法线和 stencil 问题。
+  - 先把失败资产保留结构化 failure record,不要静默跳过;M0/T0.6 的 fail-closed 模式应继续沿用。
+- QUESTIONS 清点:`docs/QUESTIONS.md` 待批复为 `(暂无)`;Q1-Q4 均已归档并有 Owner/Planner 答复。
+- 待决问题:无;M1 当前分支已可请求 review。
+
+REVIEW REQUESTED: feat/m1-render 43d2163
+
+## [2026-07-10] M1 正式审计、纠错与最终验收 — DONE
+
+- 分支:`feat/m1-render`(正式提交 sha 见本条之后的 git 历史)。
+- 说明:本条**追加修正**上方 T1.2–T1.7 的阶段性结论,不改写历史。正式 review 发现旧证据中
+  有若干“产物存在但语义/生命周期不够严格”的假成功;全部修复并重新真实运行后才放行。
+- 纠正的关键问题:
+  - 空 OCIO transform 实际会把黄色 `OCIO INVALID` 字样写进图像;改为 pass-specific 有效 transform,
+    并增加重复黄色覆盖层反例检测。
+  - PNG/EXR 不能按配置自报格式:现在解码验证真实分辨率、通道、位深、pixel type;RGBA PNG
+    原子规范为 RGB,EXR 如实记录 half-float RGBA。
+  - 三位小数 luma 不是确定性证明:现在每帧记录 canonical decoded pixel SHA-256,
+    `--verify-twice` 比较完整稳定 validation payload。
+  - normal 是 **world-space normal**,不是 PLAN 旧文所称固定偏蓝的 tangent-space 外观;契约见 ADR-004。
+  - HDRI 初版仅 SkyLight/共享场景不足以证明数据通道干净;改为官方 HDRIBackdrop 材质与
+    beauty/data 两个 LevelSequence,环境只进入 beauty/unlit。
+  - `none` 初版背景/地面语义不够严格;现在背景近黑且只有 emissive cube 可见,validator 会拒绝亮背景。
+  - three-point 改为固定顺序、固定参数的持久 key/fill/rim level actors,解决 MRQ binding/注册顺序
+    引起的 beauty FP16 非确定性。
+  - runtime normalization/初始化/next-pass 异常始终写失败 manifest 并通知 executor finished,
+    不再挂到外层 timeout;失败 manifest 的具体根因不会被 host orchestration 错误覆盖。
+  - 本地 Ctrl-C/异常会终止 UE 进程组并清生成资产;cleanup 结果写 manifest,cleanup 失败附加到主异常。
+  - 远端 runner 改为上传脚本后用短 tmux command 启动;旧 inline Python 超过 shell 命令长度的失败 run
+    `out/renders/20260709T192138Z_0734e04f/` 已安全清理。
+  - 远端 stop 使用 PID=PGID/session/start-ticks 身份验证,TERM→KILL 后等待退出;非终态且身份缺失、
+    PID 消失或疑似复用时 fail closed,保留 remote tree,绝不误删目录或误杀无关进程。
+- 本地确定性验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 1800`。
+  - runs:
+    - `out/renders/20260709T191746Z_b5cf85a4/builtin_cube`
+    - `out/renders/20260709T191834Z_cb99c332/builtin_cube`
+  - beauty_lit/beauty_unlit/depth/normal/basecolor/object_mask × 8,共 48 帧解码像素哈希逐帧完全一致。
+- 光照与通道隔离验收:
+  - HDRI beauty 背景:`out/renders/20260709T190912Z_31bd01b4/builtin_cube`。
+  - HDRI 六通道:`out/renders/20260709T191403Z_5058d55e/builtin_cube`;beauty/unlit 有环境,
+    depth/normal/basecolor/object_mask 与无 HDRI 干净基准逐帧哈希相同。
+  - none:`out/renders/20260709T191654Z_2ef29f7b/builtin_cube`;黑背景、无发光地面、emissive cube 可见。
+  - 执行代理亲眼检查以上 contact sheet,主体居中落地、8 视角完整、无 overlay、无数据通道 HDRI 污染。
+- l40s 真实远程验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --host l40s --timeout-sec 1800`。
+  - run:`out/renders/20260709T192339Z_e408576b/builtin_cube`。
+  - `status=ok`,`remote_host=l40s`,六通道 × 8 帧、contact sheet/index/4.000s MP4 全部通过本地复验。
+  - 与本地 `20260709T191746Z_b5cf85a4` 的 48 帧 decoded SHA-256 **全部完全一致**;
+    8 帧 luma 也完全一致,不是仅在 ±5% 容差内。
+  - `cleanup.status=ok`,`cleanup.verified=true`;远端 job tree 删除后以 `test ! -e` 复核。
+- 最终回归:
+  - `tools/check.sh` → ruff check/format、mypy 全绿;`102 passed, 2 deselected in 17.50s`。
+  - `.venv/bin/pytest -m ue -vv` → `2 passed, 102 deselected in 74.40s`。
+  - 最终真实 UE run:`out/renders/20260709T194212Z_4313e2b8/builtin_cube`,与确定性基准
+    六通道所有帧哈希一致;asset cleanup ok;turntable 4.000s;无遗留 UE 进程/RenderJobs 目录。
+  - doctor:本机与 l40s UE 5.5.4/GPU/远程哨兵正常;只有 NAS/DDC 性能与本机缺 `vulkaninfo`
+    的预期 WARN,不影响真实 Vulkan 渲染通过。
+- 正式结论:`docs/reviews/2026-07-10-formal-m1-render.md` = APPROVE;M1 DoD 完成,
+  当前主线切换到 M2 资产摄取。

@@ -71,6 +71,7 @@ def build_doctor_report(settings: Settings) -> dict[str, Any]:
         check_gpu(settings),
         check_vulkan(settings),
         check_disk(settings),
+        check_ffmpeg(),
         check_python(),
     ]
     status = _overall_status(checks)
@@ -344,6 +345,30 @@ def check_python() -> CheckResult:
         "platform": platform.platform(),
     }
     return CheckResult("python", "OK", f"Python {platform.python_version()}", details)
+
+
+def check_ffmpeg() -> CheckResult:
+    executable = shutil.which("ffmpeg")
+    details: dict[str, Any] = {"executable": executable}
+    if executable is None:
+        return CheckResult("ffmpeg", "WARN", "ffmpeg not found; turntable videos disabled", details)
+    try:
+        result = subprocess.run(
+            [executable, "-version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        details["error"] = str(exc)
+        return CheckResult("ffmpeg", "WARN", "ffmpeg failed", details)
+    details["returncode"] = result.returncode
+    details["version_line"] = result.stdout.splitlines()[0] if result.stdout else ""
+    if result.returncode != 0:
+        details["stderr"] = result.stderr.strip()
+        return CheckResult("ffmpeg", "WARN", "ffmpeg returned non-zero", details)
+    return CheckResult("ffmpeg", "OK", details["version_line"], details)
 
 
 def _print_table(report: dict[str, Any]) -> None:

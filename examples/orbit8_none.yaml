@@ -1,0 +1,15 @@
+job: render
+assets:
+  - builtin:cube
+camera:
+  rig: orbit
+  views: 8
+  elevation_deg: 20
+  fov: 55
+  resolution: [640, 360]
+lighting:
+  preset: none
+passes:
+  - beauty_lit
+output:
+  dir: out/renders

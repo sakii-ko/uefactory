@@ -6,6 +6,7 @@ from typing import Annotated
 import typer
 
 from uefactory import __version__
+from uefactory.cli.acquire import acquire_app
 from uefactory.cli.doctor import doctor_app
 from uefactory.cli.node import node_app
 from uefactory.cli.render import render_app
@@ -48,5 +49,6 @@ def main(
 
 
 app.add_typer(doctor_app, name="doctor")
+app.add_typer(acquire_app, name="acquire")
 app.add_typer(node_app, name="node")
 app.add_typer(render_app, name="render")

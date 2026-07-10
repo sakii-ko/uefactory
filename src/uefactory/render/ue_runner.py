@@ -13,6 +13,9 @@ LOGGER = logging.getLogger(__name__)
 
 KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
     "directory_watcher": ("LogDirectoryWatcher: Warning:",),
+    "unreal_trace_server_startup": (
+        "LogCore: Warning: UTS: Unreal Trace Server process returned an error",
+    ),
     "missing_editor_icon": ("LogStreaming: Warning: Failed to read file", ".png"),
     "usd_plugin_metadata_write_permission": (
         "Warning:",
@@ -24,6 +27,24 @@ KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
         "/Engine/",
         "WritePermissions.",
         "Permission denied",
+    ),
+    "python_types_runtime_class_probe": (
+        "LogStreaming: Warning: LoadPackage: SkipPackage: /Engine/PythonTypes",
+    ),
+    "mrq_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "out/mrq_spike/",
+        "errno=2 (No such file or directory)",
+    ),
+    "mrq_render_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "out/renders/",
+        "errno=2 (No such file or directory)",
+    ),
+    "mrq_remote_output_path_probe": (
+        "LogCore: Warning: Unable to statfs(",
+        "/_mrq/",
+        "errno=2 (No such file or directory)",
     ),
 }
 
@@ -105,6 +126,10 @@ def run_ue(
             )
             _kill_process_group(process)
             returncode = process.wait(timeout=30)
+        except BaseException:
+            LOGGER.warning("UE process interrupted; killing process group")
+            _kill_process_group(process)
+            raise
     duration_sec = time.monotonic() - start
     summary = summarize_ue_log(log_path)
     result = UERunResult(
@@ -184,6 +209,7 @@ def _kill_process_group(process: subprocess.Popen[str]) -> None:
     except (ProcessLookupError, subprocess.TimeoutExpired):
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGKILL)
+            process.wait(timeout=30)
 
 
 def _log_summary(result: UERunResult) -> None:
