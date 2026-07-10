@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -443,13 +444,32 @@ def test_scene_thumbnail_rejects_a_busy_build_or_render_lock_before_catalog_acce
     tmp_path: Path,
 ) -> None:
     settings = _settings(tmp_path)
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
 
-    with (
-        scene_lock(data_dir=settings.data_dir, scene_id=SCENE_ID),
-        pytest.raises(SceneLockError, match="another build or render owns"),
-    ):
-        thumbnail_catalog_scene(settings=settings, scene_id=SCENE_ID)
+    def hold_lock() -> None:
+        try:
+            with scene_lock(data_dir=settings.data_dir, scene_id=SCENE_ID):
+                acquired.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release the external scene lock")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+            acquired.set()
 
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    try:
+        with pytest.raises(SceneLockError, match="another build or render owns"):
+            thumbnail_catalog_scene(settings=settings, scene_id=SCENE_ID)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
     assert not (settings.data_dir / "catalog.db").exists()
     assert not (settings.project_root / "out/scene_thumbnail_jobs").exists()
 

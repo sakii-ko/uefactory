@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -473,12 +474,32 @@ def test_build_scene_rejects_a_busy_scene_lock_before_starting_ue(
         raise AssertionError(f"UE must not start while the scene lock is busy: {args}, {kwargs}")
 
     monkeypatch.setattr(scene_executor, "run_ue", unexpected_run)
-    with (
-        scene_lock(data_dir=settings.data_dir, scene_id=SCENE_ID),
-        pytest.raises(SceneLockError, match="another build or render owns"),
-    ):
-        build_scene(settings=settings, spec_path=spec_path)
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
 
+    def hold_lock() -> None:
+        try:
+            with scene_lock(data_dir=settings.data_dir, scene_id=SCENE_ID):
+                acquired.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release the external scene lock")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+            acquired.set()
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    try:
+        with pytest.raises(SceneLockError, match="another build or render owns"):
+            build_scene(settings=settings, spec_path=spec_path)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
     assert not (settings.project_root / "out/scene_builds").exists()
 
 
@@ -634,6 +655,75 @@ def test_reload_inventory_mismatch_rolls_back_and_never_writes_catalog(
     assert failure["status"] == "failed"
     assert failure["phase"] == "reload"
     assert failure["scene_spec_sha256"] == spec.digest
+
+
+def test_post_commit_package_mismatch_never_rolls_back_or_writes_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    spec_path, _, _ = _scene_fixture(settings)
+    inventory = _inventory()
+    jobs: list[dict[str, Any]] = []
+    events: list[str] = []
+    _install_catalog_stub(monkeypatch, events=events)
+    real_collect = scene_executor.collect_scene_package_evidence
+    collection_count = 0
+
+    def fake_run_ue(
+        command: Sequence[str | Path],
+        *,
+        cwd: Path,
+        log_path: Path,
+        timeout_sec: int,
+        env: Mapping[str, str] | None = None,
+    ) -> UERunResult:
+        del cwd, timeout_sec
+        assert env is not None
+        job = json.loads(Path(env["UEF_JOB_FILE"]).read_text(encoding="utf-8"))
+        assert isinstance(job, dict)
+        jobs.append(job)
+        _write_phase_manifest(job, inventory=inventory)
+        return _clean_result(command, log_path)
+
+    def changed_after_finalize(*args: Any, **kwargs: Any) -> tuple[dict[str, Any], ...]:
+        nonlocal collection_count
+        collection_count += 1
+        if collection_count == 1:
+            return real_collect(*args, **kwargs)
+        raise RuntimeError("package tree changed after irreversible scene commit")
+
+    monkeypatch.setattr(scene_executor, "run_ue", fake_run_ue)
+    monkeypatch.setattr(
+        scene_executor,
+        "collect_scene_package_evidence",
+        changed_after_finalize,
+    )
+    monkeypatch.setattr(
+        scene_executor,
+        "_commit_catalog_scene",
+        lambda **kwargs: pytest.fail("post-commit package mismatch must not write the catalog"),
+    )
+
+    with pytest.raises(SceneBuildError, match="changed after irreversible scene commit") as raised:
+        build_scene(
+            settings=settings,
+            spec_path=spec_path,
+            database_path=settings.data_dir / "catalog.db",
+            out_root=settings.project_root / "out/test_scene_builds",
+        )
+
+    assert [job["job"] for job in jobs] == [
+        "build_scene",
+        "reload_scene",
+        "finalize_scene",
+    ]
+    failure = json.loads(raised.value.manifest_path.read_text(encoding="utf-8"))
+    assert failure["status"] == "failed"
+    assert failure["transaction"] == {
+        "state": "committed",
+        "rollback": "not_attempted_after_commit",
+    }
 
 
 def test_catalog_is_not_written_when_finalize_commit_cannot_be_confirmed(

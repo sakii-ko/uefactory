@@ -35,6 +35,7 @@ from uefactory.render.job import (
 )
 from uefactory.render.jobspec import RenderJobSpec, load_jobspec
 from uefactory.render.ue_runner import LogSummary, UERunnerError, UERunResult
+from uefactory.scenes.locking import SceneLockError, scene_lock
 
 
 def test_new_run_id_is_unique_for_consecutive_calls_in_same_timestamp(
@@ -342,6 +343,59 @@ def test_model_render_busy_lock_rejects_before_resolver_or_ue(
     assert not (settings.project_root / "out/renders").exists()
 
 
+def test_scene_render_lease_is_reentrant_and_rejects_another_thread(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    settings, job_path = _local_render_fixture(tmp_path)
+    job_path.write_text(
+        job_path.read_text(encoding="utf-8").replace("builtin:cube", "scene:test_scene"),
+        encoding="utf-8",
+    )
+    entered: list[str] = []
+    sentinel = object()
+
+    def fake_render_for_spec(**kwargs: Any) -> Any:
+        entered.append(kwargs["spec"].asset_id)
+        return sentinel
+
+    monkeypatch.setattr("uefactory.render.job._render_job_for_spec", fake_render_for_spec)
+
+    with scene_lock(data_dir=settings.data_dir, scene_id="test_scene"):
+        assert render_job(settings=settings, job_path=job_path, timeout_sec=60) is sentinel
+    assert entered == ["scene:test_scene"]
+    entered.clear()
+
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with scene_lock(data_dir=settings.data_dir, scene_id="test_scene"):
+                acquired.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release the external scene lock")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+            acquired.set()
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    try:
+        with pytest.raises(SceneLockError, match="another build or render owns"):
+            render_job(settings=settings, job_path=job_path, timeout_sec=60)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert entered == []
+    assert not (settings.project_root / "out/renders").exists()
+
+
 def test_render_scene_payload_resolves_catalog_build_manifest_and_packages(
     tmp_path: Path,
 ) -> None:
@@ -410,6 +464,15 @@ def test_render_scene_payload_rejects_missing_mesh_package(tmp_path: Path) -> No
 def test_render_scene_payload_rejects_changed_package_generation(tmp_path: Path) -> None:
     settings, spec, _, _, mesh_file = _scene_render_fixture(tmp_path)
     mesh_file.write_bytes(b"tampered package")
+
+    with pytest.raises(RuntimeError, match="no valid build manifest/package inventory"):
+        _render_asset_payload(settings, spec)
+
+
+def test_render_scene_payload_rejects_unrecorded_package_file(tmp_path: Path) -> None:
+    settings, spec, _, _, mesh_file = _scene_render_fixture(tmp_path)
+    extra = mesh_file.with_suffix(".ubulk")
+    extra.write_bytes(b"unrecorded scene package sidecar")
 
     with pytest.raises(RuntimeError, match="no valid build manifest/package inventory"):
         _render_asset_payload(settings, spec)
@@ -987,7 +1050,7 @@ def _scene_render_fixture(
         "actors": actors,
         "assets": [
             {"object_path": mesh_path, "class": "StaticMesh"},
-            {"object_path": map_path, "class": "World"},
+            {"object_path": f"{map_path}.L_{scene_id}", "class": "World"},
         ],
         "static_meshes": [
             {
@@ -1007,7 +1070,7 @@ def _scene_render_fixture(
             "sha256": hashlib.sha256(mesh_file.read_bytes()).hexdigest(),
         },
         {
-            "object_path": map_path,
+            "object_path": f"{map_path}.L_{scene_id}",
             "class": "World",
             "path": map_file.relative_to(settings.project_root).as_posix(),
             "size": map_file.stat().st_size,

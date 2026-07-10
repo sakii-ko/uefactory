@@ -20,6 +20,10 @@ from uefactory.core.paths import utc_timestamp
 from uefactory.render.smoke import _prepend_env_path, _runtime_settings
 from uefactory.render.ue_runner import UERunResult, run_ue
 from uefactory.scenes.locking import scene_lock
+from uefactory.scenes.package_evidence import (
+    collect_scene_package_evidence,
+    scene_package_bundle_sha256,
+)
 from uefactory.scenes.spec import SceneSpec, load_scene_spec
 
 
@@ -178,12 +182,12 @@ def _build_scene_locked(
         if reload_payload.get("inventory") != inventory:
             raise RuntimeError("independent UE reload returned a different scene inventory")
         _assert_source_unchanged(source_file, source_sha256)
-        packages = _collect_package_evidence(
-            settings=settings,
+        packages = collect_scene_package_evidence(
+            settings.project_root,
             scene_id=spec.scene_id,
             inventory=inventory,
         )
-        package_bundle_sha256 = _canonical_digest(list(packages))
+        package_bundle_sha256 = scene_package_bundle_sha256(packages)
 
         # Exercise the exact catalog replacement while UE's previous-map backup is
         # still available.  Finalize evidence does not exist yet, so only its two
@@ -311,18 +315,18 @@ def _build_scene_locked(
                     )
                 raise
 
-        _assert_source_unchanged(source_file, source_sha256)
         assert finalize_payload is not None
         assert finalize_evidence_path is not None
         assert commit_confirmation is not None
-        finalized_packages = _collect_package_evidence(
-            settings=settings,
+        committed = True
+        _assert_source_unchanged(source_file, source_sha256)
+        finalized_packages = collect_scene_package_evidence(
+            settings.project_root,
             scene_id=spec.scene_id,
             inventory=inventory,
         )
         if finalized_packages != packages:
             raise RuntimeError("scene package files changed between reload validation and finalize")
-        committed = True
         phase = "catalog"
         final_payload = {
             "schema_version": 2,
@@ -387,6 +391,12 @@ def _build_scene_locked(
             catalog_path=catalog_path,
         )
     except BaseException as exc:
+        if committed:
+            rollback_disposition = "not_attempted_after_commit"
+        elif phase == "inspect":
+            rollback_disposition = "preserved_for_inspection"
+        else:
+            rollback_disposition = "attempted_if_safe"
         if primary_attempted and not committed and phase != "inspect":
             try:
                 rollback_primary = primary
@@ -421,6 +431,10 @@ def _build_scene_locked(
             "source_file": str(source_file),
             "source_sha256": source_sha256,
             "error": {"type": type(exc).__name__, "message": str(exc)},
+            "transaction": {
+                "state": "committed" if committed else "pre_commit_or_in_doubt",
+                "rollback": rollback_disposition,
+            },
             "runtime": runtime,
             "phases": {
                 key: _result_payload(value, run_dir) for key, value in phase_results.items()
@@ -711,62 +725,6 @@ def _catalog_scene_items(
         )
     )
     return scene, tuple(objects), artifacts
-
-
-def _collect_package_evidence(
-    *,
-    settings: Settings,
-    scene_id: str,
-    inventory: dict[str, Any],
-) -> tuple[dict[str, Any], ...]:
-    assets = inventory.get("assets")
-    if not isinstance(assets, list) or not assets:
-        raise RuntimeError("scene inventory requires a non-empty package asset list")
-    content_root = settings.project_root / "ue/UEFBase/Content"
-    expected_prefix = f"/Game/UEF/Scenes/{scene_id}/"
-    packages: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for item in assets:
-        if not isinstance(item, dict):
-            raise RuntimeError("scene package inventory entry must be an object")
-        object_path = item.get("object_path")
-        asset_class = item.get("class")
-        if not isinstance(object_path, str) or not object_path.startswith(expected_prefix):
-            raise RuntimeError(
-                f"scene package object_path must stay inside {expected_prefix}: {object_path!r}"
-            )
-        if object_path in seen:
-            raise RuntimeError(f"scene package inventory contains duplicate {object_path!r}")
-        seen.add(object_path)
-        if not isinstance(asset_class, str) or not asset_class:
-            raise RuntimeError(f"scene package {object_path!r} has no asset class")
-        package_name, separator, object_name = object_path.partition(".")
-        if (
-            separator != "."
-            or not object_name
-            or "." in object_name
-            or package_name.rsplit("/", 1)[-1] != object_name
-        ):
-            raise RuntimeError(f"scene package has a non-canonical object path: {object_path!r}")
-        relative_package = package_name.removeprefix("/Game/")
-        suffix = ".umap" if asset_class == "World" else ".uasset"
-        package_path = content_root / f"{relative_package}{suffix}"
-        if package_path.is_symlink() or not package_path.is_file():
-            raise RuntimeError(f"scene package file is missing or symbolic: {package_path}")
-        size = package_path.stat().st_size
-        if size <= 0:
-            raise RuntimeError(f"scene package file is empty: {package_path}")
-        packages.append(
-            {
-                "object_path": object_path,
-                "class": asset_class,
-                "path": _project_relative(settings.project_root, package_path),
-                "size": size,
-                "sha256": _sha256(package_path),
-            }
-        )
-    packages.sort(key=lambda value: str(value["object_path"]))
-    return tuple(packages)
 
 
 def _resolve_source_file(spec: SceneSpec) -> Path:

@@ -73,6 +73,21 @@ def render_job(
     database_path: Path | None = None,
 ) -> RenderJobResult:
     spec = load_jobspec(job_path)
+    if spec.scene_id is not None:
+        # Keep this import lazy: scenes.thumbnails imports render.job while the
+        # scenes package is still initializing.
+        from uefactory.scenes.locking import scene_lock
+
+        with scene_lock(
+            data_dir=resolve_path(settings.data_dir, settings.project_root),
+            scene_id=spec.scene_id,
+        ):
+            return _render_job_for_spec(
+                settings=settings,
+                spec=spec,
+                timeout_sec=timeout_sec,
+                database_path=database_path,
+            )
     if spec.asset_id != "builtin:cube" and spec.scene_id is None:
         with asset_lock(
             data_dir=resolve_path(settings.data_dir, settings.project_root),
@@ -1128,6 +1143,7 @@ def _render_scene_payload(
             continue
         package_bundle_sha256 = _validate_scene_package_evidence(
             settings.project_root,
+            scene_id=scene_id,
             inventory=inventory,
             manifest=manifest,
             artifact_params=artifact.params,
@@ -1261,77 +1277,28 @@ def _render_scene_payload(
 def _validate_scene_package_evidence(
     project_root: Path,
     *,
+    scene_id: str,
     inventory: dict[str, Any],
     manifest: dict[str, Any],
     artifact_params: dict[str, Any],
 ) -> str | None:
-    assets = inventory.get("assets")
-    packages = manifest.get("packages")
-    if not isinstance(assets, list) or not assets or not isinstance(packages, list):
-        return None
-    if len(packages) != len(assets):
-        return None
-    expected_assets: dict[str, str] = {}
-    for item in assets:
-        if not isinstance(item, dict) or set(item) != {"object_path", "class"}:
-            return None
-        object_path = item.get("object_path")
-        class_name = item.get("class")
-        if (
-            not isinstance(object_path, str)
-            or not isinstance(class_name, str)
-            or object_path in expected_assets
-        ):
-            return None
-        expected_assets[object_path] = class_name
-    if list(expected_assets) != sorted(expected_assets):
-        return None
+    from uefactory.scenes.package_evidence import (
+        ScenePackageEvidenceError,
+        require_valid_scene_package_evidence,
+        scene_package_bundle_sha256,
+    )
 
-    seen_paths: set[str] = set()
-    for item in packages:
-        if not isinstance(item, dict) or set(item) != {
-            "object_path",
-            "class",
-            "path",
-            "size",
-            "sha256",
-        }:
-            return None
-        object_path = item.get("object_path")
-        class_name = item.get("class")
-        relative_path = item.get("path")
-        size = item.get("size")
-        sha256 = item.get("sha256")
-        if (
-            not isinstance(object_path, str)
-            or expected_assets.get(object_path) != class_name
-            or object_path in seen_paths
-            or not isinstance(relative_path, str)
-            or not relative_path
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or size <= 0
-            or not _is_sha256(sha256)
-        ):
-            return None
-        seen_paths.add(object_path)
-        package_file = (
-            _ue_map_file(project_root, object_path)
-            if class_name == "World"
-            else _ue_object_file(project_root, object_path)
+    packages = manifest.get("packages")
+    try:
+        actual = require_valid_scene_package_evidence(
+            project_root,
+            scene_id=scene_id,
+            inventory=inventory,
+            packages=packages,
         )
-        if not _regular_project_file(project_root, package_file):
-            return None
-        if package_file.resolve().relative_to(project_root.resolve()).as_posix() != relative_path:
-            return None
-        stat = package_file.stat()
-        if stat.st_size != size or _file_sha256(package_file) != sha256:
-            return None
-    if seen_paths != set(expected_assets):
+    except (OSError, ScenePackageEvidenceError, TypeError, ValueError):
         return None
-    if [item["object_path"] for item in packages] != sorted(seen_paths):
-        return None
-    bundle_sha256 = _canonical_digest(packages)
+    bundle_sha256 = scene_package_bundle_sha256(actual)
     if (
         manifest.get("package_bundle_sha256") != bundle_sha256
         or artifact_params.get("package_bundle_sha256") != bundle_sha256
@@ -1660,13 +1627,6 @@ def _valid_engine_normalization(value: Any) -> bool:
         "package_pivot_policy": "preserve",
         "uniform_scale": 1.0,
     }
-
-
-def _ue_object_file(project_root: Path, object_path: str) -> Path:
-    package_path = object_path.partition(".")[0]
-    if not package_path.startswith("/Game/"):
-        return project_root / "__invalid_ue_object__"
-    return project_root / "ue/UEFBase/Content" / f"{package_path.removeprefix('/Game/')}.uasset"
 
 
 def _ue_map_file(project_root: Path, object_path: str) -> Path:
