@@ -15,10 +15,11 @@ import yaml
 from PIL import Image
 
 from uefactory.catalog import ArtifactUpsert, AssetRecord, AssetUpsert, Catalog
+from uefactory.core.asset_locking import asset_lock
 from uefactory.core.config import Settings
 from uefactory.core.identity import validate_asset_id
-from uefactory.core.paths import utc_timestamp
-from uefactory.render.job import RenderJobResult, render_job
+from uefactory.core.paths import resolve_path, utc_timestamp
+from uefactory.render.job import RenderJobResult, render_job, resolve_render_asset
 from uefactory.render.passes import STENCIL_NORMALIZED_ATOL, _read_half_rgba_exr
 
 THUMBNAIL_PRESET = "catalog_thumbnail_v1"
@@ -103,13 +104,19 @@ def thumbnail_catalog_asset(
         render_asset.get("import_manifest") if isinstance(render_asset, dict) else None
     )
     bundle_sha256 = render_asset.get("bundle_sha256") if isinstance(render_asset, dict) else None
+    content_sha256 = render_asset.get("content_sha256") if isinstance(render_asset, dict) else None
     ue_package_bundle_sha256 = (
         render_asset.get("ue_package_bundle_sha256") if isinstance(render_asset, dict) else None
     )
     if (
-        not isinstance(requested_normalization, dict)
+        not isinstance(render_asset, dict)
+        or render_asset.get("kind") != "catalog"
+        or render_asset.get("asset_id") != asset_id
+        or not isinstance(render_asset.get("mesh_path"), str)
+        or not isinstance(requested_normalization, dict)
         or not isinstance(import_manifest, str)
         or not isinstance(bundle_sha256, str)
+        or not isinstance(content_sha256, str)
         or not isinstance(ue_package_bundle_sha256, str)
     ):
         raise RuntimeError("Thumbnail render is missing import/package/normalization provenance")
@@ -123,18 +130,6 @@ def thumbnail_catalog_asset(
     artifact_ids = tuple(
         _artifact_id(asset_id, short_kind, path) for short_kind, _, path in planned
     )
-    manifest["catalog_commit"] = {
-        "database": _relative_project_path(settings.project_root, catalog_path),
-        "asset_id": asset_id,
-        "target_status": "render_ok",
-        "artifact_ids": list(artifact_ids),
-        "thumbnail_preset": THUMBNAIL_PRESET,
-        "selected_view_index": selected_view_index,
-        "bundle_sha256": bundle_sha256,
-        "ue_package_bundle_sha256": ue_package_bundle_sha256,
-        "requested_normalization": requested_normalization,
-        "import_manifest": import_manifest,
-    }
     manifest["thumbnail_validation"] = {
         "rule_version": THUMBNAIL_VALIDATION_RULE,
         "max_background_contamination_ratio": MAX_BACKGROUND_CONTAMINATION_RATIO,
@@ -149,34 +144,80 @@ def thumbnail_catalog_asset(
         "frames": consistency,
         "status": "passed",
     }
-    _write_json(render.manifest_path, manifest)
+    with asset_lock(
+        data_dir=resolve_path(settings.data_dir, settings.project_root),
+        asset_id=asset_id,
+    ):
+        try:
+            current_asset = resolve_render_asset(
+                settings,
+                render.spec,
+                database_path=catalog_path,
+            )
+            current_record = catalog.get_asset(asset_id)
+            _require_current_thumbnail_generation(
+                asset_id=asset_id,
+                rendered_asset=render_asset,
+                current_asset=current_asset,
+                current_record=current_record,
+            )
+            assert current_record is not None
+            manifest["catalog_commit"] = {
+                "database": _relative_project_path(settings.project_root, catalog_path),
+                "asset_id": asset_id,
+                "target_status": "render_ok",
+                "artifact_ids": list(artifact_ids),
+                "thumbnail_preset": THUMBNAIL_PRESET,
+                "selected_view_index": selected_view_index,
+                "bundle_sha256": bundle_sha256,
+                "ue_package_bundle_sha256": ue_package_bundle_sha256,
+                "requested_normalization": requested_normalization,
+                "import_manifest": import_manifest,
+            }
+            _write_json(render.manifest_path, manifest)
 
-    common_params = {
-        "schema_version": 1,
-        "thumbnail_preset": THUMBNAIL_PRESET,
-        "render_manifest": _relative_project_path(settings.project_root, render.manifest_path),
-        "views": 8,
-        "resolution": [512, 512],
-        "lighting": "three_point",
-        "subject_stencil_id": 1,
-        "selected_view_index": selected_view_index,
-        "bundle_sha256": bundle_sha256,
-        "ue_package_bundle_sha256": ue_package_bundle_sha256,
-        "requested_normalization": requested_normalization,
-        "import_manifest": import_manifest,
-    }
-    artifacts = tuple(
-        ArtifactUpsert(
-            artifact_id=artifact_id,
-            asset_id=asset_id,
-            kind=kind,
-            path=path,
-            params=common_params,
-            sha256=_sha256(path),
-        )
-        for artifact_id, (_, kind, path) in zip(artifact_ids, planned, strict=True)
-    )
-    catalog.finalize_render(_render_ok_upsert(record), artifacts)
+            common_params = {
+                "schema_version": 1,
+                "thumbnail_preset": THUMBNAIL_PRESET,
+                "render_manifest": _relative_project_path(
+                    settings.project_root, render.manifest_path
+                ),
+                "views": 8,
+                "resolution": [512, 512],
+                "lighting": "three_point",
+                "subject_stencil_id": 1,
+                "selected_view_index": selected_view_index,
+                "bundle_sha256": bundle_sha256,
+                "ue_package_bundle_sha256": ue_package_bundle_sha256,
+                "requested_normalization": requested_normalization,
+                "import_manifest": import_manifest,
+            }
+            artifacts = tuple(
+                ArtifactUpsert(
+                    artifact_id=artifact_id,
+                    asset_id=asset_id,
+                    kind=kind,
+                    path=path,
+                    params=common_params,
+                    sha256=_sha256(path),
+                )
+                for artifact_id, (_, kind, path) in zip(artifact_ids, planned, strict=True)
+            )
+            catalog.finalize_render(_render_ok_upsert(current_record), artifacts)
+        except BaseException as exc:
+            manifest["catalog_commit"] = {
+                "database": _relative_project_path(settings.project_root, catalog_path),
+                "asset_id": asset_id,
+                "target_status": "render_ok",
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+            try:
+                _write_json(render.manifest_path, manifest)
+            except Exception as record_error:  # pragma: no cover - secondary filesystem failure
+                exc.add_note(f"Could not record thumbnail catalog failure: {record_error}")
+            raise
     return ThumbnailResult(
         asset_id=asset_id,
         render=render,
@@ -185,6 +226,43 @@ def thumbnail_catalog_asset(
         catalog_path=catalog.database_path,
         artifact_ids=artifact_ids,
     )
+
+
+def _require_current_thumbnail_generation(
+    *,
+    asset_id: str,
+    rendered_asset: dict[str, Any],
+    current_asset: dict[str, Any],
+    current_record: AssetRecord | None,
+) -> None:
+    generation_fields = (
+        "kind",
+        "asset_id",
+        "mesh_path",
+        "bundle_sha256",
+        "content_sha256",
+        "import_manifest",
+        "ue_package_bundle_sha256",
+    )
+    changed = [
+        field
+        for field in generation_fields
+        if current_asset.get(field) != rendered_asset.get(field)
+    ]
+    if changed:
+        raise RuntimeError(
+            "Thumbnail render generation changed before catalog commit: " + ", ".join(changed)
+        )
+    if (
+        current_record is None
+        or current_record.status not in {"imported", "render_ok"}
+        or current_record.asset_id != asset_id
+        or current_record.ue_package_path != current_asset.get("mesh_path")
+        or current_record.sha256 != current_asset.get("content_sha256")
+    ):
+        raise RuntimeError(
+            f"Thumbnail catalog asset changed before catalog commit: asset_id={asset_id!r}"
+        )
 
 
 def _thumbnail_jobspec(asset_id: str) -> dict[str, object]:

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, NoReturn
 from uuid import uuid4
 
+from uefactory.core.asset_locking import asset_lock
 from uefactory.core.config import Settings
 from uefactory.core.identity import validate_asset_id
 from uefactory.core.ingest_contracts import (
@@ -17,8 +18,11 @@ from uefactory.core.ingest_contracts import (
     FBX_MATERIAL_POSTPROCESS_POLICY,
     IMPORT_MANIFEST_SCHEMA_VERSION,
 )
-from uefactory.core.paths import utc_timestamp
-from uefactory.ingest.package_evidence import collect_package_bundle_evidence
+from uefactory.core.paths import resolve_path, utc_timestamp
+from uefactory.ingest.package_evidence import (
+    collect_package_bundle_evidence,
+    require_valid_package_bundle_evidence,
+)
 from uefactory.ingest.quality import IngestQualityError, require_static_mesh_quality
 from uefactory.ingest.source_structure import (
     SourceStructureEvidence,
@@ -108,6 +112,45 @@ def _requested_normalization_payload(
 
 
 def ingest_asset(
+    *,
+    settings: Settings,
+    asset_id: str,
+    source_file: Path,
+    out_root: Path | None = None,
+    timeout_sec: int = 1800,
+    bundle_root: Path | None = None,
+    bundle_files: Sequence[Path] | None = None,
+    expected_bundle_sha256: str | None = None,
+    expected_content_sha256: str | None = None,
+    require_single_static_mesh: bool = True,
+    require_texture_references: bool = False,
+    requested_normalization: Mapping[str, Any] | None = None,
+    expected_source_structure: Mapping[str, Any] | None = None,
+    expected_source_structure_sha256: str | None = None,
+) -> IngestResult:
+    with asset_lock(
+        data_dir=resolve_path(settings.data_dir, settings.project_root),
+        asset_id=asset_id,
+    ):
+        return _ingest_asset_locked(
+            settings=settings,
+            asset_id=asset_id,
+            source_file=source_file,
+            out_root=out_root,
+            timeout_sec=timeout_sec,
+            bundle_root=bundle_root,
+            bundle_files=bundle_files,
+            expected_bundle_sha256=expected_bundle_sha256,
+            expected_content_sha256=expected_content_sha256,
+            require_single_static_mesh=require_single_static_mesh,
+            require_texture_references=require_texture_references,
+            requested_normalization=requested_normalization,
+            expected_source_structure=expected_source_structure,
+            expected_source_structure_sha256=expected_source_structure_sha256,
+        )
+
+
+def _ingest_asset_locked(
     *,
     settings: Settings,
     asset_id: str,
@@ -399,6 +442,8 @@ def ingest_asset(
         )
         _raise_typed_failure(exc, manifest_path)
 
+    pre_finalize_package_evidence = manifest["ue_package_bundle"]
+    assert isinstance(pre_finalize_package_evidence, dict)
     transaction = manifest.get("transaction")
     had_existing = bool(isinstance(transaction, dict) and transaction.get("had_existing") is True)
     remove_new_destination = bool(
@@ -633,7 +678,7 @@ def ingest_asset(
     ) = finalize_success
     manifest["transaction"]["state"] = "committed"
     manifest["finalize_validation"] = {
-        "status": "ok",
+        "status": "validating_package_bytes",
         "commit_confirmation": commit_confirmation,
         "attempts": finalize_attempts,
         "manifest": committed_manifest_path.name,
@@ -642,6 +687,60 @@ def ingest_asset(
         "ue_summary": _summary_payload(committed_result),
         "removed_backup": committed_manifest.get("removed_backup", False),
     }
+
+    phase = "post_commit_package_bundle_evidence"
+    try:
+        final_package_evidence = require_valid_package_bundle_evidence(
+            settings.project_root,
+            asset_id=asset_id,
+            imported_object_paths=imported_object_paths,
+            evidence=pre_finalize_package_evidence,
+        )
+    except BaseException as exc:
+        manifest["finalize_validation"].update(
+            {
+                "status": "failed",
+                "package_bundle_validation": {
+                    "status": "failed",
+                    "expected_package_bundle_sha256": pre_finalize_package_evidence.get(
+                        "package_bundle_sha256"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+            }
+        )
+        _write_json(manifest_path, manifest)
+        cleanup = {
+            "status": "committed",
+            "transaction_state": "committed",
+            "rollback_attempted": False,
+            "reason": (
+                "UE transaction was already committed before final package-byte "
+                "validation failed; rollback was not attempted"
+            ),
+        }
+        _record_failure_without_masking(
+            manifest_path=manifest_path,
+            job=job,
+            command=_exception_command(exc, command),
+            runtime=runtime,
+            error=exc,
+            phase=phase,
+            cleanup=cleanup,
+        )
+        _raise_typed_failure(exc, manifest_path)
+
+    manifest["ue_package_bundle"] = final_package_evidence
+    manifest["finalize_validation"].update(
+        {
+            "status": "ok",
+            "package_bundle_validation": {
+                "status": "ok",
+                "package_bundle_sha256": final_package_evidence["package_bundle_sha256"],
+            },
+        }
+    )
 
     _write_json(manifest_path, manifest)
     return IngestResult(

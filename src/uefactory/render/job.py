@@ -12,6 +12,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from uefactory.catalog import Catalog
+from uefactory.core.asset_locking import asset_lock
 from uefactory.core.config import Settings
 from uefactory.core.ingest_contracts import (
     IMPORT_ARTIFACT_SCHEMA_VERSION,
@@ -72,7 +73,33 @@ def render_job(
     database_path: Path | None = None,
 ) -> RenderJobResult:
     spec = load_jobspec(job_path)
-    render_asset = _render_asset_payload(settings, spec, database_path=database_path)
+    if spec.asset_id != "builtin:cube" and spec.scene_id is None:
+        with asset_lock(
+            data_dir=resolve_path(settings.data_dir, settings.project_root),
+            asset_id=spec.asset_id,
+        ):
+            return _render_job_for_spec(
+                settings=settings,
+                spec=spec,
+                timeout_sec=timeout_sec,
+                database_path=database_path,
+            )
+    return _render_job_for_spec(
+        settings=settings,
+        spec=spec,
+        timeout_sec=timeout_sec,
+        database_path=database_path,
+    )
+
+
+def _render_job_for_spec(
+    *,
+    settings: Settings,
+    spec: RenderJobSpec,
+    timeout_sec: int,
+    database_path: Path | None,
+) -> RenderJobResult:
+    render_asset = resolve_render_asset(settings, spec, database_path=database_path)
     run_id = _new_run_id()
     out_root = resolve_path(spec.output.dir, settings.project_root)
     run_dir = out_root / run_id / spec.asset_id.replace(":", "_")
@@ -1007,6 +1034,17 @@ def _render_asset_payload(
     raise RuntimeError(
         f"Catalog asset {spec.asset_id!r} has no valid import manifest/package inventory"
     )
+
+
+def resolve_render_asset(
+    settings: Settings,
+    spec: RenderJobSpec,
+    *,
+    database_path: Path | None = None,
+) -> dict[str, Any]:
+    """Resolve and validate the current builtin, model, or scene generation."""
+
+    return _render_asset_payload(settings, spec, database_path=database_path)
 
 
 def _render_scene_payload(

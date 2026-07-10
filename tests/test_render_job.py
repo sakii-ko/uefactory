@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,7 @@ from uefactory.catalog import (
     SceneObjectUpsert,
     SceneUpsert,
 )
+from uefactory.core.asset_locking import AssetLockError, asset_lock
 from uefactory.core.config import Settings
 from uefactory.core.ingest_contracts import QUALITY_CHECK_NAMES
 from uefactory.ingest.package_evidence import collect_package_bundle_evidence
@@ -280,6 +282,64 @@ def test_render_asset_payload_resolves_catalog_manifest_and_packages(tmp_path: P
     package.write_bytes(b"tampered uasset bytes")
     with pytest.raises(RuntimeError, match="no valid import manifest/package inventory"):
         _render_asset_payload(settings, spec)
+
+
+def test_model_render_busy_lock_rejects_before_resolver_or_ue(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    settings, job_path = _local_render_fixture(tmp_path)
+    job_path.write_text(
+        job_path.read_text(encoding="utf-8").replace("builtin:cube", "test_asset"),
+        encoding="utf-8",
+    )
+    resolver_called = False
+    ue_called = False
+
+    def unexpected_resolver(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        del args, kwargs
+        nonlocal resolver_called
+        resolver_called = True
+        pytest.fail("model resolver must not run while the asset lock is busy")
+
+    def unexpected_ue(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        nonlocal ue_called
+        ue_called = True
+        pytest.fail("UE must not run while the asset lock is busy")
+
+    monkeypatch.setattr("uefactory.render.job._render_asset_payload", unexpected_resolver)
+    monkeypatch.setattr("uefactory.render.job.run_ue", unexpected_ue)
+
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with asset_lock(data_dir=settings.data_dir, asset_id="test_asset"):
+                acquired.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release the external asset lock")
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+            acquired.set()
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    try:
+        with pytest.raises(AssetLockError, match="another ingest or render owns"):
+            render_job(settings=settings, job_path=job_path, timeout_sec=60)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert resolver_called is False
+    assert ue_called is False
+    assert not (settings.project_root / "out/renders").exists()
 
 
 def test_render_scene_payload_resolves_catalog_build_manifest_and_packages(

@@ -2,7 +2,29 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from uefactory.core.config import load_settings
+from uefactory.core.config import Settings, load_settings
+
+
+def test_direct_settings_resolve_project_relative_runtime_paths(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+
+    settings = Settings(
+        project_root=project_root,
+        ue_root=Path("engine"),
+        ue_home=Path("ue-home"),
+        data_dir=Path("relative-data"),
+        log_dir=Path("relative-logs"),
+        ddc_dir=Path("relative-ddc"),
+        runtime_lib_dir=Path("runtime/lib"),
+    )
+
+    assert settings.project_root == project_root.resolve()
+    assert settings.ue_root == project_root / "engine"
+    assert settings.ue_home == project_root / "ue-home"
+    assert settings.data_dir == project_root / "relative-data"
+    assert settings.log_dir == project_root / "relative-logs"
+    assert settings.ddc_dir == project_root / "relative-ddc"
+    assert settings.runtime_lib_dir == project_root / "runtime/lib"
 
 
 def test_config_file_overrides_defaults(tmp_path: Path) -> None:

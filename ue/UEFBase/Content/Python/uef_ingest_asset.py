@@ -776,13 +776,12 @@ def _current_asset_payload(job):
 
 
 def _run_finalize(job, manifest, manifest_path, asset_id):
-    destination, transaction, candidate, backup = _transaction_paths(asset_id)
+    _destination, transaction, candidate, backup = _transaction_paths(asset_id)
     expected_payload = _expected_asset_payload(job)
     payload = _current_asset_payload(job)
     if payload != expected_payload:
         raise RuntimeError("finalize destination payload differs from host-approved payload")
     manifest.update(payload)
-    _save_directory(destination)
     transaction_exists = unreal.EditorAssetLibrary.does_directory_exist(transaction)
     backup_exists = unreal.EditorAssetLibrary.does_directory_exist(backup)
     candidate_exists = unreal.EditorAssetLibrary.does_directory_exist(candidate)

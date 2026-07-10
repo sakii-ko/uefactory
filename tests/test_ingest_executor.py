@@ -3,17 +3,45 @@ from __future__ import annotations
 import hashlib
 import json
 import struct
+import threading
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from uefactory.core.asset_locking import AssetLockError, asset_lock
 from uefactory.core.config import Settings
 from uefactory.ingest.executor import IngestExecutionError, ingest_asset
 from uefactory.ingest.quality import IngestQualityError
 from uefactory.ingest.source_structure import inspect_source_structure
 from uefactory.render.ue_runner import LogSummary, UERunnerError, UERunResult
+
+
+def _start_external_asset_lock(
+    *,
+    data_dir: Path,
+    asset_id: str,
+) -> tuple[threading.Thread, threading.Event, list[BaseException]]:
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with asset_lock(data_dir=data_dir, asset_id=asset_id):
+                acquired.set()
+                if not release.wait(timeout=5):
+                    raise TimeoutError("test did not release the external asset lock")
+        except BaseException as exc:  # pragma: no cover - surfaced by the caller
+            errors.append(exc)
+            acquired.set()
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    return thread, release, errors
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -300,6 +328,10 @@ def test_ingest_asset_runs_import_then_independent_reload_validation(
     assert manifest["reload_validation"]["status"] == "ok"
     assert manifest["reload_validation"]["manifest"] == "reload_manifest.json"
     assert manifest["finalize_validation"]["status"] == "ok"
+    assert manifest["finalize_validation"]["package_bundle_validation"] == {
+        "status": "ok",
+        "package_bundle_sha256": manifest["ue_package_bundle"]["package_bundle_sha256"],
+    }
     assert manifest["schema_version"] == 2
     assert manifest["quality"]["ruleset_version"] == "m2_static_mesh_v2"
     assert manifest["quality"]["status"] == "passed"
@@ -311,6 +343,126 @@ def test_ingest_asset_runs_import_then_independent_reload_validation(
     assert manifest["ue_package_bundle"]["policy"] == "ue_ingested_package_bundle_v1"
     assert len(manifest["ue_package_bundle"]["files"]) == 3
     assert len(manifest["ue_package_bundle"]["package_bundle_sha256"]) == 64
+
+
+def test_ingest_asset_busy_lock_rejects_before_ue_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    source = _source(settings)
+    ue_started = False
+
+    def unexpected_run_ue(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+        nonlocal ue_started
+        ue_started = True
+        pytest.fail("UE must not start while the model asset lock is busy")
+
+    monkeypatch.setattr("uefactory.ingest.executor.run_ue", unexpected_run_ue)
+
+    thread, release, errors = _start_external_asset_lock(
+        data_dir=settings.data_dir,
+        asset_id="test_asset",
+    )
+    try:
+        with pytest.raises(AssetLockError, match="another ingest or render owns"):
+            ingest_asset(settings=settings, asset_id="test_asset", source_file=source)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert ue_started is False
+    assert not (settings.project_root / "out/ingest").exists()
+
+
+def test_ingest_asset_resolves_relative_data_dir_for_lock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    absolute_settings = _settings(tmp_path)
+    settings = replace(absolute_settings, data_dir=Path("relative_data"))
+    source = _source(settings)
+    lock_data_dir = settings.project_root / settings.data_dir
+    monkeypatch.setattr(
+        "uefactory.ingest.executor.run_ue",
+        lambda *args, **kwargs: pytest.fail("UE must not start while the resolved lock is busy"),
+    )
+
+    thread, release, errors = _start_external_asset_lock(
+        data_dir=lock_data_dir,
+        asset_id="test_asset",
+    )
+    lock_path = lock_data_dir / "locks/assets/test_asset.lock"
+    try:
+        with pytest.raises(AssetLockError, match="another ingest or render owns"):
+            ingest_asset(settings=settings, asset_id="test_asset", source_file=source)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert lock_path == settings.project_root / "relative_data/locks/assets/test_asset.lock"
+
+
+def test_finalize_package_rewrite_records_committed_failure_without_rollback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    source = _source(settings)
+    jobs: list[str] = []
+
+    def fake_run_ue(
+        command: Sequence[str | Path],
+        *,
+        cwd: Path,
+        log_path: Path,
+        timeout_sec: int,
+        env: Mapping[str, str] | None = None,
+    ) -> UERunResult:
+        del cwd, timeout_sec
+        assert env is not None
+        job = json.loads(Path(env["UEF_JOB_FILE"]).read_text(encoding="utf-8"))
+        jobs.append(str(job["job"]))
+        _write_ue_manifest(job, [_mesh("test_asset")])
+        if job["job"] == "finalize_ingested_asset":
+            package = (
+                settings.project_root
+                / "ue/UEFBase/Content/UEF/Ingested/test_asset/SM_test_asset.uasset"
+            )
+            package.write_bytes(b"finalize unexpectedly rewrote these package bytes")
+        return _clean_result(command, log_path)
+
+    monkeypatch.setattr("uefactory.ingest.executor.run_ue", fake_run_ue)
+
+    with pytest.raises(IngestExecutionError, match="package bundle bytes or file inventory"):
+        ingest_asset(settings=settings, asset_id="test_asset", source_file=source)
+
+    assert jobs == [
+        "ingest_asset",
+        "validate_ingested_asset",
+        "finalize_ingested_asset",
+    ]
+    manifest_path = next((settings.project_root / "out/ingest").glob("*/test_asset/manifest.json"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["status"] == "failed"
+    assert manifest["failure_phase"] == "post_commit_package_bundle_evidence"
+    assert manifest["transaction"]["state"] == "committed"
+    assert manifest["finalize_validation"]["status"] == "failed"
+    assert manifest["finalize_validation"]["package_bundle_validation"]["status"] == "failed"
+    assert manifest["asset_cleanup"] == {
+        "status": "committed",
+        "transaction_state": "committed",
+        "rollback_attempted": False,
+        "reason": (
+            "UE transaction was already committed before final package-byte validation failed; "
+            "rollback was not attempted"
+        ),
+    }
 
 
 def _write_inspect_manifest(

@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from uefactory.catalog import ArtifactRecord, ArtifactUpsert, AssetUpsert, Catalog
+from uefactory.core.asset_locking import AssetLockError, asset_lock
 from uefactory.core.config import Settings
 from uefactory.core.ingest_contracts import (
     FBX_MATERIAL_POSTPROCESS_POLICY,
@@ -15,7 +16,7 @@ from uefactory.core.ingest_contracts import (
     IMPORT_MANIFEST_SCHEMA_VERSION,
     static_mesh_quality_policy,
 )
-from uefactory.core.paths import utc_timestamp
+from uefactory.core.paths import resolve_path, utc_timestamp
 from uefactory.ingest.batch_report import (
     BatchReportArtifacts,
     BatchReportAsset,
@@ -106,6 +107,26 @@ def ingest_batch(
     for asset in spec.assets:
         staged: StagedAsset | None = None
         ingest_result: IngestResult | None = None
+        asset_lease = asset_lock(
+            data_dir=resolve_path(settings.data_dir, settings.project_root),
+            asset_id=asset.asset_id,
+        )
+        try:
+            asset_lease.__enter__()
+        except AssetLockError as exc:
+            results.append(
+                BatchAssetResult(
+                    asset_id=asset.asset_id,
+                    status="failed",
+                    bundle_sha256=None,
+                    content_sha256=None,
+                    raw_path=None,
+                    ingest_manifest=None,
+                    catalog_status=None,
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                )
+            )
+            continue
         try:
             staged = stage_asset(asset, raw_root=settings.data_dir / "raw/local")
             require_texture_references = "textured" in asset.tags
@@ -332,7 +353,20 @@ def ingest_batch(
                 },
                 sha256=_sha256(ingest_result.manifest_path),
             )
-            catalog.finalize_import(imported_asset, import_artifact)
+            with asset_lock(
+                data_dir=resolve_path(settings.data_dir, settings.project_root),
+                asset_id=asset.asset_id,
+            ):
+                if not is_valid_package_bundle_evidence(
+                    settings.project_root,
+                    asset_id=asset.asset_id,
+                    imported_object_paths=imported_paths,
+                    evidence=package_evidence,
+                ):
+                    raise RuntimeError(
+                        "UE package bytes changed before import catalog finalization"
+                    )
+                catalog.finalize_import(imported_asset, import_artifact)
             thumbnail_manifest: Path | None = None
             final_status = "imported"
             if render_thumbnails:
@@ -413,6 +447,8 @@ def ingest_batch(
                     error=error,
                 )
             )
+        finally:
+            asset_lease.__exit__(None, None, None)
 
     status = "ok" if all(result.status != "failed" for result in results) else "failed"
     report = None

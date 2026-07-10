@@ -41,6 +41,20 @@ class Settings:
     doctor: DoctorConfig = field(default_factory=DoctorConfig)
     hosts: dict[str, HostConfig] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        root = self.project_root.expanduser().resolve()
+        object.__setattr__(self, "project_root", root)
+        for field_name in ("ue_root", "ue_home", "data_dir", "log_dir"):
+            object.__setattr__(
+                self,
+                field_name,
+                resolve_path(getattr(self, field_name), root),
+            )
+        for field_name in ("ddc_dir", "runtime_lib_dir"):
+            value = getattr(self, field_name)
+            if value is not None:
+                object.__setattr__(self, field_name, resolve_path(value, root))
+
 
 def load_settings(
     *,

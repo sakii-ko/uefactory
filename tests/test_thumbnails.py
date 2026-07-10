@@ -11,6 +11,7 @@ from PIL import Image
 
 from uefactory.catalog import AssetUpsert, Catalog
 from uefactory.core.config import Settings
+from uefactory.render.jobspec import load_jobspec
 from uefactory.render.thumbnails import (
     _create_subject_mask_png,
     _validate_black_background_consistency,
@@ -120,8 +121,12 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
             {
                 "status": "ok",
                 "asset": {
+                    "kind": "catalog",
+                    "asset_id": "test_asset",
+                    "mesh_path": "/Game/UEF/Ingested/test_asset/SM_Test.SM_Test",
                     "import_manifest": "out/ingest/test_asset/manifest.json",
                     "bundle_sha256": "b" * 64,
+                    "content_sha256": "a" * 64,
                     "ue_package_bundle_sha256": "c" * 64,
                     "normalization": {"request": requested_normalization},
                 },
@@ -141,6 +146,7 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
 
     def fake_render_job(**kwargs: Any) -> Any:
         calls.append(kwargs)
+        fake_result.spec = load_jobspec(kwargs["job_path"])
         return fake_result
 
     def fake_mask(mask_path: Path, output_path: Path) -> None:
@@ -148,6 +154,12 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
         Image.new("L", (8, 8), 255).save(output_path)
 
     monkeypatch.setattr("uefactory.render.thumbnails.render_job", fake_render_job)
+    monkeypatch.setattr(
+        "uefactory.render.thumbnails.resolve_render_asset",
+        lambda settings, spec, database_path: json.loads(
+            render_manifest.read_text(encoding="utf-8")
+        )["asset"],
+    )
     monkeypatch.setattr("uefactory.render.thumbnails._create_subject_mask_png", fake_mask)
     monkeypatch.setattr(
         "uefactory.render.thumbnails._validate_black_background_consistency",
@@ -192,6 +204,95 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
     )
     assert all(item.params["bundle_sha256"] == "b" * 64 for item in artifacts)
     assert all(item.params["ue_package_bundle_sha256"] == "c" * 64 for item in artifacts)
+
+
+def test_thumbnail_rejects_generation_change_without_catalog_commit(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    catalog = Catalog(settings.data_dir / "catalog.db", project_root=settings.project_root)
+    catalog.upsert_asset(_imported_asset())
+    render_dir = settings.project_root / "out/thumbnails/run/test_asset"
+    beauty = render_dir / "beauty_lit/frame_0000.png"
+    mask = render_dir / "object_mask/frame_0000.exr"
+    beauty.parent.mkdir(parents=True)
+    mask.parent.mkdir(parents=True)
+    Image.new("RGB", (8, 8), (20, 160, 60)).save(beauty)
+    mask.write_bytes(b"raw mask fixture")
+    requested_normalization = {
+        "source_units": "auto",
+        "source_up_axis": "auto",
+        "source_handedness": "auto",
+        "uniform_scale": 1.0,
+        "pivot_policy": "preserve_source",
+    }
+    rendered_asset = {
+        "kind": "catalog",
+        "asset_id": "test_asset",
+        "mesh_path": "/Game/UEF/Ingested/test_asset/SM_Test.SM_Test",
+        "import_manifest": "out/ingest/old/manifest.json",
+        "bundle_sha256": "b" * 64,
+        "content_sha256": "a" * 64,
+        "ue_package_bundle_sha256": "c" * 64,
+        "normalization": {"request": requested_normalization},
+    }
+    render_manifest = render_dir / "manifest.json"
+    render_manifest.write_text(
+        json.dumps({"status": "ok", "asset": rendered_asset}),
+        encoding="utf-8",
+    )
+    contact_sheet = render_dir / "contact_sheet.png"
+    Image.new("RGB", (8, 8), (10, 10, 10)).save(contact_sheet)
+    fake_result = SimpleNamespace(
+        run_dir=render_dir,
+        manifest_path=render_manifest,
+        frame_paths={"beauty_lit": [beauty], "object_mask": [mask]},
+        artifacts=SimpleNamespace(contact_sheet=contact_sheet),
+    )
+
+    def fake_render_job(**kwargs: Any) -> Any:
+        fake_result.spec = load_jobspec(kwargs["job_path"])
+        return fake_result
+
+    monkeypatch.setattr("uefactory.render.thumbnails.render_job", fake_render_job)
+    monkeypatch.setattr(
+        "uefactory.render.thumbnails.resolve_render_asset",
+        lambda settings, spec, database_path: {
+            **rendered_asset,
+            "import_manifest": "out/ingest/new/manifest.json",
+            "ue_package_bundle_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        "uefactory.render.thumbnails._create_subject_mask_png",
+        lambda mask_path, output_path: Image.new("L", (8, 8), 255).save(output_path),
+    )
+    monkeypatch.setattr(
+        "uefactory.render.thumbnails._validate_black_background_consistency",
+        lambda beauty_frames, mask_frames: [
+            {
+                "frame": beauty_frames[0].name,
+                "safe_background_pixels": 1,
+                "contaminated_pixels": 0,
+                "contamination_ratio": 0.0,
+                "total_pixels": 64,
+                "subject_pixels": 64,
+                "subject_area_ratio": 1.0,
+            }
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="generation changed before catalog commit"):
+        thumbnail_catalog_asset(settings=settings, asset_id="test_asset")
+
+    record = catalog.get_asset("test_asset")
+    assert record is not None and record.status == "imported"
+    assert catalog.list_artifacts(asset_id="test_asset") == ()
+    failed_manifest = json.loads(render_manifest.read_text(encoding="utf-8"))
+    assert failed_manifest["catalog_commit"]["status"] == "failed"
+    assert "import_manifest" in failed_manifest["catalog_commit"]["error"]
+    assert "ue_package_bundle_sha256" in failed_manifest["catalog_commit"]["error"]
 
 
 def test_black_background_consistency_rejects_non_stenciled_foreground(

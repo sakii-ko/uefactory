@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import struct
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -13,6 +14,7 @@ import yaml
 from PIL import Image
 
 from uefactory.catalog import ArtifactUpsert, AssetUpsert, Catalog
+from uefactory.core.asset_locking import asset_lock
 from uefactory.core.config import Settings
 from uefactory.ingest.executor import IngestResult
 from uefactory.ingest.package_evidence import collect_package_bundle_evidence
@@ -77,6 +79,31 @@ def _settings(tmp_path: Path) -> Settings:
         data_dir=project_root / "data",
         log_dir=project_root / "logs",
     )
+
+
+def _start_external_asset_lock(
+    *,
+    data_dir: Path,
+    asset_id: str,
+) -> tuple[threading.Thread, threading.Event, list[BaseException]]:
+    acquired = threading.Event()
+    release = threading.Event()
+    errors: list[BaseException] = []
+
+    def hold_lock() -> None:
+        try:
+            with asset_lock(data_dir=data_dir, asset_id=asset_id):
+                acquired.set()
+                if not release.wait(timeout=10):
+                    raise TimeoutError("test did not release the external asset lock")
+        except BaseException as exc:  # pragma: no cover - surfaced by the caller
+            errors.append(exc)
+            acquired.set()
+
+    thread = threading.Thread(target=hold_lock)
+    thread.start()
+    assert acquired.wait(timeout=5)
+    return thread, release, errors
 
 
 def _write_batch_manifest(project_root: Path, asset_ids: tuple[str, ...]) -> Path:
@@ -509,6 +536,158 @@ def test_ingest_batch_imports_all_assets_and_second_run_skips_idempotently(
         "skipped",
     ]
     assert all(item["ingest_manifest"] is None for item in second_manifest["assets"])
+
+
+def test_busy_batch_asset_preserves_existing_catalog_and_artifacts_byte_for_byte(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manifest_path = _write_batch_manifest(settings.project_root, ("locked_asset",))
+    ingest_calls = 0
+
+    def fake_ingest_asset(**kwargs: Any) -> IngestResult:
+        nonlocal ingest_calls
+        ingest_calls += 1
+        return _fake_ingest_result(
+            settings,
+            "locked_asset",
+            [_mesh("locked_asset")],
+            bundle_sha256=str(kwargs["expected_bundle_sha256"]),
+            content_sha256=str(kwargs["expected_content_sha256"]),
+        )
+
+    monkeypatch.setattr("uefactory.ingest.pipeline.ingest_asset", fake_ingest_asset)
+    successful = ingest_batch(settings=settings, manifest_path=manifest_path)
+    assert successful.assets[0].status == "imported"
+
+    catalog = Catalog(successful.catalog_path, project_root=settings.project_root)
+    record_before = catalog.get_asset("locked_asset")
+    assert record_before is not None
+    artifacts_before = tuple(
+        item.as_dict() for item in catalog.list_artifacts(asset_id="locked_asset")
+    )
+    artifact_bytes_before = {
+        item["path"]: (settings.project_root / str(item["path"])).read_bytes()
+        for item in artifacts_before
+    }
+    database_bytes_before = successful.catalog_path.read_bytes()
+
+    thread, release, errors = _start_external_asset_lock(
+        data_dir=settings.data_dir,
+        asset_id="locked_asset",
+    )
+    try:
+        busy = ingest_batch(settings=settings, manifest_path=manifest_path)
+    finally:
+        release.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
+    assert ingest_calls == 1
+    assert busy.status == "failed"
+    assert busy.assets[0].status == "failed"
+    assert busy.assets[0].catalog_status is None
+    assert busy.assets[0].error is not None
+    assert busy.assets[0].error["type"] == "AssetLockError"
+    assert successful.catalog_path.read_bytes() == database_bytes_before
+    assert catalog.get_asset("locked_asset") == record_before
+    assert (
+        tuple(item.as_dict() for item in catalog.list_artifacts(asset_id="locked_asset"))
+        == artifacts_before
+    )
+    assert {
+        path: (settings.project_root / path).read_bytes() for path in artifact_bytes_before
+    } == artifact_bytes_before
+    busy_manifest = json.loads(busy.manifest_path.read_text(encoding="utf-8"))
+    assert busy_manifest["status"] == "failed"
+    assert busy_manifest["assets"][0]["catalog_status"] is None
+    assert busy_manifest["assets"][0]["error"]["type"] == "AssetLockError"
+
+
+def test_concurrent_busy_batch_cannot_overwrite_late_import_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manifest_path = _write_batch_manifest(settings.project_root, ("concurrent_asset",))
+    ingest_started = threading.Event()
+    allow_ingest = threading.Event()
+    successful_results: list[Any] = []
+    worker_errors: list[BaseException] = []
+
+    def fake_ingest_asset(**kwargs: Any) -> IngestResult:
+        ingest_started.set()
+        if not allow_ingest.wait(timeout=10):
+            raise TimeoutError("test did not release the successful ingest")
+        return _fake_ingest_result(
+            settings,
+            "concurrent_asset",
+            [_mesh("concurrent_asset")],
+            bundle_sha256=str(kwargs["expected_bundle_sha256"]),
+            content_sha256=str(kwargs["expected_content_sha256"]),
+        )
+
+    def run_successful_batch() -> None:
+        try:
+            successful_results.append(ingest_batch(settings=settings, manifest_path=manifest_path))
+        except BaseException as exc:  # pragma: no cover - surfaced below
+            worker_errors.append(exc)
+
+    monkeypatch.setattr("uefactory.ingest.pipeline.ingest_asset", fake_ingest_asset)
+    worker = threading.Thread(target=run_successful_batch)
+    worker.start()
+    assert ingest_started.wait(timeout=5)
+    try:
+        busy = ingest_batch(settings=settings, manifest_path=manifest_path)
+    finally:
+        allow_ingest.set()
+        worker.join(timeout=10)
+
+    assert not worker.is_alive()
+    assert worker_errors == []
+    assert len(successful_results) == 1
+    successful = successful_results[0]
+    assert successful.status == "ok"
+    assert successful.assets[0].status == "imported"
+    assert busy.status == "failed"
+    assert busy.assets[0].error is not None
+    assert busy.assets[0].error["type"] == "AssetLockError"
+
+    catalog = Catalog(settings.data_dir / "catalog.db", project_root=settings.project_root)
+    record = catalog.get_asset("concurrent_asset")
+    assert record is not None and record.status == "imported"
+    assert record.error is None
+    artifacts = catalog.list_artifacts(asset_id="concurrent_asset")
+    assert len(artifacts) == 1 and artifacts[0].kind == "import_manifest"
+
+
+def test_batch_asset_lock_releases_after_keyboard_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manifest_path = _write_batch_manifest(settings.project_root, ("interrupted_asset",))
+
+    def interrupt_ingest(**kwargs: Any) -> None:
+        del kwargs
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("uefactory.ingest.pipeline.ingest_asset", interrupt_ingest)
+
+    with pytest.raises(KeyboardInterrupt):
+        ingest_batch(settings=settings, manifest_path=manifest_path)
+
+    thread, release, errors = _start_external_asset_lock(
+        data_dir=settings.data_dir,
+        asset_id="interrupted_asset",
+    )
+    release.set()
+    thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert errors == []
 
 
 def test_ingest_batch_reimports_when_bundle_paths_change_with_identical_contents(
@@ -1285,6 +1464,47 @@ def test_ingest_batch_marks_batch_failed_when_final_report_fails(
     catalog = Catalog(result.catalog_path, project_root=settings.project_root)
     record = catalog.get_asset("report_failure")
     assert record is not None and record.status == "render_ok"
+
+
+def test_ingest_batch_succeeds_with_project_relative_data_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    settings = Settings(
+        project_root=project_root,
+        ue_root=Path("engine"),
+        ue_home=Path("ue-home"),
+        data_dir=Path("relative-data"),
+        log_dir=Path("relative-logs"),
+        ddc_dir=Path("relative-ddc"),
+        runtime_lib_dir=Path("runtime/lib"),
+    )
+    manifest_path = _write_batch_manifest(project_root, ("relative_asset",))
+
+    def fake_ingest_asset(**kwargs: Any) -> IngestResult:
+        assert kwargs["settings"].data_dir == project_root / "relative-data"
+        assert Path(kwargs["source_file"]).is_relative_to(project_root / "relative-data")
+        return _fake_ingest_result(
+            settings,
+            "relative_asset",
+            [_mesh("relative_asset")],
+            bundle_sha256=str(kwargs["expected_bundle_sha256"]),
+            content_sha256=str(kwargs["expected_content_sha256"]),
+        )
+
+    monkeypatch.setattr("uefactory.ingest.pipeline.ingest_asset", fake_ingest_asset)
+
+    result = ingest_batch(settings=settings, manifest_path=manifest_path)
+
+    assert result.status == "ok"
+    assert result.assets[0].status == "imported"
+    assert result.catalog_path == project_root / "relative-data/catalog.db"
+    assert result.catalog_path.is_file()
+    assert result.assets[0].raw_path is not None
+    assert result.assets[0].raw_path.is_relative_to(project_root / "relative-data")
+    assert (project_root / "relative-data/locks/assets/relative_asset.lock").is_file()
 
 
 def test_ingest_batch_fails_before_writing_when_data_dir_is_external(tmp_path: Path) -> None:
