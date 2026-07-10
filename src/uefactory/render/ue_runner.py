@@ -46,6 +46,19 @@ KNOWN_WARNING_NOISE_RULES: dict[str, tuple[str, ...]] = {
         "/_mrq/",
         "errno=2 (No such file or directory)",
     ),
+    "deleted_uefactory_asset_package_probe": (
+        "LogPackageName: Warning: GetLocalFullPath called on FPackagePath",
+        "Content/UEF/",
+        "has an unspecified header extension",
+        "path does not exist on disk",
+        "Assuming EPackageExtension::Asset",
+    ),
+    "derived_data_cache_slow_io": (
+        "LogDerivedDataCache: Warning:",
+        "/DerivedDataCache:",
+        " is very slow (",
+        " MiB/s); consider disabling this cache store.",
+    ),
 }
 
 KNOWN_ERROR_NOISE_RULES: dict[str, tuple[str, ...]] = {

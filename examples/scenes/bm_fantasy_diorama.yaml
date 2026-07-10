@@ -1,0 +1,29 @@
+schema_version: 1
+scene_id: bm_fantasy_diorama
+name: Low Poly Fantasy Diorama
+kind: interchange_scene
+source:
+  path: asset-library/derived/f3266f252ea98fcc/f3266f252ea98fcc.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 992d52ad075d4a9f9a012ca1ce7b56e9
+  source_url: https://sketchfab.com/3d-models/992d52ad075d4a9f9a012ca1ce7b56e9
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: Mesh-Base — Low Poly Fantasy Diorama
+expected:
+  mesh_count: 6
+  material_count: 2
+  texture_count: 0
+  triangle_count: 10216
+build:
+  map_path: /Game/UEF/Scenes/bm_fantasy_diorama/L_bm_fantasy_diorama
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -22.5
+  distance_multiplier: 1.35
+render:
+  no_auto_floor: true

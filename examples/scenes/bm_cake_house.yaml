@@ -1,0 +1,29 @@
+schema_version: 1
+scene_id: bm_cake_house
+name: Stylized Fantasy Cake House Diorama
+kind: interchange_scene
+source:
+  path: asset-library/derived/65464a374ed08c85/65464a374ed08c85.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: ed9fc407a3244e56ba49fe4477c2a60d
+  source_url: https://sketchfab.com/3d-models/ed9fc407a3244e56ba49fe4477c2a60d
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: Nikoleta.Zhecheva — Stylized Fantasy Cake House Diorama
+expected:
+  mesh_count: 127
+  material_count: 10
+  texture_count: 13
+  triangle_count: 35550
+build:
+  map_path: /Game/UEF/Scenes/bm_cake_house/L_bm_cake_house
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -24
+  distance_multiplier: 1.45
+render:
+  no_auto_floor: true

@@ -47,6 +47,34 @@ def test_parse_jobspec_accepts_t14_all_passes() -> None:
     assert spec.passes == PASS_ORDER
 
 
+def test_parse_jobspec_accepts_one_catalog_asset_id() -> None:
+    raw = valid_jobspec()
+    raw["assets"] = ["khronos_avocado"]
+
+    spec = parse_jobspec(raw)
+
+    assert spec.asset_id == "khronos_avocado"
+
+
+def test_parse_jobspec_accepts_scene_reference() -> None:
+    raw = valid_jobspec()
+    raw["assets"] = ["scene:bm_fantasy_diorama"]
+
+    spec = parse_jobspec(raw)
+
+    assert spec.asset_id == "scene:bm_fantasy_diorama"
+    assert spec.scene_id == "bm_fantasy_diorama"
+
+
+@pytest.mark.parametrize("asset", ["scene:", "scene:Bad", "scene:two__underscores"])
+def test_parse_jobspec_rejects_invalid_scene_reference(asset: str) -> None:
+    raw = valid_jobspec()
+    raw["assets"] = [asset]
+
+    with pytest.raises(JobSpecError, match=r"\$\.assets\[0\]"):
+        parse_jobspec(raw)
+
+
 def test_parse_jobspec_accepts_t15_hdri_lighting() -> None:
     raw = valid_jobspec()
     raw["lighting"] = {"preset": "hdri", "hdri": "studio_small_03_1k"}
@@ -76,7 +104,9 @@ def test_parse_jobspec_accepts_t15_none_lighting() -> None:
         ({"camera": {"elevation_deg": 90}}, "$.camera.elevation_deg"),
         ({"camera": {"fov": 9}}, "$.camera.fov"),
         ({"camera": {"resolution": [640]}}, "$.camera.resolution"),
-        ({"assets": ["chair_001"]}, "$.assets"),
+        ({"assets": ["one", "two"]}, "$.assets"),
+        ({"assets": ["Bad Asset"]}, "$.assets[0]"),
+        ({"assets": ["catalog:chair"]}, "$.assets[0]"),
         ({"lighting": {"preset": "unlit"}}, "$.lighting.preset"),
         ({"lighting": {"preset": "three_point", "hdri": "studio_small_03_1k"}}, "$.lighting.hdri"),
         ({"passes": ["not_a_pass"]}, "$.passes[0]"),

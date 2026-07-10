@@ -1,0 +1,30 @@
+schema_version: 1
+scene_id: bm_old_church_ruins
+name: Old Church Ruins Environment
+kind: interchange_scene
+source:
+  path: asset-library/derived/0de174e0f2afce28/0de174e0f2afce28.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 4c7284834ef748109276ba2138ca8123
+  source_url: https://sketchfab.com/3d-models/4c7284834ef748109276ba2138ca8123
+  license: CC-BY-SA-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by-sa/4.0/
+  attribution: H.Foucault — Old Church Ruins
+expected:
+  mesh_count: 60
+  material_count: 16
+  texture_count: 46
+  triangle_count: 355661
+build:
+  map_path: /Game/UEF/Scenes/bm_old_church_ruins/L_bm_old_church_ruins
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -38
+  pitch: -20
+  distance_multiplier: 0.9
+render:
+  no_auto_floor: true
+  lighting_intensity_multiplier: 6.0

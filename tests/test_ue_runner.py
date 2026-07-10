@@ -91,6 +91,18 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
                     "builtin_cube/_mrq/beauty_lit/FinalImage.frame_0000.png'): "
                     "errno=2 (No such file or directory)"
                 ),
+                (
+                    "LogPackageName: Warning: GetLocalFullPath called on FPackagePath "
+                    "../../Content/UEF/Ingested/test/mesh which has an unspecified header "
+                    "extension, and the path does not exist on disk. Assuming "
+                    "EPackageExtension::Asset."
+                ),
+                (
+                    "LogDerivedDataCache: Warning: /cache/DerivedDataCache: Loading "
+                    "bucket.udd from '/Engine/Test' is very slow (0.00 MiB/s); "
+                    "consider disabling this cache store."
+                ),
+                "LogDerivedDataCache: Warning: cache is very slow because it is corrupt",
                 "LogPython: Error: traceback",
                 (
                     "LogUsd: Error: TF_DIAGNOSTIC_CODING_ERROR_TYPE: Failed to load plugin "
@@ -108,8 +120,8 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
 
     summary = summarize_ue_log(log_path)
 
-    assert summary.warning_count == 2
-    assert summary.warning_noise_count == 9
+    assert summary.warning_count == 3
+    assert summary.warning_noise_count == 11
     assert summary.warning_noise == {
         "directory_watcher": 1,
         "unreal_trace_server_startup": 1,
@@ -120,6 +132,8 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
         "mrq_output_path_probe": 1,
         "mrq_render_output_path_probe": 1,
         "mrq_remote_output_path_probe": 1,
+        "deleted_uefactory_asset_package_probe": 1,
+        "derived_data_cache_slow_io": 1,
     }
     assert summary.error_count == 1
     assert summary.error_noise_count == 2
@@ -129,6 +143,7 @@ def test_summarize_ue_log_counts_warnings_and_errors(tmp_path: Path) -> None:
     }
     assert summary.warnings == [
         "LogFoo: Warning: first warning",
+        "LogDerivedDataCache: Warning: cache is very slow because it is corrupt",
         "LogBar: Warning: second warning",
     ]
     assert summary.errors == ["LogPython: Error: traceback"]

@@ -1,0 +1,29 @@
+schema_version: 1
+scene_id: bm_thunderclap_temple
+name: Thunderclap Temple
+kind: interchange_scene
+source:
+  path: asset-library/derived/c90687efbbe20b0b/c90687efbbe20b0b.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 5ad2c436655e41ee923d358de0fafeeb
+  source_url: https://sketchfab.com/3d-models/5ad2c436655e41ee923d358de0fafeeb
+  license: CC-BY-SA-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by-sa/4.0/
+  attribution: patrix — Thunderclap Temple
+expected:
+  mesh_count: 14
+  material_count: 1
+  texture_count: 3
+  triangle_count: 437840
+build:
+  map_path: /Game/UEF/Scenes/bm_thunderclap_temple/L_bm_thunderclap_temple
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -24
+  distance_multiplier: 1.5
+render:
+  no_auto_floor: true

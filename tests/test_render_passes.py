@@ -85,6 +85,156 @@ def test_validate_object_mask_accepts_background_and_two_objects(tmp_path: Path)
     result = validate_render_pass("object_mask", [frame], expected_frames=1)
 
     assert result.frames[0].unique_values == 3
+    assert result.frames[0].unique_scalar_values == (0.0, 0.00392, 0.00784)
+
+
+def test_validate_object_mask_accepts_scene_background_and_single_stencil(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:7, 1:7] = 1.0 / 255.0
+    _write_scalar_exr(frame, values)
+
+    result = validate_render_pass(
+        "object_mask",
+        [frame],
+        expected_frames=1,
+        expected_object_stencil_ids=(1,),
+    )
+
+    assert result.frames[0].unique_scalar_values == (0.0, 0.00392)
+
+
+def test_validate_object_mask_rejects_unexpected_scene_stencil(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:4, 1:4] = 1.0 / 255.0
+    values[4:7, 4:7] = 2.0 / 255.0
+    _write_scalar_exr(frame, values)
+
+    with pytest.raises(RuntimeError, match=r"stencil IDs \[1\]"):
+        validate_render_pass(
+            "object_mask",
+            [frame],
+            expected_frames=1,
+            expected_object_stencil_ids=(1,),
+        )
+
+
+def test_validate_scene_object_mask_requires_sequence_union_coverage(tmp_path: Path) -> None:
+    first = tmp_path / "frame_0000.exr"
+    second = tmp_path / "frame_0001.exr"
+    first_values = np.zeros((8, 8), dtype=np.float32)
+    first_values[1:4, 1:4] = 1.0 / 255.0
+    first_values[4:7, 1:4] = 2.0 / 255.0
+    second_values = np.zeros((8, 8), dtype=np.float32)
+    second_values[1:4, 4:7] = 2.0 / 255.0
+    second_values[4:7, 4:7] = 3.0 / 255.0
+    _write_scalar_exr(first, first_values)
+    _write_scalar_exr(second, second_values)
+
+    result = validate_render_pass(
+        "object_mask",
+        [first, second],
+        expected_frames=2,
+        expected_object_stencil_ids=(1, 2, 3),
+        object_stencil_coverage="sequence_union",
+    )
+
+    assert result.frames[0].unique_scalar_values == (0.0, 0.00392, 0.00784)
+    assert result.frames[1].unique_scalar_values == (0.0, 0.00784, 0.01176)
+    assert result.observed_stencil_ids == (1, 2, 3)
+    assert result.missing_stencil_ids == ()
+    assert result.stencil_coverage_ratio == 1.0
+
+
+def test_validate_scene_object_mask_decodes_real_high_id_quantization(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    for row, value in enumerate((0.03528, 0.04312, 0.05881, 0.07056, 0.07446), start=1):
+        values[row, 1:7] = value
+    _write_scalar_exr(frame, values)
+
+    result = validate_render_pass(
+        "object_mask",
+        [frame],
+        expected_frames=1,
+        expected_object_stencil_ids=(9, 11, 15, 18, 19),
+    )
+
+    assert result.frames[0].unique_values == 6
+
+
+def test_validate_scene_object_mask_rejects_non_stencil_scalar(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:7, 1:7] = 0.036
+    _write_scalar_exr(frame, values)
+
+    with pytest.raises(RuntimeError, match="non-stencil scalar"):
+        validate_render_pass(
+            "object_mask",
+            [frame],
+            expected_frames=1,
+            expected_object_stencil_ids=(9,),
+        )
+
+
+def test_validate_scene_object_mask_rejects_missing_sequence_stencil(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:7, 1:7] = 1.0 / 255.0
+    _write_scalar_exr(frame, values)
+
+    with pytest.raises(RuntimeError, match="does not meet expected stencil coverage"):
+        validate_render_pass(
+            "object_mask",
+            [frame],
+            expected_frames=1,
+            expected_object_stencil_ids=(1, 2),
+            object_stencil_coverage="sequence_union",
+        )
+
+
+def test_validate_scene_object_mask_reports_allowed_occluded_stencils(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:4, 1:4] = 1.0 / 255.0
+    values[4:7, 4:7] = 2.0 / 255.0
+    _write_scalar_exr(frame, values)
+
+    result = validate_render_pass(
+        "object_mask",
+        [frame],
+        expected_frames=1,
+        expected_object_stencil_ids=(1, 2, 3),
+        object_stencil_coverage="sequence_union",
+        minimum_object_stencil_coverage=0.6,
+    )
+
+    assert result.observed_stencil_ids == (1, 2)
+    assert result.missing_stencil_ids == (3,)
+    assert result.stencil_coverage_ratio == pytest.approx(2 / 3)
+    assert result.stable_payload()["stencil_coverage"] == {
+        "observed_ids": [1, 2],
+        "missing_ids": [3],
+        "coverage_ratio": pytest.approx(2 / 3),
+    }
+
+
+def test_validate_object_mask_accepts_high_half_float_stencil_id(tmp_path: Path) -> None:
+    frame = tmp_path / "frame_0000.exr"
+    values = np.zeros((8, 8), dtype=np.float32)
+    values[1:7, 1:7] = 200.0 / 255.0
+    _write_scalar_exr(frame, values)
+
+    result = validate_render_pass(
+        "object_mask",
+        [frame],
+        expected_frames=1,
+        expected_object_stencil_ids=(200,),
+    )
+
+    assert result.frames[0].unique_scalar_values == (0.0, 0.78418)
 
 
 def test_validate_object_mask_rejects_palette_vectors(tmp_path: Path) -> None:
@@ -285,6 +435,24 @@ def test_assert_object_mask_visibility_accepts_centered_visible_object(tmp_path:
     _write_visibility_png(beauty, values)
 
     assert_object_mask_visibility(pass_frames={"object_mask": [mask], "beauty_lit": [beauty]})
+
+
+def test_assert_object_mask_visibility_uses_scene_stencil_union(tmp_path: Path) -> None:
+    mask = tmp_path / "mask.exr"
+    beauty = tmp_path / "beauty.png"
+    values = np.zeros((24, 40), dtype=np.float32)
+    values[6:18, 8:20] = 1.0 / 255.0
+    values[6:18, 20:32] = 2.0 / 255.0
+    _write_scalar_exr(mask, values)
+    pixels = np.full((24, 40, 3), (12, 18, 24), dtype=np.uint8)
+    pixels[6:18, 8:20] = (210, 80, 40)
+    pixels[6:18, 20:32] = (60, 180, 90)
+    Image.fromarray(pixels, mode="RGB").save(beauty)
+
+    assert_object_mask_visibility(
+        pass_frames={"object_mask": [mask], "beauty_lit": [beauty]},
+        foreground_stencil_ids=(1, 2),
+    )
 
 
 def _write_rgb_gradient(path: Path) -> None:

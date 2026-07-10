@@ -1,0 +1,266 @@
+assets:
+  - asset_id: khronos_avocado
+    name: Avocado
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_avocado/Avocado.glb
+    dependencies: []
+    source: khronos
+    source_id: Avocado
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/Avocado
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: Microsoft; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - food
+      - fruit
+      - textured
+
+  - asset_id: khronos_barramundi_fish
+    name: Barramundi Fish
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_barramundi_fish/BarramundiFish.glb
+    dependencies: []
+    source: khronos
+    source_id: BarramundiFish
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/BarramundiFish
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: Microsoft; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - animal
+      - fish
+      - textured
+
+  - asset_id: khronos_boom_box
+    name: Boom Box
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 10.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_boom_box/BoomBox.glb
+    dependencies: []
+    source: khronos
+    source_id: BoomBox
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/BoomBox
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: Microsoft; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - electronics
+      - radio
+      - textured
+
+  - asset_id: khronos_corset
+    name: Corset
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_corset/Corset.glb
+    dependencies: []
+    source: khronos
+    source_id: Corset
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/Corset
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: UX3D and Microsoft; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - clothing
+      - fabric
+      - textured
+
+  - asset_id: khronos_water_bottle
+    name: Water Bottle
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_water_bottle/WaterBottle.glb
+    dependencies: []
+    source: khronos
+    source_id: WaterBottle
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/WaterBottle
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: Microsoft; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - bottle
+      - container
+      - textured
+
+  - asset_id: polyhaven_shelf_01
+    name: Shelf 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/polyhaven_shelf_01/Shelf_01_1k.fbx
+    dependencies:
+      - textures/Shelf_01_diff_1k.jpg
+      - textures/Shelf_01_metallic_1k.exr
+      - textures/Shelf_01_nor_gl_1k.exr
+      - textures/Shelf_01_roughness_1k.jpg
+    source: polyhaven
+    source_id: Shelf_01
+    source_url: https://polyhaven.com/a/Shelf_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: Gabriel Radić; distributed by Poly Haven.
+    tags:
+      - furniture
+      - shelf
+      - textured
+
+  - asset_id: polyhaven_side_table_01
+    name: Side Table 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/polyhaven_side_table_01/side_table_01_1k.fbx
+    dependencies:
+      - textures/side_table_01_diff_1k.jpg
+      - textures/side_table_01_metal_1k.exr
+      - textures/side_table_01_nor_gl_1k.exr
+      - textures/side_table_01_rough_1k.jpg
+    source: polyhaven
+    source_id: side_table_01
+    source_url: https://polyhaven.com/a/side_table_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: James Ray Cock; distributed by Poly Haven.
+    tags:
+      - furniture
+      - table
+      - textured
+
+  - asset_id: polyhaven_standing_picture_frame_01
+    name: Standing Picture Frame 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/polyhaven_standing_picture_frame_01/standing_picture_frame_01_1k.fbx
+    dependencies:
+      - textures/standing_picture_frame_01_artwork_diff_1k.png
+      - textures/standing_picture_frame_01_artwork_nor_gl_1k.png
+      - textures/standing_picture_frame_01_artwork_rough_1k.png
+      - textures/standing_picture_frame_01_diff_1k.jpg
+      - textures/standing_picture_frame_01_metal_1k.exr
+      - textures/standing_picture_frame_01_nor_gl_1k.exr
+      - textures/standing_picture_frame_01_rough_1k.jpg
+    source: polyhaven
+    source_id: standing_picture_frame_01
+    source_url: https://polyhaven.com/a/standing_picture_frame_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: James Ray Cock; distributed by Poly Haven.
+    tags:
+      - decorative
+      - frame
+      - textured
+
+  - asset_id: polyhaven_school_desk_01
+    name: School Desk 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/polyhaven_school_desk_01/SchoolDesk_01_1k.fbx
+    dependencies:
+      - textures/SchoolDesk_01_diff_1k.jpg
+      - textures/SchoolDesk_01_metallic_1k.exr
+      - textures/SchoolDesk_01_nor_gl_1k.exr
+      - textures/SchoolDesk_01_roughness_1k.jpg
+    source: polyhaven
+    source_id: SchoolDesk_01
+    source_url: https://polyhaven.com/a/SchoolDesk_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: Ethan Place; distributed by Poly Haven.
+    tags:
+      - desk
+      - furniture
+      - textured
+
+  - asset_id: polyhaven_ceramic_vase_01
+    name: Ceramic Vase 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/polyhaven_ceramic_vase_01/ceramic_vase_01_1k.fbx
+    dependencies:
+      - textures/ceramic_vase_01_diff_1k.jpg
+      - textures/ceramic_vase_01_metal_1k.exr
+      - textures/ceramic_vase_01_nor_gl_1k.exr
+      - textures/ceramic_vase_01_rough_1k.jpg
+    source: polyhaven
+    source_id: ceramic_vase_01
+    source_url: https://polyhaven.com/a/ceramic_vase_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: James Ray Cock; distributed by Poly Haven.
+    tags:
+      - decorative
+      - vase
+      - textured
+
+  - asset_id: khronos_box
+    name: Box
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_samples/khronos_box/Box.glb
+    dependencies: []
+    source: khronos
+    source_id: Box
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/2bac6f8c57bf471df0d2a1e8a8ec023c7801dddf/Models/Box
+    license: CC-BY-4.0
+    license_tier: open
+    license_url: https://creativecommons.org/licenses/by/4.0/legalcode
+    attribution: Cesium; distributed by Khronos Group glTF Sample Assets.
+    tags:
+      - geometry
+      - hierarchy
+      - primitive
+      - untextured

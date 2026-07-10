@@ -84,6 +84,7 @@ def render_smoke(settings: Settings, out_root: Path, timeout_sec: int = 1800) ->
         "-stdout",
         "-FullStdOutLogOutput",
         "-NoSound",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
     ]
     env = {
@@ -822,6 +823,7 @@ try:
         "-stdout",
         "-FullStdOutLogOutput",
         "-NoSound",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
     ]
     run_command, run_env = command_for_run_user(command, env)
