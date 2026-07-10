@@ -1,0 +1,48 @@
+assets:
+  - asset_id: khronos_avocado
+    name: Avocado
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_spike/khronos_avocado/Avocado.glb
+    dependencies: []
+    source: khronos
+    source_id: Avocado
+    source_url: https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models/Avocado
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://creativecommons.org/publicdomain/zero/1.0/
+    attribution: Microsoft and Khronos Group glTF Sample Assets.
+    tags:
+      - food
+      - fruit
+      - textured
+
+  - asset_id: polyhaven_shelf_01
+    name: Shelf 01
+    normalization:
+      source_units: auto
+      source_up_axis: auto
+      source_handedness: auto
+      uniform_scale: 1.0
+      pivot_policy: preserve_source
+    path: ../data/m2_spike/polyhaven_shelf/Shelf_01_1k.fbx
+    dependencies:
+      - textures/Shelf_01_diff_1k.jpg
+      - textures/Shelf_01_metallic_1k.exr
+      - textures/Shelf_01_nor_gl_1k.exr
+      - textures/Shelf_01_roughness_1k.jpg
+    source: polyhaven
+    source_id: Shelf_01
+    source_url: https://polyhaven.com/a/Shelf_01
+    license: CC0-1.0
+    license_tier: open
+    license_url: https://polyhaven.com/license
+    attribution: Gabriel Radić and Poly Haven.
+    tags:
+      - furniture
+      - shelf
+      - textured

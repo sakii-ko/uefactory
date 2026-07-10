@@ -6,6 +6,7 @@ from typing import Any
 
 import yaml
 
+from uefactory.core.identity import validate_asset_id
 from uefactory.render.passes import SUPPORTED_PASSES
 
 
@@ -52,6 +53,12 @@ class RenderJobSpec:
     def asset_id(self) -> str:
         return self.assets[0]
 
+    @property
+    def scene_id(self) -> str | None:
+        if not self.asset_id.startswith("scene:"):
+            return None
+        return self.asset_id.removeprefix("scene:")
+
 
 def load_jobspec(path: Path) -> RenderJobSpec:
     try:
@@ -71,8 +78,19 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
         raise JobSpecError(f"$.job: expected 'render', got {job!r}")
 
     assets = _string_list(root["assets"], "$.assets", min_len=1)
-    if tuple(assets) != ("builtin:cube",):
-        raise JobSpecError("$.assets: T1.3 supports exactly ['builtin:cube']")
+    if len(assets) != 1:
+        raise JobSpecError("$.assets: expected exactly one asset")
+    if assets[0].startswith("scene:"):
+        scene_id = assets[0].removeprefix("scene:")
+        try:
+            validate_asset_id(scene_id, field="$.assets[0]")
+        except ValueError as exc:
+            raise JobSpecError(str(exc)) from exc
+    elif assets[0] != "builtin:cube":
+        try:
+            validate_asset_id(assets[0], field="$.assets[0]")
+        except ValueError as exc:
+            raise JobSpecError(str(exc)) from exc
 
     camera_raw = _mapping(root["camera"], "$.camera")
     _require_keys(camera_raw, {"rig", "views", "elevation_deg", "fov", "resolution"}, "$.camera")

@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import math
 import shlex
 import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
+from uefactory.catalog import Catalog
 from uefactory.core.config import Settings
+from uefactory.core.ingest_contracts import (
+    IMPORT_ARTIFACT_SCHEMA_VERSION,
+    IMPORT_MANIFEST_SCHEMA_VERSION,
+    QUALITY_RULESET_VERSION,
+    is_current_passed_quality,
+    static_mesh_quality_policy,
+)
 from uefactory.core.paths import resolve_path, utc_timestamp
 from uefactory.core.remote import RemoteHost
 from uefactory.render.artifacts import RenderArtifacts, create_render_artifacts
@@ -59,8 +69,10 @@ def render_job(
     settings: Settings,
     job_path: Path,
     timeout_sec: int = 1800,
+    database_path: Path | None = None,
 ) -> RenderJobResult:
     spec = load_jobspec(job_path)
+    render_asset = _render_asset_payload(settings, spec, database_path=database_path)
     run_id = _new_run_id()
     out_root = resolve_path(spec.output.dir, settings.project_root)
     run_dir = out_root / run_id / spec.asset_id.replace(":", "_")
@@ -85,16 +97,26 @@ def render_job(
         if not path.exists():
             raise FileNotFoundError(f"{label} not found: {path}")
 
-    ue_job = _ue_job_payload(settings, spec, run_id, run_dir, sequence_path)
+    ue_job = _ue_job_payload(
+        settings,
+        spec,
+        run_id,
+        run_dir,
+        sequence_path,
+        render_asset=render_asset,
+    )
     ue_job_path.write_text(json.dumps(ue_job, indent=2, sort_keys=True), encoding="utf-8")
 
     ddc_dir = settings.ddc_dir or settings.data_dir / "ddc"
     ddc_dir.mkdir(parents=True, exist_ok=True)
+    tmp_dir = settings.data_dir / "tmp"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     ue_home = settings.ue_home
     ue_home.mkdir(parents=True, exist_ok=True)
     runtime = _runtime_settings(settings.runtime_lib_dir)
     env = {
         "HOME": str(ue_home),
+        "TMPDIR": str(tmp_dir),
         "UEF_JOB_FILE": str(ue_job_path),
         "UE-LocalDataCachePath": str(ddc_dir),
     }
@@ -112,6 +134,7 @@ def render_job(
         "-stdout",
         "-FullStdOutLogOutput",
         "-NoSound",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
     ]
     try:
@@ -171,6 +194,7 @@ def render_job(
         "-windowed",
         f"-resx={width}",
         f"-resy={height}",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
         "-MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor",
         "-ExecutorPythonClass=/Engine/PythonTypes.UEFRenderJobRuntimeExecutor",
@@ -237,6 +261,7 @@ def render_job(
         raise missing_manifest_error
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     base_manifest = {
+        "asset": ue_job["asset"],
         "commands": {"setup": setup_result.command, "render": ue_result.command},
         "runtime": runtime,
         "setup_log": setup_log_path.name,
@@ -262,12 +287,14 @@ def render_job(
     manifest["status"] = "validating"
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
     try:
+        _validate_scene_sanitization(manifest, spec)
         result = _validate_render_output(
             run_dir=run_dir,
             manifest_path=manifest_path,
             setup_log_path=setup_log_path,
             ue_log_path=ue_log_path,
             spec=spec,
+            render_asset=ue_job["asset"],
         )
         manifest.update(
             {
@@ -292,6 +319,47 @@ def render_job(
         raise
 
 
+def _validate_scene_sanitization(manifest: dict[str, Any], spec: RenderJobSpec) -> None:
+    payload = manifest.get("scene_sanitization")
+    if spec.asset_id == "builtin:cube":
+        if payload != {"policy": "not_applicable"}:
+            raise RuntimeError("Builtin render must retain the M1 scene contract")
+        return
+    if not isinstance(payload, dict):
+        raise RuntimeError("Catalog render is missing scene sanitization evidence")
+    if payload.get("policy") != "catalog_hide_all_pawns_v2":
+        raise RuntimeError("Catalog render used an unsupported scene sanitization policy")
+    subjobs = payload.get("subjobs")
+    if not isinstance(subjobs, list) or len(subjobs) != len(spec.passes):
+        actual_count = 0 if not isinstance(subjobs, list) else len(subjobs)
+        raise RuntimeError(
+            "Catalog scene sanitization must cover every MRQ subjob: "
+            f"expected={len(spec.passes)} actual={actual_count}"
+        )
+    expected_indices = list(range(len(spec.passes)))
+    actual_indices = [item.get("subjob_index") for item in subjobs if isinstance(item, dict)]
+    if actual_indices != expected_indices:
+        raise RuntimeError(
+            "Catalog scene sanitization subjob indices are incomplete: "
+            f"expected={expected_indices} actual={actual_indices}"
+        )
+    for item in subjobs:
+        assert isinstance(item, dict)
+        count = item.get("hidden_pawn_count")
+        editor_count = item.get("editor_hidden_pawn_count")
+        meshes = item.get("hidden_static_meshes")
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise RuntimeError("Catalog scene sanitization has an invalid pawn count")
+        if (
+            not isinstance(editor_count, int)
+            or isinstance(editor_count, bool)
+            or editor_count != count
+        ):
+            raise RuntimeError("Catalog scene sanitization has an invalid editor-hidden count")
+        if not isinstance(meshes, list) or any(not isinstance(path, str) for path in meshes):
+            raise RuntimeError("Catalog scene sanitization has an invalid mesh inventory")
+
+
 def render_job_remote(
     *,
     settings: Settings,
@@ -301,6 +369,8 @@ def render_job_remote(
     poll_interval_sec: int = 30,
 ) -> RenderJobResult:
     spec = load_jobspec(job_path)
+    if spec.asset_id != "builtin:cube":
+        raise ValueError("Remote catalog-asset rendering is not supported until M4 package sync")
     remote = RemoteHost.from_settings(settings, host)
     runtime = _prepare_remote_smoke_runtime(remote, run_user="uef")
     run_user = str(runtime.get("run_user") or "")
@@ -560,6 +630,7 @@ def _validate_render_output(
     setup_log_path: Path,
     ue_log_path: Path,
     spec: RenderJobSpec,
+    render_asset: dict[str, Any] | None = None,
 ) -> RenderJobResult:
     frame_paths = {
         pass_name: sorted((run_dir / pass_name).glob("frame_*.*")) for pass_name in spec.passes
@@ -568,6 +639,35 @@ def _validate_render_output(
         png_paths = [path for path in paths if path.suffix.lower() == ".png"]
         if png_paths:
             canonicalize_png_frames(png_paths)
+    if spec.scene_id is not None:
+        if not isinstance(render_asset, dict):
+            raise RuntimeError("Scene render validation is missing its build-generation payload")
+        stencil_payload = render_asset.get("expected_object_stencil_ids")
+        static_actor_count = render_asset.get("static_mesh_actor_count")
+        if (
+            not isinstance(stencil_payload, list)
+            or isinstance(static_actor_count, bool)
+            or not isinstance(static_actor_count, int)
+            or stencil_payload != list(range(1, static_actor_count + 1))
+        ):
+            raise RuntimeError("Scene render has an invalid object-stencil inventory")
+        coverage_payload = render_asset.get("minimum_object_stencil_coverage")
+        if (
+            isinstance(coverage_payload, bool)
+            or not isinstance(coverage_payload, int | float)
+            or not math.isfinite(float(coverage_payload))
+            or not 0.6 <= float(coverage_payload) <= 1.0
+        ):
+            raise RuntimeError("Scene render has an invalid object-stencil coverage policy")
+        expected_object_stencil_ids = tuple(stencil_payload)
+        object_stencil_coverage: Literal["every_frame", "sequence_union"] = "sequence_union"
+        minimum_object_stencil_coverage = float(coverage_payload)
+        foreground_stencil_ids = expected_object_stencil_ids
+    else:
+        expected_object_stencil_ids = (1, 2)
+        object_stencil_coverage = "every_frame"
+        minimum_object_stencil_coverage = 1.0
+        foreground_stencil_ids = (1,)
     pass_validations = {
         pass_name: validate_render_pass(
             pass_name,
@@ -575,6 +675,9 @@ def _validate_render_output(
             expected_frames=spec.frame_count,
             expected_resolution=spec.camera.resolution,
             lighting_preset=spec.lighting.preset,
+            expected_object_stencil_ids=expected_object_stencil_ids,
+            object_stencil_coverage=object_stencil_coverage,
+            minimum_object_stencil_coverage=minimum_object_stencil_coverage,
         )
         for pass_name, paths in frame_paths.items()
     }
@@ -585,7 +688,10 @@ def _validate_render_output(
             second_pass="beauty_unlit",
         )
     if "object_mask" in frame_paths:
-        assert_object_mask_visibility(pass_frames=frame_paths)
+        assert_object_mask_visibility(
+            pass_frames=frame_paths,
+            foreground_stencil_ids=foreground_stencil_ids,
+        )
     artifacts = create_render_artifacts(
         run_dir=run_dir,
         frame_paths=frame_paths,
@@ -687,6 +793,8 @@ def _ue_job_payload(
     run_id: str,
     run_dir: Path,
     sequence_path: str,
+    *,
+    render_asset: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     payload = _ue_job_payload_with_lighting(
         spec=spec,
@@ -694,6 +802,7 @@ def _ue_job_payload(
         run_dir=run_dir,
         sequence_path=sequence_path,
         lighting=_lighting_payload(settings, spec),
+        render_asset=render_asset or _render_asset_payload(settings, spec),
     )
     payload["engine"] = _engine_version(settings)
     return payload
@@ -706,6 +815,7 @@ def _ue_job_payload_with_lighting(
     run_dir: Path,
     sequence_path: str,
     lighting: dict[str, Any],
+    render_asset: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     width, height = spec.camera.resolution
     beauty_sequence_name = f"UEF_RenderJobBeauty_{run_id}"
@@ -715,6 +825,7 @@ def _ue_job_payload_with_lighting(
         else sequence_path
     )
     return {
+        "asset": render_asset or _builtin_render_asset_payload(spec),
         "asset_id": spec.asset_id,
         "camera": {
             "rig": spec.camera.rig,
@@ -730,11 +841,832 @@ def _ue_job_payload_with_lighting(
         "passes": list(spec.passes),
         "render_kind": "job",
         "run_id": run_id,
-        "schema_version": 2,
+        "schema_version": 3,
         "map_path": f"/Game/UEF/RenderJobs/{run_id}/UEF_RenderWorld_{run_id}",
         "sequence_path": sequence_path,
         "beauty_sequence_path": beauty_sequence_path,
     }
+
+
+def _render_asset_payload(
+    settings: Settings,
+    spec: RenderJobSpec,
+    *,
+    database_path: Path | None = None,
+) -> dict[str, Any]:
+    # Import lazily so importing scene specs cannot recurse through
+    # ingest.pipeline -> render.thumbnails -> render.job.
+    from uefactory.ingest.source_structure import is_valid_source_structure_evidence
+
+    if spec.asset_id == "builtin:cube":
+        return _builtin_render_asset_payload(spec)
+    resolved_database = database_path or settings.data_dir / "catalog.db"
+    if not resolved_database.is_absolute():
+        resolved_database = settings.project_root / resolved_database
+    catalog = Catalog(resolved_database, project_root=settings.project_root)
+    if spec.scene_id is not None:
+        return _render_scene_payload(settings, spec, catalog)
+    record = catalog.get_asset(spec.asset_id)
+    if record is None:
+        raise ValueError(f"Catalog asset not found: {spec.asset_id}")
+    if record.status not in {"imported", "render_ok"} or record.ue_package_path is None:
+        raise ValueError(
+            f"Catalog asset {spec.asset_id!r} is not renderable: status={record.status!r}"
+        )
+    if record.material_count is None or record.material_count <= 0:
+        raise ValueError(
+            f"Catalog asset {spec.asset_id!r} requires at least one material for thumbnails"
+        )
+
+    quality_policy = static_mesh_quality_policy(
+        require_single_static_mesh=True,
+        require_texture_references="textured" in record.tags,
+    )
+
+    artifacts = sorted(
+        catalog.list_artifacts(asset_id=spec.asset_id),
+        key=lambda item: (item.created_at, item.artifact_id),
+        reverse=True,
+    )
+    for artifact in artifacts:
+        if artifact.kind != "import_manifest" or artifact.sha256 is None:
+            continue
+        manifest_path = settings.project_root / artifact.path
+        if not _regular_project_file(settings.project_root, manifest_path):
+            continue
+        if _file_sha256(manifest_path) != artifact.sha256:
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(manifest, dict):
+            continue
+        requested_normalization = _catalog_requested_normalization(manifest)
+        if requested_normalization is None:
+            continue
+        material_postprocess = manifest.get("material_postprocess")
+        bundle_sha256 = manifest.get("bundle_sha256")
+        source_format = artifact.params.get("source_format")
+        record_source_format = Path(record.raw_path).suffix.lower().removeprefix(".")
+        source_structure = manifest.get("source_structure")
+        source_structure_sha256 = manifest.get("source_structure_sha256")
+        if (
+            manifest.get("schema_version") != IMPORT_MANIFEST_SCHEMA_VERSION
+            or artifact.params.get("schema_version") != IMPORT_ARTIFACT_SCHEMA_VERSION
+            or not isinstance(bundle_sha256, str)
+            or artifact.params.get("bundle_sha256") != bundle_sha256
+            or artifact.params.get("content_sha256") != record.sha256
+            or artifact.params.get("quality_ruleset_version") != QUALITY_RULESET_VERSION
+            or artifact.params.get("quality_policy") != quality_policy
+            or artifact.params.get("requested_normalization") != requested_normalization
+            or artifact.params.get("import_backend") != "asset_tools_auto"
+            or artifact.params.get("engine_normalization") != manifest.get("normalization")
+            or not isinstance(material_postprocess, dict)
+            or artifact.params.get("material_postprocess_policy")
+            != material_postprocess.get("policy")
+            or artifact.params.get("source_structure") != source_structure
+            or artifact.params.get("source_structure_sha256") != source_structure_sha256
+            or not isinstance(source_format, str)
+            or source_format != record_source_format
+            or not is_valid_source_structure_evidence(
+                source_structure,
+                source_structure_sha256,
+                expected_source_format=source_format,
+            )
+            or not is_current_passed_quality(
+                manifest.get("quality"),
+                require_single_static_mesh=quality_policy["require_single_static_mesh"],
+                require_texture_references=quality_policy["require_texture_references"],
+            )
+            or not _valid_engine_normalization(manifest.get("normalization"))
+        ):
+            continue
+        transaction = manifest.get("transaction")
+        if (
+            manifest.get("status") != "ok"
+            or manifest.get("asset_id") != spec.asset_id
+            or manifest.get("content_sha256") != record.sha256
+            or not isinstance(transaction, dict)
+            or transaction.get("state") != "committed"
+        ):
+            continue
+        meshes = manifest.get("static_meshes")
+        if not isinstance(meshes, list):
+            continue
+        mesh = next(
+            (
+                item
+                for item in meshes
+                if isinstance(item, dict) and item.get("object_path") == record.ue_package_path
+            ),
+            None,
+        )
+        if mesh is None:
+            continue
+        if (
+            mesh.get("triangle_count") != record.tri_count
+            or mesh.get("material_count") != record.material_count
+            or not record.ue_package_path.startswith(f"/Game/UEF/Ingested/{spec.asset_id}/")
+        ):
+            continue
+        imported_paths = manifest.get("imported_object_paths")
+        if not isinstance(imported_paths, list) or not imported_paths:
+            continue
+        if not all(
+            isinstance(path, str)
+            and _regular_project_file(
+                settings.project_root,
+                _ue_object_file(settings.project_root, path),
+            )
+            for path in imported_paths
+        ):
+            continue
+        geometry = _catalog_geometry_payload(
+            mesh.get("bounds_cm"),
+            resolution=spec.camera.resolution,
+            horizontal_fov_deg=spec.camera.fov,
+            requested_normalization=requested_normalization,
+        )
+        return {
+            "kind": "catalog",
+            "asset_id": spec.asset_id,
+            "mesh_path": record.ue_package_path,
+            "bundle_sha256": bundle_sha256,
+            "content_sha256": record.sha256,
+            "import_manifest": artifact.path,
+            "preserve_materials": True,
+            **geometry,
+        }
+    raise RuntimeError(
+        f"Catalog asset {spec.asset_id!r} has no valid import manifest/package inventory"
+    )
+
+
+def _render_scene_payload(
+    settings: Settings,
+    spec: RenderJobSpec,
+    catalog: Catalog,
+) -> dict[str, Any]:
+    scene_id = spec.scene_id
+    if scene_id is None:  # pragma: no cover - guarded by the caller
+        raise ValueError("scene render payload requires a scene reference")
+    record = catalog.get_scene(scene_id)
+    if record is None:
+        raise ValueError(f"Catalog scene not found: {scene_id}")
+    if record.status not in {"built", "render_ok"} or record.map_path is None:
+        raise ValueError(f"Catalog scene {scene_id!r} is not renderable: status={record.status!r}")
+    if record.build_sha256 is None:
+        raise RuntimeError(f"Catalog scene {scene_id!r} has no active build generation")
+    if record.source_file is None:
+        raise RuntimeError(f"Catalog scene {scene_id!r} has no source-file provenance")
+    source_file = Path(record.source_file)
+    if not source_file.is_absolute():
+        source_file = settings.project_root / source_file
+    if (
+        source_file.is_symlink()
+        or not source_file.is_file()
+        or _file_sha256(source_file) != record.source_sha256
+    ):
+        raise RuntimeError(f"Catalog scene source provenance changed: {record.source_file}")
+    map_file = _ue_map_file(settings.project_root, record.map_path)
+    if not _regular_project_file(settings.project_root, map_file):
+        raise RuntimeError(f"Catalog scene map package is missing: {record.map_path}")
+
+    artifacts = sorted(
+        catalog.list_scene_artifacts(scene_id=scene_id),
+        key=lambda item: (item.created_at, item.artifact_id),
+        reverse=True,
+    )
+    for artifact in artifacts:
+        if (
+            artifact.kind != "scene_build_manifest"
+            or artifact.sha256 != record.build_sha256
+            or artifact.params.get("build_sha256") != record.build_sha256
+        ):
+            continue
+        manifest_path = settings.project_root / artifact.path
+        if not _regular_project_file(settings.project_root, manifest_path):
+            continue
+        if _file_sha256(manifest_path) != record.build_sha256:
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            continue
+        if not isinstance(manifest, dict) or manifest.get("status") != "ok":
+            continue
+        inventory = manifest.get("inventory")
+        scene_spec = manifest.get("scene_spec")
+        if not isinstance(inventory, dict) or not isinstance(scene_spec, dict):
+            continue
+        inventory_sha256 = _canonical_digest(inventory)
+        if (
+            manifest.get("scene_id") != scene_id
+            or manifest.get("map_path") != record.map_path
+            or manifest.get("source_sha256") != record.source_sha256
+            or manifest.get("scene_spec_sha256") != record.spec_sha256
+            or _canonical_digest(scene_spec) != record.spec_sha256
+            or manifest.get("inventory_sha256") != inventory_sha256
+            or artifact.params.get("source_sha256") != record.source_sha256
+            or artifact.params.get("scene_spec_sha256") != record.spec_sha256
+            or artifact.params.get("inventory_sha256") != inventory_sha256
+            or artifact.params.get("map_path") != record.map_path
+            or inventory.get("actor_count") != record.actor_count
+            or inventory.get("static_mesh_count") != record.static_mesh_count
+            or inventory.get("triangle_count") != record.triangle_count
+            or inventory.get("material_count") != record.material_count
+            or inventory.get("texture_count") != record.texture_count
+            or inventory.get("aggregate_bounds_cm") != record.bounds
+        ):
+            continue
+        if manifest.get("source_file") != record.source_file:
+            continue
+        package_bundle_sha256 = _validate_scene_package_evidence(
+            settings.project_root,
+            inventory=inventory,
+            manifest=manifest,
+            artifact_params=artifact.params,
+        )
+        if package_bundle_sha256 is None:
+            continue
+        render_inventory = _scene_render_inventory_payload(inventory)
+        if render_inventory is None:
+            continue
+        source_spec = scene_spec.get("source")
+        if not isinstance(source_spec, dict) or any(
+            source_spec.get(key) != expected
+            for key, expected in {
+                "source": record.source,
+                "source_id": record.source_id,
+                "source_url": record.source_url,
+                "license": record.license,
+                "license_tier": record.license_tier,
+                "license_url": record.license_url,
+                "attribution": record.attribution,
+            }.items()
+        ):
+            continue
+        camera = scene_spec.get("camera")
+        if not isinstance(camera, dict):
+            continue
+        distance_multiplier = camera.get("distance_multiplier")
+        yaw = camera.get("yaw")
+        pitch = camera.get("pitch")
+        if (
+            isinstance(distance_multiplier, bool)
+            or not isinstance(distance_multiplier, int | float)
+            or not math.isfinite(float(distance_multiplier))
+            or float(distance_multiplier) <= 0.0
+            or isinstance(yaw, bool)
+            or not isinstance(yaw, int | float)
+            or not math.isfinite(float(yaw))
+            or isinstance(pitch, bool)
+            or not isinstance(pitch, int | float)
+            or not math.isfinite(float(pitch))
+            or not -89.0 <= -float(pitch) <= 89.0
+        ):
+            continue
+        build = scene_spec.get("build")
+        render_policy = scene_spec.get("render")
+        lighting_intensity_multiplier = (
+            render_policy.get("lighting_intensity_multiplier", 1.0)
+            if isinstance(render_policy, dict)
+            else None
+        )
+        minimum_object_stencil_coverage = (
+            render_policy.get("minimum_object_stencil_coverage", 0.8)
+            if isinstance(render_policy, dict)
+            else None
+        )
+        maximum_background_contamination_ratio = (
+            render_policy.get("maximum_background_contamination_ratio", 0.001)
+            if isinstance(render_policy, dict)
+            else None
+        )
+        if (
+            not isinstance(build, dict)
+            or build.get("map_path") != record.map_path
+            or not isinstance(build.get("export"), bool)
+            or not isinstance(render_policy, dict)
+            or render_policy.get("no_auto_floor") is not True
+            or isinstance(lighting_intensity_multiplier, bool)
+            or not isinstance(lighting_intensity_multiplier, int | float)
+            or not math.isfinite(float(lighting_intensity_multiplier))
+            or not 0.1 <= float(lighting_intensity_multiplier) <= 100.0
+            or isinstance(minimum_object_stencil_coverage, bool)
+            or not isinstance(minimum_object_stencil_coverage, int | float)
+            or not math.isfinite(float(minimum_object_stencil_coverage))
+            or not 0.6 <= float(minimum_object_stencil_coverage) <= 1.0
+            or isinstance(maximum_background_contamination_ratio, bool)
+            or not isinstance(maximum_background_contamination_ratio, int | float)
+            or not math.isfinite(float(maximum_background_contamination_ratio))
+            or not 0.001 <= float(maximum_background_contamination_ratio) <= 0.01
+            or artifact.params.get("license") != record.license
+            or artifact.params.get("license_tier") != record.license_tier
+            or artifact.params.get("license_url") != record.license_url
+            or artifact.params.get("attribution") != record.attribution
+            or artifact.params.get("export") != build.get("export")
+        ):
+            continue
+        geometry = _scene_geometry_payload(
+            record.bounds,
+            resolution=spec.camera.resolution,
+            horizontal_fov_deg=spec.camera.fov,
+            distance_multiplier=float(distance_multiplier),
+        )
+        expected_stencil_ids = list(range(1, int(inventory["static_mesh_actor_count"]) + 1))
+        return {
+            "kind": "scene",
+            "asset_id": spec.asset_id,
+            "scene_id": scene_id,
+            "scene_map_path": record.map_path,
+            "scene_build_manifest": artifact.path,
+            "build_sha256": record.build_sha256,
+            "package_bundle_sha256": package_bundle_sha256,
+            "inventory_sha256": inventory_sha256,
+            "source": record.source,
+            "source_id": record.source_id,
+            "source_url": record.source_url,
+            "source_file": record.source_file,
+            "source_sha256": record.source_sha256,
+            "scene_spec_sha256": record.spec_sha256,
+            "license": record.license,
+            "license_tier": record.license_tier,
+            "license_url": record.license_url,
+            "attribution": record.attribution,
+            "export": build["export"],
+            "actor_count": int(inventory["actor_count"]),
+            "static_mesh_actor_count": int(inventory["static_mesh_actor_count"]),
+            "static_mesh_component_count": int(inventory["static_mesh_component_count"]),
+            "render_inventory": render_inventory,
+            "render_inventory_sha256": _canonical_digest(render_inventory),
+            "expected_object_stencil_ids": expected_stencil_ids,
+            "camera_azimuth_offset_deg": float(yaw),
+            "camera_elevation_deg": -float(pitch),
+            "lighting_intensity_multiplier": float(lighting_intensity_multiplier),
+            "minimum_object_stencil_coverage": float(minimum_object_stencil_coverage),
+            "maximum_background_contamination_ratio": float(maximum_background_contamination_ratio),
+            "preserve_materials": True,
+            "no_auto_floor": True,
+            **geometry,
+        }
+    raise RuntimeError(f"Catalog scene {scene_id!r} has no valid build manifest/package inventory")
+
+
+def _validate_scene_package_evidence(
+    project_root: Path,
+    *,
+    inventory: dict[str, Any],
+    manifest: dict[str, Any],
+    artifact_params: dict[str, Any],
+) -> str | None:
+    assets = inventory.get("assets")
+    packages = manifest.get("packages")
+    if not isinstance(assets, list) or not assets or not isinstance(packages, list):
+        return None
+    if len(packages) != len(assets):
+        return None
+    expected_assets: dict[str, str] = {}
+    for item in assets:
+        if not isinstance(item, dict) or set(item) != {"object_path", "class"}:
+            return None
+        object_path = item.get("object_path")
+        class_name = item.get("class")
+        if (
+            not isinstance(object_path, str)
+            or not isinstance(class_name, str)
+            or object_path in expected_assets
+        ):
+            return None
+        expected_assets[object_path] = class_name
+    if list(expected_assets) != sorted(expected_assets):
+        return None
+
+    seen_paths: set[str] = set()
+    for item in packages:
+        if not isinstance(item, dict) or set(item) != {
+            "object_path",
+            "class",
+            "path",
+            "size",
+            "sha256",
+        }:
+            return None
+        object_path = item.get("object_path")
+        class_name = item.get("class")
+        relative_path = item.get("path")
+        size = item.get("size")
+        sha256 = item.get("sha256")
+        if (
+            not isinstance(object_path, str)
+            or expected_assets.get(object_path) != class_name
+            or object_path in seen_paths
+            or not isinstance(relative_path, str)
+            or not relative_path
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or not _is_sha256(sha256)
+        ):
+            return None
+        seen_paths.add(object_path)
+        package_file = (
+            _ue_map_file(project_root, object_path)
+            if class_name == "World"
+            else _ue_object_file(project_root, object_path)
+        )
+        if not _regular_project_file(project_root, package_file):
+            return None
+        if package_file.resolve().relative_to(project_root.resolve()).as_posix() != relative_path:
+            return None
+        stat = package_file.stat()
+        if stat.st_size != size or _file_sha256(package_file) != sha256:
+            return None
+    if seen_paths != set(expected_assets):
+        return None
+    if [item["object_path"] for item in packages] != sorted(seen_paths):
+        return None
+    bundle_sha256 = _canonical_digest(packages)
+    if (
+        manifest.get("package_bundle_sha256") != bundle_sha256
+        or artifact_params.get("package_bundle_sha256") != bundle_sha256
+    ):
+        return None
+    return bundle_sha256
+
+
+def _scene_render_inventory_payload(inventory: dict[str, Any]) -> dict[str, Any] | None:
+    actors = inventory.get("actors")
+    static_meshes = inventory.get("static_meshes")
+    if not isinstance(actors, list) or not actors:
+        return None
+    if not isinstance(static_meshes, list) or not static_meshes:
+        return None
+    imported_mesh_paths = {
+        item.get("object_path")
+        for item in static_meshes
+        if isinstance(item, dict) and isinstance(item.get("object_path"), str)
+    }
+    if len(imported_mesh_paths) != len(static_meshes):
+        return None
+    expected_actor_count = inventory.get("actor_count")
+    expected_static_actors = inventory.get("static_mesh_actor_count")
+    expected_components = inventory.get("static_mesh_component_count")
+    if (
+        isinstance(expected_actor_count, bool)
+        or not isinstance(expected_actor_count, int)
+        or expected_actor_count != len(actors)
+        or isinstance(expected_static_actors, bool)
+        or not isinstance(expected_static_actors, int)
+        or not 1 <= expected_static_actors <= 255
+        or isinstance(expected_components, bool)
+        or not isinstance(expected_components, int)
+        or expected_components < expected_static_actors
+    ):
+        return None
+    actor_names: set[str] = set()
+    referenced_mesh_paths: set[str] = set()
+    static_actor_count = 0
+    component_count = 0
+    for actor in actors:
+        if not _valid_scene_actor_inventory_row(actor):
+            return None
+        assert isinstance(actor, dict)
+        actor_name = actor.get("actor_name")
+        components = actor.get("components")
+        assert isinstance(actor_name, str)
+        assert isinstance(components, list)
+        if actor_name in actor_names or actor.get("object_id") != actor_name:
+            return None
+        actor_names.add(actor_name)
+        if components:
+            static_actor_count += 1
+        referenced_mesh_paths.update(component["mesh_path"] for component in components)
+        component_count += len(components)
+    if (
+        static_actor_count != expected_static_actors
+        or component_count != expected_components
+        or [actor["actor_name"] for actor in actors] != sorted(actor_names)
+        or referenced_mesh_paths != imported_mesh_paths
+        or inventory.get("static_mesh_count") != len(imported_mesh_paths)
+    ):
+        return None
+    return {
+        "schema_version": 1,
+        "actors": actors,
+        "static_mesh_actor_count": expected_static_actors,
+        "static_mesh_component_count": expected_components,
+    }
+
+
+def _valid_scene_actor_inventory_row(value: Any) -> bool:
+    if not isinstance(value, dict) or set(value) != {
+        "object_id",
+        "actor_name",
+        "actor_label",
+        "actor_class",
+        "parent_actor_name",
+        "transform",
+        "components",
+    }:
+        return False
+    if any(
+        not isinstance(value.get(key), str) or not value[key]
+        for key in ("object_id", "actor_name", "actor_label", "actor_class")
+    ):
+        return False
+    parent = value.get("parent_actor_name")
+    if parent is not None and (not isinstance(parent, str) or not parent):
+        return False
+    transform = value.get("transform")
+    if not isinstance(transform, dict) or set(transform) != {
+        "translation_cm",
+        "rotation_deg",
+        "scale",
+    }:
+        return False
+    if any(not _finite_scene_vector(transform[key]) for key in transform):
+        return False
+    components = value.get("components")
+    if not isinstance(components, list):
+        return False
+    component_keys = {"name", "mesh_path", "materials", "world_bounds_cm"}
+    for component in components:
+        if not isinstance(component, dict) or set(component) != component_keys:
+            return False
+        if any(
+            not isinstance(component.get(key), str) or not component[key]
+            for key in ("name", "mesh_path")
+        ):
+            return False
+        materials = component.get("materials")
+        if not isinstance(materials, list) or any(
+            material is not None and (not isinstance(material, str) or not material)
+            for material in materials
+        ):
+            return False
+        bounds = component.get("world_bounds_cm")
+        if (
+            not isinstance(bounds, dict)
+            or set(bounds) != {"min", "max", "size"}
+            or any(not _finite_scene_vector(bounds[key]) for key in bounds)
+        ):
+            return False
+    return components == sorted(
+        components,
+        key=lambda item: (item["mesh_path"], item["name"]),
+    )
+
+
+def _finite_scene_vector(value: Any) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) == 3
+        and all(
+            isinstance(item, int | float)
+            and not isinstance(item, bool)
+            and math.isfinite(float(item))
+            for item in value
+        )
+    )
+
+
+def _scene_geometry_payload(
+    bounds: Any,
+    *,
+    resolution: tuple[int, int],
+    horizontal_fov_deg: float,
+    distance_multiplier: float,
+) -> dict[str, Any]:
+    base = _catalog_geometry_payload(
+        bounds,
+        resolution=resolution,
+        horizontal_fov_deg=horizontal_fov_deg,
+    )
+    canonical_bounds = base["bounds_cm"]
+    minimum = canonical_bounds["min"]
+    maximum = canonical_bounds["max"]
+    target = [(float(low) + float(high)) / 2.0 for low, high in zip(minimum, maximum, strict=True)]
+    return {
+        "bounds_cm": canonical_bounds,
+        "camera_target_cm": target,
+        "camera_radius_cm": round(float(base["camera_radius_cm"]) * distance_multiplier, 6),
+        "camera_near_clip_cm": 0.1,
+        "normalization": {
+            "engine_unit": "centimeter",
+            "uniform_scale": 1.0,
+            "logical_size_cm": canonical_bounds["size"],
+            "pivot_policy": "preserve_scene_world",
+            "translation_cm": [0.0, 0.0, 0.0],
+        },
+    }
+
+
+def _builtin_render_asset_payload(spec: RenderJobSpec) -> dict[str, Any]:
+    if spec.asset_id != "builtin:cube":
+        raise ValueError(f"Catalog render asset payload is required for {spec.asset_id!r}")
+    return {
+        "kind": "builtin",
+        "asset_id": "builtin:cube",
+        "mesh_path": "/Engine/BasicShapes/Cube",
+        "preserve_materials": False,
+        "bounds_cm": {
+            "min": [-50.0, -50.0, -50.0],
+            "max": [50.0, 50.0, 50.0],
+            "size": [100.0, 100.0, 100.0],
+        },
+        "actor_location_cm": [0.0, 0.0, 0.0],
+        "camera_target_cm": [0.0, 0.0, 0.0],
+        "camera_radius_cm": 420.0,
+        "floor_location_z_cm": -52.5,
+        "floor_scale_xy": 5.0,
+    }
+
+
+def _catalog_geometry_payload(
+    bounds: Any,
+    *,
+    resolution: tuple[int, int],
+    horizontal_fov_deg: float,
+    requested_normalization: dict[str, str | float] | None = None,
+) -> dict[str, Any]:
+    normalization_request = requested_normalization or {
+        "source_units": "auto",
+        "source_up_axis": "auto",
+        "source_handedness": "auto",
+        "uniform_scale": 1.0,
+        "pivot_policy": "preserve_source",
+    }
+    uniform_scale = normalization_request.get("uniform_scale")
+    if (
+        isinstance(uniform_scale, bool)
+        or not isinstance(uniform_scale, int | float)
+        or not math.isfinite(float(uniform_scale))
+        or float(uniform_scale) <= 0.0
+    ):
+        raise RuntimeError("Catalog requested uniform_scale is invalid")
+    scale = float(uniform_scale)
+    if not isinstance(bounds, dict) or set(bounds) != {"min", "max", "size"}:
+        raise RuntimeError("Catalog StaticMesh bounds payload is invalid")
+    vectors: dict[str, tuple[float, float, float]] = {}
+    for key in ("min", "max", "size"):
+        value = bounds[key]
+        if not isinstance(value, list) or len(value) != 3:
+            raise RuntimeError(f"Catalog StaticMesh bounds {key} must have three values")
+        if any(isinstance(item, bool) or not isinstance(item, int | float) for item in value):
+            raise RuntimeError(f"Catalog StaticMesh bounds {key} contains a non-number")
+        vector = tuple(float(item) for item in value)
+        if not all(math.isfinite(item) for item in vector):
+            raise RuntimeError(f"Catalog StaticMesh bounds {key} contains a non-finite value")
+        vectors[key] = vector  # type: ignore[assignment]
+    minimum, maximum, size = vectors["min"], vectors["max"], vectors["size"]
+    if any(low > high for low, high in zip(minimum, maximum, strict=True)):
+        raise RuntimeError("Catalog StaticMesh bounds min exceeds max")
+    for axis, (low, high, reported_size) in enumerate(zip(minimum, maximum, size, strict=True)):
+        actual_size = high - low
+        if not math.isclose(
+            reported_size,
+            actual_size,
+            rel_tol=1e-6,
+            abs_tol=1e-5,
+        ):
+            raise RuntimeError(
+                f"Catalog StaticMesh bounds size[{axis}] does not match max-min: "
+                f"{reported_size} != {actual_size}"
+            )
+    if any(item < 0.0 for item in size) or sum(item > 0.0 for item in size) < 2:
+        raise RuntimeError("Catalog StaticMesh bounds size is degenerate")
+
+    scaled_size = tuple(item * scale for item in size)
+    actor_location = (
+        -(minimum[0] + maximum[0]) / 2.0 * scale,
+        -(minimum[1] + maximum[1]) / 2.0 * scale,
+        -minimum[2] * scale,
+    )
+    target = (0.0, 0.0, scaled_size[2] / 2.0)
+    sphere_radius = math.sqrt(sum((item / 2.0) ** 2 for item in scaled_size))
+    aspect = resolution[0] / resolution[1]
+    horizontal_half = math.radians(horizontal_fov_deg) / 2.0
+    vertical_half = math.atan(math.tan(horizontal_half) / aspect)
+    limiting_half = min(horizontal_half, vertical_half)
+    camera_radius = max(10.0, sphere_radius / math.sin(limiting_half) * 1.2)
+    return {
+        "bounds_cm": {key: list(value) for key, value in vectors.items()},
+        "actor_scale": [scale, scale, scale],
+        "actor_location_cm": list(actor_location),
+        "camera_target_cm": list(target),
+        "camera_radius_cm": round(camera_radius, 6),
+        "camera_near_clip_cm": 0.1,
+        "floor_location_z_cm": -2.5,
+        "floor_scale_xy": max(1.0, max(scaled_size[0], scaled_size[1]) * 3.0 / 100.0),
+        "normalization": {
+            "engine_unit": "centimeter",
+            "uniform_scale": scale,
+            "request": normalization_request,
+            "logical_size_cm": list(scaled_size),
+            "pivot_policy": "bounds_bottom_center_to_origin",
+            "translation_cm": list(actor_location),
+        },
+    }
+
+
+def _catalog_requested_normalization(
+    manifest: dict[str, Any],
+) -> dict[str, str | float] | None:
+    value = manifest.get("requested_normalization")
+    if not isinstance(value, dict) or set(value) != {
+        "source_units",
+        "source_up_axis",
+        "source_handedness",
+        "uniform_scale",
+        "pivot_policy",
+    }:
+        return None
+    if (
+        value.get("source_units") != "auto"
+        or value.get("source_up_axis") != "auto"
+        or value.get("source_handedness") != "auto"
+        or value.get("pivot_policy") != "preserve_source"
+    ):
+        return None
+    scale = value.get("uniform_scale")
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, int | float)
+        or not math.isfinite(float(scale))
+        or not 0.0001 <= float(scale) <= 10_000.0
+    ):
+        return None
+    return {
+        "source_units": "auto",
+        "source_up_axis": "auto",
+        "source_handedness": "auto",
+        "uniform_scale": float(scale),
+        "pivot_policy": "preserve_source",
+    }
+
+
+def _valid_engine_normalization(value: Any) -> bool:
+    return isinstance(value, dict) and value == {
+        "target_units": "centimeters",
+        "target_up_axis": "Z",
+        "target_handedness": "left_handed",
+        "source_conversion": "delegated_to_engine_importer",
+        "package_pivot_policy": "preserve",
+        "uniform_scale": 1.0,
+    }
+
+
+def _ue_object_file(project_root: Path, object_path: str) -> Path:
+    package_path = object_path.partition(".")[0]
+    if not package_path.startswith("/Game/"):
+        return project_root / "__invalid_ue_object__"
+    return project_root / "ue/UEFBase/Content" / f"{package_path.removeprefix('/Game/')}.uasset"
+
+
+def _ue_map_file(project_root: Path, object_path: str) -> Path:
+    package_path = object_path.partition(".")[0]
+    if not package_path.startswith("/Game/"):
+        return project_root / "__invalid_ue_map__"
+    return project_root / "ue/UEFBase/Content" / f"{package_path.removeprefix('/Game/')}.umap"
+
+
+def _regular_project_file(project_root: Path, path: Path) -> bool:
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        path.resolve().relative_to(project_root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_digest(value: Any) -> str:
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _lighting_payload(settings: Settings, spec: RenderJobSpec) -> dict[str, Any]:
@@ -922,7 +1854,7 @@ def _write_failure_manifest(
             payload["manifest_read_error"] = _error_payload(exc)
     payload.update(
         {
-            "schema_version": 2,
+            "schema_version": 3,
             "status": "failed",
             "render_kind": "job",
             "commands": commands,
@@ -931,6 +1863,7 @@ def _write_failure_manifest(
         }
     )
     payload.setdefault("job", ue_job.get("job", {}))
+    payload.setdefault("asset", ue_job.get("asset", {}))
     payload.setdefault("engine", ue_job.get("engine"))
     payload.setdefault("error", error)
     manifest_path.write_text(
@@ -1316,6 +2249,7 @@ try:
         "-stdout",
         "-FullStdOutLogOutput",
         "-NoSound",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
     ]
     setup = run_ue_phase("setup", setup_command, setup_log_path, env)
@@ -1346,6 +2280,7 @@ try:
         "-windowed",
         f"-resx={width}",
         f"-resy={height}",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
         "-MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor",
         "-ExecutorPythonClass=/Engine/PythonTypes.UEFRenderJobRuntimeExecutor",

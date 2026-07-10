@@ -1,0 +1,32 @@
+schema_version: 1
+scene_id: bm_rpg_lowpoly_arena
+name: RPG Project Environment Lowpoly Arena
+kind: interchange_scene
+source:
+  path: asset-library/derived/1e02e322f71d431f/1e02e322f71d431f.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 1e719d5c7c8a4818986b212c79f11d3b
+  source_url: https://sketchfab.com/3d-models/1e719d5c7c8a4818986b212c79f11d3b
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: Bunny-HungTD — RPG Project environment (Lowpoly)
+expected:
+  mesh_count: 55
+  material_count: 18
+  texture_count: 49
+  triangle_count: 36551
+build:
+  map_path: /Game/UEF/Scenes/bm_rpg_lowpoly_arena/L_bm_rpg_lowpoly_arena
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -30
+  pitch: -45
+  distance_multiplier: 1.0
+render:
+  no_auto_floor: true
+  lighting_intensity_multiplier: 5.0
+  # Five translucent flag planes are visible but do not write UE custom depth.
+  maximum_background_contamination_ratio: 0.005

@@ -9,7 +9,13 @@ from pathlib import Path
 
 import unreal
 
-_STATE = {"started_at": 0.0, "job": {}, "job_index": 0, "success": True}
+_STATE = {
+    "started_at": 0.0,
+    "job": {},
+    "job_index": 0,
+    "success": True,
+    "scene_sanitization": {"policy": "not_applicable"},
+}
 _PIPELINE_QUEUE = None
 _WORLD_DEPTH_MATERIAL = (
     "/MovieRenderPipeline/Materials/MovieRenderQueue_WorldDepth.MovieRenderQueue_WorldDepth"
@@ -80,6 +86,14 @@ class UEFRenderJobRuntimeExecutor(unreal.MoviePipelinePythonHostExecutor):
             _STATE["job_index"] = 0
             _STATE["success"] = True
             job = _STATE["job"]
+            _STATE["scene_sanitization"] = (
+                {
+                    "policy": "catalog_hide_all_pawns_v2",
+                    "subjobs": [],
+                }
+                if str(job["asset"]["kind"]) in {"catalog", "scene"}
+                else {"policy": "not_applicable"}
+            )
             out_dir = Path(job["out_dir"])
             out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -190,6 +204,11 @@ def _start_next_pipeline(executor) -> bool:
     if job_index >= len(jobs):
         return False
     world = executor.get_last_loaded_world()
+    if str(_STATE["job"]["asset"]["kind"]) in {"catalog", "scene"}:
+        entry = _hide_catalog_pawns(world)
+        entry["subjob_index"] = job_index
+        sanitization = _STATE["scene_sanitization"]
+        sanitization["subjobs"].append(entry)
     unreal.log(f"[UEF-RENDER-JOB-RUNTIME] starting MRQ subjob {job_index + 1}/{len(jobs)}")
     executor.active_movie_pipeline = unreal.new_object(
         executor.target_pipeline_class,
@@ -202,6 +221,28 @@ def _start_next_pipeline(executor) -> bool:
     )
     executor.active_movie_pipeline.initialize(jobs[job_index])
     return True
+
+
+def _hide_catalog_pawns(world) -> dict[str, object]:
+    pawns = unreal.GameplayStatics.get_all_actors_of_class(world, unreal.Pawn)
+    hidden_meshes: list[str] = []
+    for pawn in pawns:
+        pawn.set_actor_hidden_in_game(True)
+        pawn.set_is_temporarily_hidden_in_editor(True)
+        for component in pawn.get_components_by_class(unreal.PrimitiveComponent):
+            component.set_editor_property("visible", False)
+            component.set_editor_property("hidden_in_game", True)
+            if isinstance(component, unreal.StaticMeshComponent):
+                mesh = component.get_editor_property("static_mesh")
+                if mesh is not None:
+                    hidden_meshes.append(mesh.get_path_name())
+    payload: dict[str, object] = {
+        "hidden_pawn_count": len(pawns),
+        "editor_hidden_pawn_count": len(pawns),
+        "hidden_static_meshes": sorted(set(hidden_meshes)),
+    }
+    unreal.log("[UEF-RENDER-JOB-RUNTIME] scene sanitization=" + json.dumps(payload, sort_keys=True))
+    return payload
 
 
 def _configure_pipeline_job(queue, job: dict, pass_name: str):
@@ -469,7 +510,7 @@ def _write_manifest(
         for pass_name in job["passes"]
     }
     payload = {
-        "schema_version": 2,
+        "schema_version": int(job.get("schema_version", 3)),
         "status": (
             "ok"
             if success and all(len(paths) == int(job["frames"]) for paths in pass_frames.values())
@@ -477,6 +518,7 @@ def _write_manifest(
         ),
         "render_kind": "job",
         "asset_id": job["asset_id"],
+        "asset": job["asset"],
         "job_id": job["run_id"],
         "job": job["job"],
         "camera": job["camera"],
@@ -487,6 +529,7 @@ def _write_manifest(
         "duration_sec": round(duration_sec, 3),
         "frame_paths": pass_frames,
         "executor": "UEFRenderJobRuntimeExecutor",
+        "scene_sanitization": _STATE["scene_sanitization"],
     }
     if error is not None:
         payload["error"] = error

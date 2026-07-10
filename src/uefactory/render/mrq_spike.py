@@ -78,6 +78,7 @@ def render_mrq_spike(
         "-stdout",
         "-FullStdOutLogOutput",
         "-NoSound",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
     ]
     env = {
@@ -142,6 +143,7 @@ def render_mrq_spike(
         "-windowed",
         "-resx=640",
         "-resy=360",
+        "-ddc=InstalledNoZenLocalFallback",
         f"-LocalDataCachePath={ddc_dir}",
         "-MoviePipelineLocalExecutorClass=/Script/MovieRenderPipelineCore.MoviePipelinePythonHostExecutor",
         "-ExecutorPythonClass=/Engine/PythonTypes.UEFMRQSpikeRuntimeExecutor",

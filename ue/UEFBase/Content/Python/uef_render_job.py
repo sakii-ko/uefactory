@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -41,9 +42,23 @@ def _create_empty_level(job: dict) -> str:
     ) and not unreal.EditorAssetLibrary.delete_asset(map_path):
         raise RuntimeError(f"Could not replace render level: {map_path}")
     level_editor = unreal.get_editor_subsystem(unreal.LevelEditorSubsystem)
-    if level_editor is None or not level_editor.new_level(map_path, False):
-        raise RuntimeError(f"Could not create empty render level: {map_path}")
-    unreal.log(f"[UEF-RENDER-JOB] empty level={map_path}")
+    if level_editor is None:
+        raise RuntimeError("LevelEditorSubsystem is unavailable")
+    render_asset = job["asset"]
+    if str(render_asset["kind"]) == "scene":
+        source_map = str(render_asset["scene_map_path"])
+        if not unreal.EditorAssetLibrary.does_asset_exist(source_map):
+            raise RuntimeError(f"Could not load persistent scene map: {source_map}")
+        unreal.EditorAssetLibrary.make_directory(map_path.rpartition("/")[0])
+        if not level_editor.new_level_from_template(map_path, source_map):
+            raise RuntimeError(f"Could not clone scene render level: {source_map} -> {map_path}")
+        if not level_editor.load_level(map_path):
+            raise RuntimeError(f"Could not load cloned scene render level: {map_path}")
+        unreal.log(f"[UEF-RENDER-JOB] cloned scene level={source_map} -> {map_path}")
+    else:
+        if not level_editor.new_level(map_path, False):
+            raise RuntimeError(f"Could not create empty render level: {map_path}")
+        unreal.log(f"[UEF-RENDER-JOB] empty level={map_path}")
     return map_path
 
 
@@ -67,9 +82,12 @@ def _create_sequences(job: dict):
     materials = _create_materials(package_path, lighting_preset=preset)
     _create_object_mask_material(package_path)
 
+    if str(job["asset"]["kind"]) == "scene":
+        _prepare_scene_level(job)
+
     lighting_assets: dict[str, object] = {}
     if preset == "three_point":
-        _add_three_point_lighting()
+        _add_three_point_lighting(job)
     elif preset == "hdri":
         texture = _import_hdri_texture(package_path, str(lighting["hdri_file"]))
         lighting_assets = {
@@ -140,28 +158,37 @@ def _create_sequence_asset(
     sequence.set_playback_start(0)
     sequence.set_playback_end(frames)
 
-    _add_static_mesh_spawnable(
-        sequence,
-        frames=frames,
-        label="UEF_Job_Cube",
-        mesh_path="/Engine/BasicShapes/Cube",
-        material=materials["cube"],
-        location=(0, 0, 0),
-        rotation=(0, 0, 0),
-        scale=(1.0, 1.0, 1.0),
-        stencil_value=1,
-    )
-    _add_static_mesh_spawnable(
-        sequence,
-        frames=frames,
-        label="UEF_Job_Floor",
-        mesh_path="/Engine/BasicShapes/Cube",
-        material=materials["floor"],
-        location=(0, 0, -52.5),
-        rotation=(0, 0, 0),
-        scale=(5.0, 5.0, 0.05),
-        stencil_value=2,
-    )
+    render_asset = job["asset"]
+    if str(render_asset["kind"]) != "scene":
+        is_builtin = str(render_asset["kind"]) == "builtin"
+        _add_static_mesh_spawnable(
+            sequence,
+            frames=frames,
+            label="UEF_Job_Cube" if is_builtin else "UEF_Job_Asset",
+            mesh_path=str(render_asset["mesh_path"]),
+            material=materials["cube"] if not render_asset["preserve_materials"] else None,
+            location=tuple(float(value) for value in render_asset["actor_location_cm"]),
+            rotation=(0, 0, 0),
+            scale=tuple(float(value) for value in render_asset.get("actor_scale", [1.0] * 3)),
+            stencil_value=1,
+            expected_bounds=render_asset["bounds_cm"],
+        )
+        _add_static_mesh_spawnable(
+            sequence,
+            frames=frames,
+            label="UEF_Job_Floor",
+            mesh_path="/Engine/BasicShapes/Cube",
+            material=materials["floor"],
+            location=(0, 0, float(render_asset["floor_location_z_cm"])),
+            rotation=(0, 0, 0),
+            scale=(
+                float(render_asset["floor_scale_xy"]),
+                float(render_asset["floor_scale_xy"]),
+                0.05,
+            ),
+            stencil_value=2,
+            expected_bounds=None,
+        )
     _configure_sequence_lighting(
         sequence,
         job,
@@ -173,6 +200,172 @@ def _create_sequence_asset(
     _save_asset(asset_path)
     unreal.log(f"[UEF-RENDER-JOB] sequence={asset_path}.{asset_name}")
     return sequence
+
+
+def _prepare_scene_level(job: dict) -> None:
+    render_asset = job["asset"]
+    if render_asset.get("no_auto_floor") is not True:
+        raise RuntimeError("Scene render requires no_auto_floor=true")
+    expected_inventory = render_asset.get("render_inventory")
+    expected_digest = render_asset.get("render_inventory_sha256")
+    if not isinstance(expected_inventory, dict) or not isinstance(expected_digest, str):
+        raise RuntimeError("Scene render is missing its approved actor/component inventory")
+    if _canonical_digest(expected_inventory) != expected_digest:
+        raise RuntimeError("Scene render actor/component inventory digest mismatch")
+    actual_inventory, actors_by_name = _current_scene_render_inventory()
+    if actual_inventory != expected_inventory:
+        raise RuntimeError("Persistent scene actor/component inventory changed before render")
+
+    expected_actors = int(render_asset["static_mesh_actor_count"])
+    expected_components = int(render_asset["static_mesh_component_count"])
+    expected_stencil_ids = render_asset.get("expected_object_stencil_ids")
+    if (
+        expected_inventory.get("static_mesh_actor_count") != expected_actors
+        or expected_inventory.get("static_mesh_component_count") != expected_components
+        or not 1 <= expected_actors <= 255
+        or expected_stencil_ids != list(range(1, expected_actors + 1))
+    ):
+        raise RuntimeError("Scene render has an invalid actor/component stencil contract")
+    stencil_assignments = []
+    static_actor_rows = sorted(
+        (row for row in actual_inventory["actors"] if row["components"]),
+        key=lambda row: row["actor_name"],
+    )
+    for stencil_id, row in enumerate(static_actor_rows, start=1):
+        actor_name = row["actor_name"]
+        actor = actors_by_name[actor_name]
+        assigned_components = 0
+        for component in actor.get_components_by_class(unreal.StaticMeshComponent):
+            if component.get_editor_property("static_mesh") is None:
+                continue
+            component.set_render_custom_depth(True)
+            component.set_custom_depth_stencil_value(stencil_id)
+            assigned_components += 1
+        stencil_assignments.append(
+            {
+                "actor_name": actor_name,
+                "stencil_id": stencil_id,
+                "component_count": assigned_components,
+            }
+        )
+    unreal.log(
+        f"[UEF-RENDER-JOB] scene foreground actors={expected_actors} "
+        f"components={expected_components} auto_floor=false stencils="
+        + json.dumps(stencil_assignments, sort_keys=True)
+    )
+
+
+def _canonical_digest(value) -> str:
+    encoded = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _stable_number(value, digits=6):
+    result = float(value)
+    if not math.isfinite(result):
+        raise RuntimeError(f"scene render inventory contains a non-finite value: {result}")
+    result = round(result, digits)
+    return 0.0 if result == 0.0 else result
+
+
+def _vector(value, digits=6):
+    return [
+        _stable_number(value.x, digits),
+        _stable_number(value.y, digits),
+        _stable_number(value.z, digits),
+    ]
+
+
+def _scene_actor_transform(actor):
+    value = actor.get_actor_transform()
+    rotation = value.rotation.rotator()
+    return {
+        "translation_cm": _vector(value.translation),
+        "rotation_deg": [
+            _stable_number(rotation.roll),
+            _stable_number(rotation.pitch),
+            _stable_number(rotation.yaw),
+        ],
+        "scale": _vector(value.scale3d),
+    }
+
+
+def _scene_component_payload(component):
+    mesh = component.get_editor_property("static_mesh")
+    if mesh is None:
+        return None
+    origin, extent, _ = unreal.SystemLibrary.get_component_bounds(component)
+    low = origin - extent
+    high = origin + extent
+    materials = []
+    for index in range(int(component.get_num_materials())):
+        material = component.get_material(index)
+        materials.append(None if material is None else str(material.get_path_name()))
+    return {
+        "name": str(component.get_name()),
+        "mesh_path": str(mesh.get_path_name()),
+        "materials": materials,
+        "world_bounds_cm": {
+            "min": _vector(low),
+            "max": _vector(high),
+            "size": _vector(high - low),
+        },
+    }
+
+
+def _current_scene_render_inventory():
+    actor_subsystem = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    if actor_subsystem is None:
+        raise RuntimeError("EditorActorSubsystem is unavailable")
+    actors = []
+    actors_by_name = {}
+    static_mesh_actor_count = 0
+    static_mesh_component_count = 0
+    for actor in actor_subsystem.get_all_level_actors():
+        actor_name = str(actor.get_name())
+        if actor_name in actors_by_name:
+            raise RuntimeError(f"Persistent scene has duplicate actor name: {actor_name}")
+        actors_by_name[actor_name] = actor
+        component_rows = []
+        for component in actor.get_components_by_class(unreal.StaticMeshComponent):
+            component_row = _scene_component_payload(component)
+            if component_row is None:
+                continue
+            component_rows.append(component_row)
+            static_mesh_component_count += 1
+        if component_rows:
+            static_mesh_actor_count += 1
+        parent = actor.get_attach_parent_actor()
+        actors.append(
+            {
+                "object_id": actor_name,
+                "actor_name": actor_name,
+                "actor_label": str(actor.get_actor_label()),
+                "actor_class": str(actor.get_class().get_name()),
+                "parent_actor_name": None if parent is None else str(parent.get_name()),
+                "transform": _scene_actor_transform(actor),
+                "components": sorted(
+                    component_rows,
+                    key=lambda item: (item["mesh_path"], item["name"]),
+                ),
+            }
+        )
+    actors.sort(key=lambda item: item["object_id"])
+    return (
+        {
+            "schema_version": 1,
+            "actors": actors,
+            "static_mesh_actor_count": static_mesh_actor_count,
+            "static_mesh_component_count": static_mesh_component_count,
+        },
+        actors_by_name,
+    )
 
 
 def _create_materials(package_path: str, *, lighting_preset: str) -> dict[str, object]:
@@ -281,30 +474,34 @@ def _configure_sequence_lighting(
                 scale=(100.0, 100.0, 100.0),
                 stencil_value=None,
                 cast_shadow=False,
+                expected_bounds=None,
             )
 
 
-def _add_three_point_lighting() -> None:
+def _add_three_point_lighting(job: dict) -> None:
     # Fixed lights belong to the level instead of the sequence. Sequencer assigns
     # spawnables random binding GUIDs, which can change equal-type light registration
     # order and produce one-to-three-code-value FP16 accumulation differences.
+    multiplier = float(job.get("asset", {}).get("lighting_intensity_multiplier", 1.0))
+    if not math.isfinite(multiplier) or not 0.1 <= multiplier <= 100.0:
+        raise RuntimeError(f"Invalid three-point lighting intensity multiplier: {multiplier}")
     _add_directional_light_actor(
         label="UEF_Job_KeyLight",
         location=(-250, -350, 500),
         rotation=(-50, 35, 0),
-        intensity=8.0,
+        intensity=8.0 * multiplier,
     )
     _add_directional_light_actor(
         label="UEF_Job_FillLight",
         location=(350, 250, 350),
         rotation=(-35, -85, 0),
-        intensity=2.0,
+        intensity=2.0 * multiplier,
     )
     _add_directional_light_actor(
         label="UEF_Job_RimLight",
         location=(250, 350, 450),
         rotation=(-25, 155, 0),
-        intensity=3.0,
+        intensity=3.0 * multiplier,
     )
 
 
@@ -456,6 +653,7 @@ def _add_static_mesh_spawnable(
     stencil_value: int | None,
     cast_shadow: bool = True,
     tags: tuple[str, ...] = (),
+    expected_bounds=None,
 ):
     binding = sequence.add_spawnable_from_class(unreal.StaticMeshActor)
     binding.set_display_name(label)
@@ -466,8 +664,10 @@ def _add_static_mesh_spawnable(
     _add_transform_track(binding, frames=frames, location=location, rotation=rotation, scale=scale)
     _set_movable(actor)
     mesh = unreal.EditorAssetLibrary.load_asset(mesh_path)
-    if mesh is None:
+    if mesh is None or not isinstance(mesh, unreal.StaticMesh):
         raise RuntimeError(f"Could not load mesh: {mesh_path}")
+    if expected_bounds is not None:
+        _validate_mesh_bounds(mesh, expected_bounds)
     component = actor.static_mesh_component
     component.set_static_mesh(mesh)
     component.set_editor_property("cast_shadow", bool(cast_shadow))
@@ -476,11 +676,42 @@ def _add_static_mesh_spawnable(
     else:
         component.set_render_custom_depth(True)
         component.set_custom_depth_stencil_value(int(stencil_value))
-    material_slots = max(1, int(component.get_num_materials()))
-    for material_index in range(material_slots):
-        component.set_material(material_index, material)
-    component.set_editor_property("override_materials", [material] * material_slots)
+    if material is not None:
+        material_slots = max(1, int(component.get_num_materials()))
+        for material_index in range(material_slots):
+            component.set_material(material_index, material)
+        component.set_editor_property("override_materials", [material] * material_slots)
     return binding
+
+
+def _validate_mesh_bounds(mesh, expected_bounds) -> None:
+    box = mesh.get_bounding_box()
+    actual = {
+        "min": [float(box.min.x), float(box.min.y), float(box.min.z)],
+        "max": [float(box.max.x), float(box.max.y), float(box.max.z)],
+        "size": [
+            float(box.max.x - box.min.x),
+            float(box.max.y - box.min.y),
+            float(box.max.z - box.min.z),
+        ],
+    }
+    for key in ("min", "max", "size"):
+        expected = expected_bounds[key]
+        if len(expected) != 3:
+            raise RuntimeError(f"Expected mesh bounds {key} must have three values")
+        for axis, (actual_value, expected_value) in enumerate(
+            zip(actual[key], expected, strict=True)
+        ):
+            if not math.isclose(
+                actual_value,
+                float(expected_value),
+                rel_tol=1e-6,
+                abs_tol=1e-4,
+            ):
+                raise RuntimeError(
+                    f"StaticMesh bounds changed for {mesh.get_path_name()}: "
+                    f"{key}[{axis}] {actual_value} != {expected_value}"
+                )
 
 
 def _add_directional_light_spawnable(
@@ -569,11 +800,24 @@ def _add_sky_light_spawnable(
 
 def _add_orbit_camera(sequence, job: dict) -> None:
     camera = job["camera"]
+    render_asset = job["asset"]
     views = int(camera["views"])
-    elevation = float(camera["elevation_deg"])
+    elevation = float(render_asset.get("camera_elevation_deg", camera["elevation_deg"]))
+    azimuth_offset = float(render_asset.get("camera_azimuth_offset_deg", 0.0))
+    if not math.isfinite(elevation) or not -89.0 <= elevation <= 89.0:
+        raise RuntimeError(f"Invalid orbit camera elevation: {elevation}")
+    if not math.isfinite(azimuth_offset):
+        raise RuntimeError(f"Invalid orbit camera azimuth offset: {azimuth_offset}")
     fov = float(camera["fov"])
-    radius = 420.0
-    first_location, first_rotation = _orbit_camera_transform(radius, 0.0, elevation)
+    radius = float(render_asset["camera_radius_cm"])
+    target = tuple(float(value) for value in render_asset["camera_target_cm"])
+    custom_near_clip_cm = render_asset.get("camera_near_clip_cm")
+    first_location, first_rotation = _orbit_camera_transform(
+        radius,
+        azimuth_offset,
+        elevation,
+        target,
+    )
     binding = _add_camera_spawnable(
         sequence,
         frames=views,
@@ -581,12 +825,16 @@ def _add_orbit_camera(sequence, job: dict) -> None:
         location=first_location,
         rotation=first_rotation,
         fov=fov,
+        aspect_ratio=float(camera["resolution"][0]) / float(camera["resolution"][1]),
+        custom_near_clip_cm=(None if custom_near_clip_cm is None else float(custom_near_clip_cm)),
     )
     _add_orbit_transform_keys(
         binding,
         views=views,
         radius=radius,
         elevation=elevation,
+        azimuth_offset=azimuth_offset,
+        target=target,
     )
 
     camera_cut_track = (
@@ -608,6 +856,8 @@ def _add_orbit_transform_keys(
     views: int,
     radius: float,
     elevation: float,
+    azimuth_offset: float,
+    target: tuple[float, float, float],
 ) -> None:
     tracks = [
         track
@@ -624,8 +874,8 @@ def _add_orbit_transform_keys(
     if len(channels) != 9:
         raise RuntimeError(f"Expected 9 camera transform channels, got {len(channels)}")
     for view_index in range(views):
-        azimuth = 360.0 * view_index / views
-        location, rotation = _orbit_camera_transform(radius, azimuth, elevation)
+        azimuth = azimuth_offset + 360.0 * view_index / views
+        location, rotation = _orbit_camera_transform(radius, azimuth, elevation, target)
         values = (*location, *_sequencer_rotation(rotation), 1.0, 1.0, 1.0)
         frame = unreal.FrameNumber(view_index)
         for channel, value in zip(channels, values, strict=True):
@@ -642,18 +892,19 @@ def _orbit_camera_transform(
     radius: float,
     azimuth_deg: float,
     elevation_deg: float,
+    target: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     azimuth_rad = math.radians(azimuth_deg)
     elevation_rad = math.radians(elevation_deg)
     horizontal = radius * math.cos(elevation_rad)
     location = (
-        -horizontal * math.cos(azimuth_rad),
-        -horizontal * math.sin(azimuth_rad),
-        radius * math.sin(elevation_rad),
+        target[0] - horizontal * math.cos(azimuth_rad),
+        target[1] - horizontal * math.sin(azimuth_rad),
+        target[2] + radius * math.sin(elevation_rad),
     )
     look_at = unreal.MathLibrary.find_look_at_rotation(
         unreal.Vector(*location),
-        unreal.Vector(0.0, 0.0, 0.0),
+        unreal.Vector(*target),
     )
     rotation = (look_at.pitch, look_at.yaw, look_at.roll)
     return location, rotation
@@ -667,13 +918,15 @@ def _add_camera_spawnable(
     location: tuple[float, float, float],
     rotation: tuple[float, float, float],
     fov: float,
+    aspect_ratio: float,
+    custom_near_clip_cm: float | None,
 ):
     binding = sequence.add_spawnable_from_class(unreal.CineCameraActor)
     binding.set_display_name(label)
     actor = _object_template(binding)
     actor.set_actor_label(label)
     _set_transform(actor, location, rotation, (1, 1, 1))
-    _configure_perspective_camera(actor, fov)
+    _configure_perspective_camera(actor, fov, aspect_ratio, custom_near_clip_cm)
     _add_transform_track(
         binding, frames=frames, location=location, rotation=rotation, scale=(1, 1, 1)
     )
@@ -681,7 +934,12 @@ def _add_camera_spawnable(
     return binding
 
 
-def _configure_perspective_camera(actor, fov: float) -> None:
+def _configure_perspective_camera(
+    actor,
+    fov: float,
+    aspect_ratio: float,
+    custom_near_clip_cm: float | None,
+) -> None:
     camera_component = getattr(actor, "camera_component", None) or getattr(
         actor,
         "cine_camera_component",
@@ -690,6 +948,37 @@ def _configure_perspective_camera(actor, fov: float) -> None:
     if camera_component is None:
         raise RuntimeError(f"Camera actor has no camera component: {actor}")
     camera_component.set_editor_property("projection_mode", unreal.CameraProjectionMode.PERSPECTIVE)
+    if custom_near_clip_cm is not None:
+        if not math.isfinite(custom_near_clip_cm) or custom_near_clip_cm <= 0.0:
+            raise RuntimeError(f"Invalid custom camera near clip: {custom_near_clip_cm}")
+        camera_component.set_editor_property("override_custom_near_clipping_plane", True)
+        camera_component.set_editor_property(
+            "custom_near_clipping_plane",
+            float(custom_near_clip_cm),
+        )
+        actual_override = bool(
+            camera_component.get_editor_property("override_custom_near_clipping_plane")
+        )
+        actual_near_clip = float(camera_component.get_editor_property("custom_near_clipping_plane"))
+        if not actual_override or not math.isclose(
+            actual_near_clip,
+            custom_near_clip_cm,
+            rel_tol=0.0,
+            abs_tol=1e-6,
+        ):
+            raise RuntimeError(
+                "Could not apply catalog camera custom near clip: "
+                f"requested={custom_near_clip_cm} actual={actual_near_clip} "
+                f"override={actual_override}"
+            )
+    filmback = camera_component.get_editor_property("filmback")
+    current_aspect = float(filmback.get_editor_property("sensor_aspect_ratio"))
+    if not math.isclose(current_aspect, aspect_ratio, rel_tol=0.0, abs_tol=1e-6):
+        sensor_width = float(filmback.get_editor_property("sensor_width"))
+        filmback.set_editor_property("sensor_height", sensor_width / aspect_ratio)
+        camera_component.set_editor_property("filmback", filmback)
+        camera_component.set_editor_property("aspect_ratio", float(aspect_ratio))
+        camera_component.set_editor_property("constrain_aspect_ratio", True)
     try:
         camera_component.set_field_of_view(float(fov))
         return

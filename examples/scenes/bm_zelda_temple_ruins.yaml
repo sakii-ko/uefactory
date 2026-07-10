@@ -1,0 +1,31 @@
+schema_version: 1
+scene_id: bm_zelda_temple_ruins
+name: Legend of Zelda Temple Ruins
+kind: interchange_scene
+source:
+  path: asset-library/derived/945b5c9b16b28658/945b5c9b16b28658.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: c76a34aba7444285bdf83e921e548a53
+  source_url: https://sketchfab.com/3d-models/c76a34aba7444285bdf83e921e548a53
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: jeffwang — Legend of Zelda - Temple Ruins
+expected:
+  mesh_count: 25
+  material_count: 18
+  texture_count: 13
+  triangle_count: 751016
+build:
+  map_path: /Game/UEF/Scenes/bm_zelda_temple_ruins/L_bm_zelda_temple_ruins
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -38
+  pitch: -24
+  distance_multiplier: 1.0
+render:
+  no_auto_floor: true
+  # Transparent and sub-pixel Tilt Brush actors do not all write UE custom depth.
+  minimum_object_stencil_coverage: 0.6

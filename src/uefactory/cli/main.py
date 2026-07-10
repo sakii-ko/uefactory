@@ -7,9 +7,12 @@ import typer
 
 from uefactory import __version__
 from uefactory.cli.acquire import acquire_app
+from uefactory.cli.catalog import catalog_app
 from uefactory.cli.doctor import doctor_app
+from uefactory.cli.ingest import ingest_app
 from uefactory.cli.node import node_app
 from uefactory.cli.render import render_app
+from uefactory.cli.scene import scene_app
 from uefactory.core.config import load_settings
 from uefactory.core.log import configure_logging
 
@@ -50,5 +53,8 @@ def main(
 
 app.add_typer(doctor_app, name="doctor")
 app.add_typer(acquire_app, name="acquire")
+app.add_typer(catalog_app, name="catalog")
+app.add_typer(ingest_app, name="ingest")
 app.add_typer(node_app, name="node")
 app.add_typer(render_app, name="render")
+app.add_typer(scene_app, name="scene")

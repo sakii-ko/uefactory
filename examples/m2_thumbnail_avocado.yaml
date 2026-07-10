@@ -1,0 +1,16 @@
+job: render
+assets:
+  - khronos_avocado
+camera:
+  rig: orbit
+  views: 4
+  elevation_deg: 20
+  fov: 45
+  resolution: [512, 512]
+lighting:
+  preset: three_point
+passes:
+  - beauty_lit
+  - object_mask
+output:
+  dir: out/thumbnails

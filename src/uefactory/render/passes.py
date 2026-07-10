@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import struct
 import tempfile
@@ -20,6 +21,10 @@ PASS_ORDER = (
     "object_mask",
 )
 SUPPORTED_PASSES = frozenset(PASS_ORDER)
+# MRQ writes the 8-bit stencil normalization through a half-float render target.
+# Half an FP16 ULP approaches 2.44e-4 near 1.0; keep the decode tolerance well
+# below half the 1/255 distance between adjacent IDs (about 1.96e-3).
+STENCIL_NORMALIZED_ATOL = 4e-4
 
 
 @dataclass(frozen=True)
@@ -49,6 +54,7 @@ class PassFrameStats:
     max: tuple[float, ...]
     stddev: tuple[float, ...]
     unique_values: int | None = None
+    unique_scalar_values: tuple[float, ...] | None = None
     unique_vectors: int | None = None
     scalar_vector: bool | None = None
 
@@ -63,6 +69,8 @@ class PassFrameStats:
         }
         if self.unique_values is not None:
             payload["unique_values"] = self.unique_values
+        if self.unique_scalar_values is not None:
+            payload["unique_scalar_values"] = list(self.unique_scalar_values)
         if self.unique_vectors is not None:
             payload["unique_vectors"] = self.unique_vectors
         if self.scalar_vector is not None:
@@ -77,9 +85,12 @@ class PassValidation:
     resolution: tuple[int, int]
     frame_count: int
     frames: tuple[PassFrameStats, ...]
+    observed_stencil_ids: tuple[int, ...] | None = None
+    missing_stencil_ids: tuple[int, ...] | None = None
+    stencil_coverage_ratio: float | None = None
 
     def stable_payload(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "format": {
                 "extension": self.format.extension,
                 "bit_depth": self.format.bit_depth,
@@ -90,6 +101,13 @@ class PassValidation:
             "frame_count": self.frame_count,
             "frames": [frame.stable_payload() for frame in self.frames],
         }
+        if self.observed_stencil_ids is not None:
+            payload["stencil_coverage"] = {
+                "observed_ids": list(self.observed_stencil_ids),
+                "missing_ids": list(self.missing_stencil_ids or ()),
+                "coverage_ratio": self.stencil_coverage_ratio,
+            }
+        return payload
 
 
 @dataclass(frozen=True)
@@ -105,6 +123,9 @@ def validate_render_pass(
     expected_frames: int,
     expected_resolution: tuple[int, int] | None = None,
     lighting_preset: str = "three_point",
+    expected_object_stencil_ids: tuple[int, ...] = (1, 2),
+    object_stencil_coverage: Literal["every_frame", "sequence_union"] = "every_frame",
+    minimum_object_stencil_coverage: float = 1.0,
 ) -> PassValidation:
     if pass_name not in SUPPORTED_PASSES:
         raise ValueError(f"Unsupported render pass: {pass_name}")
@@ -135,13 +156,23 @@ def validate_render_pass(
         )
 
     frames = tuple(frame.stats for frame in inspected)
-    _assert_pass_quality(pass_name, frames, lighting_preset=lighting_preset)
+    stencil_coverage = _assert_pass_quality(
+        pass_name,
+        frames,
+        lighting_preset=lighting_preset,
+        expected_object_stencil_ids=expected_object_stencil_ids,
+        object_stencil_coverage=object_stencil_coverage,
+        minimum_object_stencil_coverage=minimum_object_stencil_coverage,
+    )
     return PassValidation(
         pass_name=pass_name,
         format=fmt,
         resolution=resolution,
         frame_count=len(frame_paths),
         frames=frames,
+        observed_stencil_ids=(None if stencil_coverage is None else stencil_coverage[0]),
+        missing_stencil_ids=(None if stencil_coverage is None else stencil_coverage[1]),
+        stencil_coverage_ratio=(None if stencil_coverage is None else stencil_coverage[2]),
     )
 
 
@@ -212,10 +243,12 @@ def assert_object_mask_visibility(
     *,
     pass_frames: dict[str, list[Path]],
     margin_fraction: float = 0.03,
+    foreground_stencil_ids: tuple[int, ...] = (1,),
 ) -> None:
-    """Check that stencil object 1 is framed and visible in aligned RGB passes."""
+    """Check that the stencil foreground union is framed in aligned RGB passes."""
     if not 0 <= margin_fraction < 0.5:
         raise ValueError("margin_fraction must be in [0, 0.5)")
+    _validate_expected_stencil_ids(foreground_stencil_ids)
     mask_paths = pass_frames.get("object_mask")
     if not mask_paths:
         raise RuntimeError("object_mask: no frames available for visibility validation")
@@ -232,18 +265,24 @@ def assert_object_mask_visibility(
             )
 
     np = import_module("numpy")
-    stencil_one = np.float32(1.0 / 255.0)
+    stencil_values = tuple(np.float32(value / 255.0) for value in foreground_stencil_ids)
     for frame_index, mask_path in enumerate(mask_paths):
         mask_pixels, resolution = _read_half_rgba_exr("object_mask", mask_path)
-        object_region = np.isclose(
-            mask_pixels[:, :, 0].astype(np.float32),
-            stencil_one,
-            rtol=0.0,
-            atol=5e-5,
-        )
+        scalar_mask = mask_pixels[:, :, 0].astype(np.float32)
+        object_region = np.zeros(scalar_mask.shape, dtype=bool)
+        for stencil_value in stencil_values:
+            object_region |= np.isclose(
+                scalar_mask,
+                stencil_value,
+                rtol=0.0,
+                atol=STENCIL_NORMALIZED_ATOL,
+            )
         coordinates = np.argwhere(object_region)
         if coordinates.size == 0:
-            raise RuntimeError(f"object_mask: {mask_path.name} contains no stencil ID 1")
+            raise RuntimeError(
+                f"object_mask: {mask_path.name} contains none of foreground stencil IDs "
+                f"{list(foreground_stencil_ids)}"
+            )
 
         height, width = object_region.shape
         y_min, x_min = (int(value) for value in coordinates.min(axis=0))
@@ -258,7 +297,8 @@ def assert_object_mask_visibility(
             or edge_distances[3] < vertical_margin
         ):
             raise RuntimeError(
-                f"object_mask: {mask_path.name} stencil ID 1 bbox touches frame margin; "
+                f"object_mask: {mask_path.name} foreground stencil union bbox touches "
+                "frame margin; "
                 f"bbox=({x_min}, {y_min}, {x_max}, {y_max}) resolution={resolution}"
             )
 
@@ -289,7 +329,8 @@ def assert_object_mask_visibility(
             contrast = float(np.percentile(boundary_contrast, 95))
             if contrast < 1.0:
                 raise RuntimeError(
-                    f"{pass_name}: {rgb_path.name} stencil ID 1 is not visibly distinct "
+                    f"{pass_name}: {rgb_path.name} foreground stencil union is not visibly "
+                    "distinct "
                     f"from adjacent non-object pixels; p95_boundary_contrast={contrast:.3f}"
                 )
 
@@ -375,6 +416,7 @@ def _exr_frame_stats(pass_name: str, frame_path: Path) -> _InspectedFrame:
     if values.size == 0:
         raise RuntimeError(f"{pass_name}: {frame_path} contains no finite pixels")
     rounded = np.round(values, 5)
+    unique_scalar_values = tuple(round(float(value), 5) for value in np.unique(rounded))
     return _InspectedFrame(
         stats=PassFrameStats(
             frame=frame_path.name,
@@ -383,7 +425,8 @@ def _exr_frame_stats(pass_name: str, frame_path: Path) -> _InspectedFrame:
             min=(round(float(np.min(values)), 5),),
             max=(round(float(np.max(values)), 5),),
             stddev=(round(float(np.std(values)), 5),),
-            unique_values=int(np.unique(rounded).size),
+            unique_values=len(unique_scalar_values),
+            unique_scalar_values=unique_scalar_values,
             unique_vectors=unique_vectors,
             scalar_vector=scalar_vector,
         ),
@@ -529,7 +572,10 @@ def _assert_pass_quality(
     frames: tuple[PassFrameStats, ...],
     *,
     lighting_preset: str,
-) -> None:
+    expected_object_stencil_ids: tuple[int, ...],
+    object_stencil_coverage: Literal["every_frame", "sequence_union"],
+    minimum_object_stencil_coverage: float,
+) -> tuple[tuple[int, ...], tuple[int, ...], float] | None:
     if pass_name in {"beauty_lit", "beauty_unlit", "basecolor"}:
         _assert_rgb_non_dark_non_uniform(pass_name, frames, lighting_preset=lighting_preset)
     elif pass_name == "depth":
@@ -537,7 +583,13 @@ def _assert_pass_quality(
     elif pass_name == "normal":
         _assert_normal_reasonable(frames)
     elif pass_name == "object_mask":
-        _assert_object_mask_values(frames)
+        return _assert_object_mask_values(
+            frames,
+            expected_stencil_ids=expected_object_stencil_ids,
+            coverage=object_stencil_coverage,
+            minimum_coverage=minimum_object_stencil_coverage,
+        )
+    return None
 
 
 def _assert_rgb_non_dark_non_uniform(
@@ -586,24 +638,104 @@ def _assert_normal_reasonable(frames: tuple[PassFrameStats, ...]) -> None:
             raise RuntimeError(f"normal: {frame.frame} is too uniform stddev={frame.stddev}")
 
 
-def _assert_object_mask_values(frames: tuple[PassFrameStats, ...]) -> None:
+def _assert_object_mask_values(
+    frames: tuple[PassFrameStats, ...],
+    *,
+    expected_stencil_ids: tuple[int, ...],
+    coverage: Literal["every_frame", "sequence_union"],
+    minimum_coverage: float,
+) -> tuple[tuple[int, ...], tuple[int, ...], float]:
+    _validate_expected_stencil_ids(expected_stencil_ids)
+    if coverage not in {"every_frame", "sequence_union"}:
+        raise ValueError(f"unsupported object stencil coverage policy: {coverage!r}")
+    if not math.isfinite(minimum_coverage) or not 0.0 < minimum_coverage <= 1.0:
+        raise ValueError("minimum object stencil coverage must be in (0, 1]")
+    expected_id_sequence = (0, *expected_stencil_ids)
+    expected_id_set = set(expected_id_sequence)
+    observed_ids: set[int] = set()
     for frame in frames:
         if frame.scalar_vector is False:
             raise RuntimeError(
                 f"object_mask: {frame.frame} expected scalar stencil IDs, "
                 f"got {frame.unique_vectors} unique color vectors"
             )
-        if frame.unique_values != 3:
+        actual_values = frame.unique_scalar_values
+        if actual_values is None or not actual_values or actual_values[0] != 0.0:
             raise RuntimeError(
-                f"object_mask: {frame.frame} expected 3 unique values "
-                f"(background + 2 objects), got {frame.unique_values}"
+                f"object_mask: {frame.frame} must contain a background stencil value"
             )
+        decoded_ids: list[int] = []
+        for value in actual_values:
+            stencil_id = _decode_normalized_stencil(value)
+            if stencil_id is None:
+                raise RuntimeError(
+                    f"object_mask: {frame.frame} contains a non-stencil scalar {value}; "
+                    f"expected IDs {list(expected_stencil_ids)}"
+                )
+            decoded_ids.append(stencil_id)
+        if len(set(decoded_ids)) != len(decoded_ids):
+            raise RuntimeError(
+                f"object_mask: {frame.frame} contains multiple encodings for one stencil ID; "
+                f"values={actual_values} decoded={decoded_ids}"
+            )
+        actual_id_set = set(decoded_ids)
+        if len(actual_id_set) <= 1:
+            raise RuntimeError(f"object_mask: {frame.frame} contains no foreground stencil ID")
+        if coverage == "every_frame" and tuple(decoded_ids) != expected_id_sequence:
+            raise RuntimeError(
+                f"object_mask: {frame.frame} expected {len(expected_id_sequence)} unique values "
+                f"(background + stencil IDs {list(expected_stencil_ids)}), got {actual_values}"
+            )
+        if not actual_id_set.issubset(expected_id_set):
+            raise RuntimeError(
+                f"object_mask: {frame.frame} contains a stencil outside expected stencil IDs "
+                f"{list(expected_stencil_ids)}; got values={actual_values} "
+                f"decoded={decoded_ids}"
+            )
+        observed_ids.update(actual_id_set)
         if frame.min[0] < -1e-5:
             raise RuntimeError(f"object_mask: {frame.frame} has negative value {frame.min[0]}")
-        if frame.max[0] > (2.0 / 255.0) + 1e-4:
-            raise RuntimeError(
-                f"object_mask: {frame.frame} max value is not a stencil id {frame.max[0]}"
-            )
+    observed_foreground = tuple(sorted(observed_ids - {0}))
+    missing = tuple(sorted(set(expected_stencil_ids) - set(observed_foreground)))
+    coverage_ratio = len(observed_foreground) / len(expected_stencil_ids)
+    if coverage == "sequence_union" and coverage_ratio < minimum_coverage:
+        raise RuntimeError(
+            "object_mask: frame sequence does not meet expected stencil coverage; "
+            f"expected={expected_id_sequence} observed={tuple(sorted(observed_ids))} "
+            f"missing={list(missing)} coverage={coverage_ratio:.6f} "
+            f"minimum={minimum_coverage:.6f}"
+        )
+    return observed_foreground, missing, coverage_ratio
+
+
+def _decode_normalized_stencil(value: float) -> int | None:
+    if not math.isfinite(value) or value < -STENCIL_NORMALIZED_ATOL:
+        return None
+    stencil_id = int(round(value * 255.0))
+    if not 0 <= stencil_id <= 255:
+        return None
+    if not math.isclose(
+        value,
+        stencil_id / 255.0,
+        rel_tol=0.0,
+        abs_tol=STENCIL_NORMALIZED_ATOL,
+    ):
+        return None
+    return stencil_id
+
+
+def _validate_expected_stencil_ids(expected_stencil_ids: tuple[int, ...]) -> None:
+    if (
+        not expected_stencil_ids
+        or tuple(sorted(set(expected_stencil_ids))) != expected_stencil_ids
+        or any(
+            isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 255
+            for value in expected_stencil_ids
+        )
+    ):
+        raise ValueError(
+            "expected object stencil IDs must be unique ascending integers in [1, 255]"
+        )
 
 
 def _rounded_tuple(values: list[float]) -> tuple[float, ...]:

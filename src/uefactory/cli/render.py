@@ -100,14 +100,26 @@ def render_job_command(
         str | None,
         typer.Option("--host", help="Run render job on a configured remote host."),
     ] = None,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", "--db", help="Catalog database for local catalog assets."),
+    ] = None,
 ) -> None:
     settings = settings_from_context(ctx)
     try:
         if host is not None and verify_twice:
             typer.echo("--verify-twice is only supported for local render jobs", err=True)
             raise typer.Exit(2)
+        if host is not None and database is not None:
+            typer.echo("--database is only supported for local render jobs", err=True)
+            raise typer.Exit(2)
         first = (
-            render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
+            render_job(
+                settings=settings,
+                job_path=job_path,
+                timeout_sec=timeout_sec,
+                database_path=database,
+            )
             if host is None
             else render_job_remote(
                 settings=settings,
@@ -125,7 +137,12 @@ def render_job_command(
             typer.echo(f"Turntable: {first.artifacts.turntable_mp4}")
             typer.echo(f"Index: {first.artifacts.index_html}")
         if verify_twice:
-            second = render_job(settings=settings, job_path=job_path, timeout_sec=timeout_sec)
+            second = render_job(
+                settings=settings,
+                job_path=job_path,
+                timeout_sec=timeout_sec,
+                database_path=database,
+            )
             compare_job_outputs(first, second)
             typer.echo(f"Render job repeat OK: {second.run_dir}")
     except JobSpecError as exc:

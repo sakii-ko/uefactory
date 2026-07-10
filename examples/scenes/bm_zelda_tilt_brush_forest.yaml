@@ -1,0 +1,31 @@
+schema_version: 1
+scene_id: bm_zelda_tilt_brush_forest
+name: The Legend of Zelda Tilt Brush Forest
+kind: interchange_scene
+source:
+  path: asset-library/derived/2e62798f321b5e6f/2e62798f321b5e6f.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: a97fa3169b9544c99183a21df26755f4
+  source_url: https://sketchfab.com/3d-models/a97fa3169b9544c99183a21df26755f4
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: vrhuman — The Legend of Zelda Tilt Brush Forest
+expected:
+  mesh_count: 14
+  material_count: 10
+  texture_count: 7
+  triangle_count: 477968
+build:
+  map_path: /Game/UEF/Scenes/bm_zelda_tilt_brush_forest/L_bm_zelda_tilt_brush_forest
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -22
+  distance_multiplier: 1.5
+render:
+  no_auto_floor: true
+  # Three translucent Tilt Brush materials do not write UE custom depth.
+  minimum_object_stencil_coverage: 0.75

@@ -1,0 +1,29 @@
+schema_version: 1
+scene_id: bm_lys_piandian
+name: Black Myth LYS Piandian Research Component
+kind: interchange_scene
+source:
+  path: asset-library/_demo/lys_buildings/b1/Content/00MainHZ/Environment/Building_Combine/LYS/Meshs/LYS_piandian_a.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_research
+  source_id: lys_piandian_a
+  source_url: urn:uefactory:blackmyth-research:lys-piandian-a
+  license: LicenseRef-Research-Only
+  license_tier: nc
+  license_url: urn:uefactory:license:research-only
+  attribution: Local Black Myth research extraction — LYS_piandian_a; redistribution prohibited
+expected:
+  mesh_count: 1
+  material_count: 42
+  texture_count: 0
+  triangle_count: 177610
+build:
+  map_path: /Game/UEF/Scenes/bm_lys_piandian/L_bm_lys_piandian
+  export: false
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -18
+  distance_multiplier: 1.5
+render:
+  no_auto_floor: true

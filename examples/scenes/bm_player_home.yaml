@@ -1,0 +1,29 @@
+schema_version: 1
+scene_id: bm_player_home
+name: Stylised Sky Player Home Diorama
+kind: interchange_scene
+source:
+  path: asset-library/derived/d0f073d970484a0a/d0f073d970484a0a.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 6597e6c9a5184f07a638ac33c08c2ad5
+  source_url: https://sketchfab.com/3d-models/6597e6c9a5184f07a638ac33c08c2ad5
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: Sander Vander Meiren — Stylised Sky Player Home Diorama
+expected:
+  mesh_count: 22
+  material_count: 10
+  texture_count: 11
+  triangle_count: 39187
+build:
+  map_path: /Game/UEF/Scenes/bm_player_home/L_bm_player_home
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -40
+  pitch: -20
+  distance_multiplier: 1.15
+render:
+  no_auto_floor: true
