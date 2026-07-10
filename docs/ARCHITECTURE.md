@@ -47,21 +47,24 @@
 
 ```yaml
 job: render
-assets: [chair_001, "tag:furniture"]      # id 或 catalog 查询
+assets: ["builtin:cube"]                  # M1 仅内置 cube;M2 扩展 catalog id
 camera:
-  rig: orbit          # orbit | fixed | random
+  rig: orbit
   views: 8            # 环拍视角数
-  elevation_deg: [15, 45]
-  fov: 60
-  resolution: [1024, 1024]
+  elevation_deg: 20
+  fov: 55
+  resolution: [640, 360]
 lighting:
-  preset: hdri        # hdri | three_point | unlit | none(纯黑测发光)
-  hdri: studio_small_03
+  preset: hdri        # hdri | three_point | none
+  hdri: studio_small_03_1k
 passes: [beauty_lit, beauty_unlit, depth, normal, basecolor, object_mask]
 output:
-  dir: out/renders/{job_id}
-  format: png16       # mask/depth 需要 16bit
+  dir: out/renders
 ```
+
+物理输出契约:beauty/unlit/normal/basecolor 为 8-bit RGB PNG;depth/object_mask 为
+half-float RGBA EXR(统计语义取第一通道)。manifest 记录实际格式、分辨率、每帧统计和
+**解码像素 SHA-256**,`--verify-twice` 比较完整稳定校验载荷而非三位小数 luma。
 
 ## 4. Catalog schema 草案(M2 定稿)
 
@@ -97,8 +100,15 @@ CREATE TABLE artifacts (               -- 渲染/缩略图等产物索引
 |---|---|
 | beauty_lit | MRQ Deferred Rendering 默认输出 |
 | beauty_unlit | viewmode unlit(MRQ Additional Post Process / ShowFlag.Lighting=0) |
-| depth / normal / basecolor | MRQ 的 GBuffer 通道(Deferred Rendering 的 Additional Render Passes) |
-| object_mask | Custom Stencil:导入时给每资产分配 stencil id,MRQ Stencil Layer 输出 |
+| depth | MRQ WorldDepth 后处理材质;half-float EXR,必须有前后景梯度 |
+| normal | MRQ WorldNormal 后处理材质;**世界空间**编码,orbit 时 R/G 随视角变化,不是固定偏蓝的切线空间贴图 |
+| basecolor | MRQ BaseColor 后处理材质;8-bit RGB PNG |
+| object_mask | Custom Stencil 标量材质(`stencil / 255`);half-float EXR,主体 bbox/可见性必须与 beauty 对齐 |
+
+HDRI beauty 与数据 pass 使用两个 LevelSequence:beauty sequence 含 HDRIBackdrop,
+data sequence 不含 backdrop。这样环境只进入 beauty/unlit,不会把穹顶几何写进
+depth/normal/basecolor/object_mask。三点光使用固定顺序、固定参数的持久 level actor;
+该约束与确定性策略见 ADR-004。
 
 已知备选:若 MRQ 通道在 headless 下有坑,退路是 SceneCapture2D + 后处理材质(记 ADR 再切换)。
 

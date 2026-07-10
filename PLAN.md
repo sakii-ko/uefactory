@@ -1,12 +1,11 @@
 # UEFactory — UE 数据制造农场 · 总计划
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
-> 由 Planner 维护;Coder(同事)只执行「当前 Sprint」清单中的任务,不自行扩大范围。
-> 最后更新:2026-07-09(第 6 次) · 当前阶段:**M1 渲染服务 v1** · 上一里程碑:**M0 已由 Owner 验收,tag `v0.1.0`**
-> **当前主线:T1.2(MRQ headless spike)→ T1.3 JobSpec → T1.4 多通道 → T1.5 光照预设
-> → T1.6 统一执行器 + contact sheet + turntable 视频 → T1.7 收尾 → M1 验收。
-> T1.1(4090)降级为机会性任务,不阻塞 M1(Owner 2026-07-09 指示)。**
-> 规则不变:DoD 验收对象不可自行替换;一次只推进一个任务;通知走 docs/SIGNALS.md 信号。
+> 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
+> 最后更新:2026-07-10(第 7 次) · 当前阶段:**M2 资产摄取** · 已完成:**M0 `v0.1.0`;M1 正式审计通过,待里程碑提交/合并/tag**
+> **当前主线:T2.1 ingest 契约与样例集 → T2.2 SQLite catalog → T2.3 UE headless 导入
+> → T2.4 规范化/质量门禁 → T2.5 缩略图 → T2.6 十资产端到端验收 → T2.7 收尾。**
+> 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
 
 ## 1. 愿景与范围
@@ -27,106 +26,110 @@
 - 多机分布式——先做好单机多 worker。
 - Windows 支持。
 
-## 2. 协作协议(必读)
+## 2. 工作协议(必读)
 
 | 角色 | 谁 | 职责 |
 |---|---|---|
-| Planner | Claude(本会话) | 写计划、定规范、review 代码、必要时补代码 |
-| Coder | 同事 | 按当前 Sprint 清单实现,产出验收产物 |
-| Owner | 用户 | 验收里程碑、拍板开放性决策 |
+| 执行代理 | Codex(当前会话) | 统一负责计划、设计、实现、测试、真实运行、可视化审阅、review 与里程碑收口 |
+| Owner | 用户 | 定义终极目标;仅在权限、外部资源或会实质改变目标的开放性选择上介入 |
 
-**通信全部走 md 文件 + git,不走口头**:
-- `PLAN.md`(本文件)—— Planner 写任务;Coder 只读。
-- `docs/WORKLOG.md` —— Coder 每完成一个任务**追加**一条记录(模板见该文件),必须附验收产物路径。
-- `docs/QUESTIONS.md` —— Coder 遇到计划没覆盖的决策点,**写问题、停下来或先做别的任务**,不要擅自做重大设计决定。
-- `docs/reviews/` —— Planner 的 review 报告;review 发现的问题会变成 PLAN.md 里的 fix 任务。
-- `docs/adr/` —— 架构决策记录;重大技术选型必须先有 ADR。
+项目状态以文件与 git 为准:
 
-**流程**:Coder 从 `main` 切 `feat/m0-<slug>` 分支 → 按任务提交(Conventional Commits)→
-任务全部 DoD 达成后在 WORKLOG 登记并请求 review → Planner review → 通过后由 Planner 合入 `main` 并打 tag。
-详细 git / 代码规范见 `docs/CONVENTIONS.md`,**开工前先读完它**。
-**互相通知走信号机制**(2026-07-08 起,Owner 不再中转):协议见 `docs/SIGNALS.md`——
-push 完发 `tools/signal.sh planner REVIEW_REQUESTED`,收到 `REVIEW_DONE` 信号后 pull 并读 review。
+- `PLAN.md`(本文件)—— 当前目标、任务顺序与 DoD;执行中同步维护。
+- `docs/WORKLOG.md` —— **只追加**实际命令、结果、产物路径、失败修正和耗时。
+- `docs/QUESTIONS.md` —— 只有真正需要 Owner 拍板或提供外部条件时才登记阻塞。
+- `docs/reviews/` —— 每个里程碑的独立审计结论;发现的问题先修复再放行。
+- `docs/adr/` —— 跨里程碑的不变量与重大技术选型。
+
+**流程**:在 `feat/m<里程碑>-<slug>` 上直接规划并实现 → 自动化测试 → 真实 UE/远程运行
+→ 亲眼审阅图像/报告 → 更新 WORKLOG 与 ADR → 正式 review → Conventional Commits →
+合入 `main` 并打 tag。除非遇到真实外部阻塞,不再用 Planner/Coder 信号交接停顿。
+详细 git、代码与证据规范见 `docs/CONVENTIONS.md`。
 
 ## 3. 里程碑路线图
 
 | 里程碑 | 交付物 | 验收标准(摘要) |
 |---|---|---|
 | **M0 骨架与冒烟渲染** | `uef` CLI 骨架、`uef doctor`、headless 渲出第一张非全黑图 | pytest 全绿;`out/smoke/` 有 PNG + manifest + 日志 |
-| **M1 渲染服务 v1** | JobSpec(YAML)→ MRQ 渲染:多 pass、orbit 相机、光照预设、contact sheet;本地/远程节点同一入口 | 同一资产渲出 lit/unlit/depth/normal 四通道 × 8 视角,并在**至少一个远程节点(l40s)**跑通;4090 期间可用则一并跑通 |
+| **M1 渲染服务 v1** | JobSpec(YAML)→ MRQ 渲染:六 pass、orbit 相机、三种光照、contact sheet/MP4;本地/远程同一入口 | **已通过正式审计**:六通道 × 8 视角;本地重复运行及本地↔l40s 共 48 帧解码像素哈希完全一致;HDRI/none 视觉验收与失败清理通过 |
 | **M2 资产摄取** | 本地 FBX/glTF 导入 UE + SQLite catalog + 缩略图 | 10 个杂源模型一键入库,catalog 可查,缩略图正确 |
 | **M3 持续获取** | 按 `docs/ASSET_ACQUISITION.md` 五腿战略:PolyHaven adapter 打样 → Objaverse LVIS 灌库 → 质量门禁/去重 → 每日增量调度 | 无人值守跑 24h;license 三档(open/nc/ue-only)全程可追溯;catalog stats 报告可读 |
 | **M4 农场化** | 作业队列、**多节点池调度**(本机 + 4090 + l40s)、失败重试、HTML 统计报告 | 100 资产 × 全通道批渲无人值守完成(跨节点),报告可读 |
 | **M5 UnrealZoo 化(后议)** | 交互控制 / 场景组合 / gym 接口 | 待 Owner 定义 |
 
-每个里程碑完成 = Planner review 通过 + Owner 验收 + tag `vX.Y.0`。
+每个里程碑完成 = DoD 证据齐全 + 正式 review 通过 + 可追溯提交/合并 + tag `vX.Y.0`。
 
-## 4. 当前 Sprint:M1 任务清单(渲染服务 v1)
+## 4. 当前 Sprint:M2 任务清单(资产摄取)
 
-> M0(T0.1–T0.7)已全部完成并验收,tag `v0.1.0`;过程与证据见 WORKLOG 与 docs/reviews/,此处不再保留细节。
-> M1 目标(里程碑表):JobSpec(YAML)→ 多 pass、orbit 相机、光照预设、contact sheet;
-> 本地/远程同一入口;验收标准:**同一资产渲出 lit/unlit/depth/normal 四通道 × 8 视角,且在 4090 节点跑通**。
-> 继承不变量:**确定性渲染**(同 job 两次运行输出一致;破坏此性质的变更需先记 ADR)。
+> M0 已验收并标记 `v0.1.0`。M1 的修正版证据、正式审计和渲染数据契约见
+> `docs/WORKLOG.md`、`docs/reviews/2026-07-10-formal-m1-render.md` 与 ADR-004。
+> M2 的验收对象是**真实本地 FBX/glTF/GLB 资产**,不是内置 cube 或伪造 catalog 行。
 
-### T1.1 4090 节点上线 `#remote`(**机会性任务,不阻塞 M1**;Owner 2026-07-09 指示)
-- [ ] 每个工作日**至多一次**轻量探测(单条 ssh echo,不 hammer);不通只记一行 WORKLOG,继续主线;
-- [ ] 探测通了才升级动作:`node init` → `provision`(tmux + `--partial`,落点 `/home/lyf/uef/engine/`;
-  传输挂后台,不占串行槽)→ doctor → 远程 smoke;共享机器纪律与 150GB 硬上限不变;
-- [ ] GPU 挑选策略(8 卡选空闲)与实测带宽记 WORKLOG。
-- **DoD(仅当节点可用时适用)**:4090 冒烟图过校验 + 确定性;渲染不影响该机其他用户(nvidia-smi 前后对照)。
-- **M1 验收不依赖本任务**;若 M1 结束时仍不可用,顺延 M2 并在 WORKLOG 记录探测历史。
+### T2.1 IngestSpec 与十资产样例集 `#ingest` `#acquire`
 
-### T1.2 MRQ headless 可行性 spike `#render`(M1 最大技术风险,先消解)
-- [ ] 最小验证:UEFBase 里建一个 LevelSequence(相机固定或简单位移)+ MRQ 配置,headless
-  (`-game -RenderOffscreen` 或 editor `-ExecutePythonScript` 驱动 MRQ,以实测为准)渲出 8 帧 PNG 序列;
-- [ ] 确定性验证:同配置两跑,逐帧 luma 一致;
-- [ ] 结论写 WORKLOG:可行路径、必需命令行 flags、坑(首帧 GC、TAA 抖动等);**若 MRQ 不可行**,
-  停下发 BLOCKED 信号 + QUESTIONS 里给备选评估(SceneCapture 多 pass 方案),等 Planner 裁定(ADR-002 约定)。
-- **DoD**:8 帧序列 + 两跑一致证据 + WORKLOG spike 报告。**不做任何超出 spike 的封装**——先证明,再工程化。
+- [ ] 定义严格的 ingest manifest:本地路径、稳定 `asset_id`、名称、source/source URL、SPDX 风格
+  license、tags;未知/缺失字段 fail fast,license 不允许为空。
+- [ ] 准备至少 10 个可再分发的开放许可样例,覆盖 FBX 与 glTF/GLB、带/不带贴图、不同尺度与层级;
+  原始大文件放 `data/raw/`,git 仅记录小型 manifest、来源与许可证证据。
+- [ ] 下载必须可重入,校验 size + SHA-256,临时文件原子改名;失败不得伪装为已获取。
+- **DoD**:一条命令可准备/校验样例集;10 个条目均有来源、license、内容 hash,重复执行不重复下载。
 
-### T1.3 JobSpec v1 + orbit 相机 `#render`
-- [ ] JobSpec YAML schema 落地(ARCHITECTURE §3 草案):`assets/camera(rig=orbit,views,elevation_deg,fov,resolution)/lighting(preset)/passes/output`;
-  dataclass + 显式校验(未知字段、缺字段、非法值一律 raise,错误信息带字段路径);schema 单测(合法/非法例);
-- [ ] `uef render job <job.yaml>`:先支持 `passes: [beauty_lit]` 单通道,orbit N 视角(等距方位角 × 指定仰角),
-  走 T1.2 验证过的执行路径;输出 `out/renders/<job_id>/<asset>/<pass>/frame_%04d.png` + manifest v2(含 job 全文、每帧校验值);
-- [ ] 场景仍用冒烟的 Cube 场景充当"资产占位"(真资产等 M2 ingest;JobSpec 的 assets 字段先允许 `builtin:cube`)。
-- **DoD**:`uef render job examples/orbit8.yaml` 渲出 8 视角 beauty;非法 YAML 有可读报错;确定性两跑一致。
+### T2.2 SQLite catalog v1 `#catalog`
 
-### T1.4 多通道 passes `#render`(M1 核心交付)
-- [ ] 在 MRQ 上实现:`depth` / `normal` / `basecolor`(GBuffer 通道)+ `object_mask`(custom stencil)+
-  `beauty_unlit`(unlit 视图模式);depth/mask 用 16bit(EXR 或 png16,选型记 WORKLOG);
-- [ ] **通道级防假成功断言**(校验器扩展):depth 必须有梯度(非常数)、normal 均值应偏蓝(切线空间外观合理性)、
-  mask 的唯一值数量 = 场景物体数 + 1、unlit 与 lit 不得逐像素相同;各断言配反例单测;
-- [ ] manifest 记录每通道格式/位深/校验值。
-- **DoD**:同一 job 渲出 lit/unlit/depth/normal/basecolor/mask 六通道 × 8 视角,全部过通道级校验;确定性保持。
+- [ ] 用标准库 `sqlite3` 落地 versioned schema 与迁移:assets、artifacts,外键开启;路径存相对路径;
+  asset/license/status/source/hash/timestamp 约束入库级强制。
+- [ ] CLI 至少支持 `catalog init/list/show/stats`;查询支持 id、status、source、license、tag。
+- [ ] upsert 必须事务化;同 hash 重复资产可检测,失败导入保留结构化 error 而不污染 imported 状态。
+- **DoD**:空库初始化幂等;十资产 raw 记录可查;非法 license/状态、重复 id/hash 与事务回滚均有反例测试。
 
-### T1.5 光照预设 `#render`
-- [ ] `lighting.preset ∈ {hdri, three_point, none}`:hdri 需样例 HDRI(脚本从 PolyHaven 下载 1–2 张 CC0 到
-  `data/hdri/`,不入 git,下载器即 M3 acquire 的最小雏形);three_point 为参数化三点光;none 为全黑底(测发光材质);
-- [ ] 预设由 UE 侧脚本按 job JSON 构建,幂等(重复构建不叠灯)。
-- **DoD**:同场景 × 3 预设 × beauty 通道图,视觉可辨(hdri 有环境反射/背景,none 接近全黑但发光体可见);luma 断言按预设定制。
+### T2.3 UE 5.5.4 headless 导入 `#ingest` `#ue`
 
-### T1.6 本地/远程统一执行器 + contact sheet + turntable `#render` `#remote`
-- [ ] `Executor(local | remote(host))` 抽象落地(ARCHITECTURE §6):`uef render job x.yaml [--host l40s|4090]`,
-  JobSpec 与 UE 侧脚本完全不感知本地/远程;远程沿用作业包推送/tmux/回收/清理机制;
-- [ ] contact sheet:每 job 自动生成缩略图拼图 PNG(视角 × 通道网格)+ 简单 index.html;
-- [ ] turntable:orbit 帧序列合成 mp4(ffmpeg;doctor 增加 ffmpeg 检测,缺失则 QUESTIONS,不自装);
-- [ ] 跨节点一致性初查:同 job 本地 vs l40s vs 4090 的 luma 偏差表记 WORKLOG(容差暂定 ±5%,超出开 M2 前置调查任务)。
-- **DoD**:同一 job 在本地 + l40s 跑通且产物结构一致(4090 届时可用则加验);contact sheet + turntable 视频可看(M1 验收演示物)。
+- [ ] `uef ingest asset|batch` 生成 JSON 作业,经统一 `run_ue` 调 UE Python;优先使用 Interchange,
+  必要时按格式使用受控 fallback,不得依赖 Editor GUI。
+- [ ] 输出到 `/Game/UEF/Ingested/<asset_id>/`,写 import manifest:package paths、mesh 数、三角形数、
+  material/texture 数、bounds、引擎版本、日志摘要与耗时。
+- [ ] 进程失败、warning/error、零 mesh/零三角形、缺 package 都 fail closed;重复导入幂等且不会叠资产。
+- **DoD**:至少一份 FBX 与一份 glTF/GLB 经真实 UE headless 导入成功,日志零未过滤 error/warning,
+  package 能由独立 UE 进程重新加载。
 
-### T1.7 收尾
-- [ ] LogHttp/在线请求源头禁用(M0 遗留);README「五分钟上手」+ `uef.toml.example` 补全;
-- [ ] WORKLOG 汇总 M1 + 给 M2(资产 ingest)的建议;QUESTIONS 清点;
-- [ ] 文末 `REVIEW REQUESTED: <branch> <sha>` + 发 REVIEW_REQUESTED 信号。
+### T2.4 规范化与质量门禁 `#ingest`
 
-**任务顺序**:主线严格 T1.2 → T1.3 → T1.4 → T1.5 → T1.6 → T1.7 串行;T1.1 为机会性任务,
-在任务间隙做轻量探测,通了再做重活(后台传输不占串行槽)。
-每任务完成即在 WORKLOG 登记并可发 INFO 信号,**中途发现 PLAN 未覆盖的决策点一律 BLOCKED + QUESTIONS**。
-分支:`feat/m1-render`(从 main 切)。预计 4–6 个工作日(MRQ spike 为主要不确定项)。
+- [ ] 统一厘米/米换算、Z-up、pivot 落地与可配置缩放;保留源变换信息以便追溯。
+- [ ] 自动门禁至少覆盖:有限非零 bounds、三角形数 > 0、合理尺度、材质槽/纹理引用可解析、无 NaN;
+  失败进入 `failed`/quarantine 并记录规则版本与原因。
+- [ ] 不把“导入命令退出 0”等同于质量通过;为每条门禁制作失败 fixture。
+- **DoD**:十资产全部得到确定的 imported 或可解释 failed 结果;用于 M2 验收的 10 个全部过门禁。
+
+### T2.5 Catalog ↔ render 与缩略图闭环 `#catalog` `#render`
+
+- [ ] JobSpec 支持 catalog `asset_id`,UE setup 加载已导入 StaticMesh,自动按 bounds 构图、落地并赋 stencil;
+  `builtin:cube` 仅保留回归用途。
+- [ ] 每个 imported 资产生成至少一张标准 beauty 缩略图和 object mask;缩略图/manifest 作为 artifacts 入 catalog。
+- [ ] 复用 M1 的解码像素、格式、mask/bounds 校验;图像必须由执行代理逐张或 contact sheet 亲眼审阅。
+- **DoD**:十资产缩略图均非黑、主体完整、不穿地/严重裁切,mask 与主体一致;catalog 路径均可解析。
+
+### T2.6 十资产一键端到端验收 `#ingest` `#catalog` `#ue`
+
+- [ ] 一条 batch 命令完成 manifest 校验 → catalog raw → UE import → 门禁 → thumbnail → catalog imported。
+- [ ] 中途失败可安全重跑,已成功项不重复工作;最终生成 JSON + HTML 汇总和 10 资产 contact sheet。
+- [ ] 跑纯逻辑全量测试、真实 UE 集成测试,并至少随机独立重载 3 个 package 验证持久化。
+- **DoD**:10 个杂源 FBX/glTF/GLB 一键入库;`catalog list/show/stats` 可查;10 张缩略图视觉正确;
+  manifest、数据库和磁盘三方一致。
+
+### T2.7 收尾与正式 review
+
+- [ ] README 增加 ingest/catalog 五分钟路径;ARCHITECTURE 将 M2 schema/数据流由草案改为实装契约。
+- [ ] WORKLOG 追加所有真实命令、耗时、失败修正、产物路径;新增 M2 正式 review,无高/中未解决项。
+- [ ] Conventional Commits 推送分支,合入 `main`,打 `v0.3.0`。
+
+**任务顺序**:T2.1 → T2.2 → T2.3 → T2.4 → T2.5 → T2.6 → T2.7。
+实现时允许为测试并行准备样例和 catalog,但不允许用未经过前序门禁的结果冒充后序 DoD。
+分支:M1 收口后切 `feat/m2-ingest`。
 
 ## 5. 风险与已知约束
 
-1. **GPU 显存被占**:H100 上有一个常驻进程占 69GiB,渲染只有 ~12GiB 余量。UE 一般够用,但 doctor 必须每次检查;若 OOM,记录现场并在 QUESTIONS 里升级给 Owner(是否协调让出显存)。**禁止 kill 任何不是我们启动的进程。**
+1. **GPU 显存占用会动态变化**:2026-07-10 doctor 时 H100 约 79GiB 可用,但历史上曾只剩 ~12GiB。
+   UE/ingest 重任务前必须 doctor;若 OOM,记录现场并升级给 Owner。**禁止 kill 任何不是我们启动的进程。**
 2. **全盘皆 NAS(CephFS)**:repo、home 都在 NAS 上。UE 的 DDC/shader 编译对 IO 极敏感——T0.1 doctor 必须找出本地盘;若真没有本地盘,DDC 放 NAS 并把首次编译耗时如实记录,后续再议。
 3. **无 docker**:一切原生跑,依赖装进 venv,系统级依赖(如 vulkan-tools)先记录缺什么、写进 QUESTIONS,不擅自 `apt install`(无 root 也未必装得上)。
 4. **许可证合规**:M3 起,任何抓取的资产必须记录 license 与来源 URL,默认白名单 CC0/CC-BY;这是硬约束,catalog schema 里 license 字段 NOT NULL。

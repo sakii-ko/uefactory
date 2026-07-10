@@ -770,3 +770,57 @@ REVIEW REQUESTED: feat/m0-remote f19bbeb
 - 待决问题:无;M1 当前分支已可请求 review。
 
 REVIEW REQUESTED: feat/m1-render 43d2163
+
+## [2026-07-10] M1 正式审计、纠错与最终验收 — DONE
+
+- 分支:`feat/m1-render`(正式提交 sha 见本条之后的 git 历史)。
+- 说明:本条**追加修正**上方 T1.2–T1.7 的阶段性结论,不改写历史。正式 review 发现旧证据中
+  有若干“产物存在但语义/生命周期不够严格”的假成功;全部修复并重新真实运行后才放行。
+- 纠正的关键问题:
+  - 空 OCIO transform 实际会把黄色 `OCIO INVALID` 字样写进图像;改为 pass-specific 有效 transform,
+    并增加重复黄色覆盖层反例检测。
+  - PNG/EXR 不能按配置自报格式:现在解码验证真实分辨率、通道、位深、pixel type;RGBA PNG
+    原子规范为 RGB,EXR 如实记录 half-float RGBA。
+  - 三位小数 luma 不是确定性证明:现在每帧记录 canonical decoded pixel SHA-256,
+    `--verify-twice` 比较完整稳定 validation payload。
+  - normal 是 **world-space normal**,不是 PLAN 旧文所称固定偏蓝的 tangent-space 外观;契约见 ADR-004。
+  - HDRI 初版仅 SkyLight/共享场景不足以证明数据通道干净;改为官方 HDRIBackdrop 材质与
+    beauty/data 两个 LevelSequence,环境只进入 beauty/unlit。
+  - `none` 初版背景/地面语义不够严格;现在背景近黑且只有 emissive cube 可见,validator 会拒绝亮背景。
+  - three-point 改为固定顺序、固定参数的持久 key/fill/rim level actors,解决 MRQ binding/注册顺序
+    引起的 beauty FP16 非确定性。
+  - runtime normalization/初始化/next-pass 异常始终写失败 manifest 并通知 executor finished,
+    不再挂到外层 timeout;失败 manifest 的具体根因不会被 host orchestration 错误覆盖。
+  - 本地 Ctrl-C/异常会终止 UE 进程组并清生成资产;cleanup 结果写 manifest,cleanup 失败附加到主异常。
+  - 远端 runner 改为上传脚本后用短 tmux command 启动;旧 inline Python 超过 shell 命令长度的失败 run
+    `out/renders/20260709T192138Z_0734e04f/` 已安全清理。
+  - 远端 stop 使用 PID=PGID/session/start-ticks 身份验证,TERM→KILL 后等待退出;非终态且身份缺失、
+    PID 消失或疑似复用时 fail closed,保留 remote tree,绝不误删目录或误杀无关进程。
+- 本地确定性验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --verify-twice --timeout-sec 1800`。
+  - runs:
+    - `out/renders/20260709T191746Z_b5cf85a4/builtin_cube`
+    - `out/renders/20260709T191834Z_cb99c332/builtin_cube`
+  - beauty_lit/beauty_unlit/depth/normal/basecolor/object_mask × 8,共 48 帧解码像素哈希逐帧完全一致。
+- 光照与通道隔离验收:
+  - HDRI beauty 背景:`out/renders/20260709T190912Z_31bd01b4/builtin_cube`。
+  - HDRI 六通道:`out/renders/20260709T191403Z_5058d55e/builtin_cube`;beauty/unlit 有环境,
+    depth/normal/basecolor/object_mask 与无 HDRI 干净基准逐帧哈希相同。
+  - none:`out/renders/20260709T191654Z_2ef29f7b/builtin_cube`;黑背景、无发光地面、emissive cube 可见。
+  - 执行代理亲眼检查以上 contact sheet,主体居中落地、8 视角完整、无 overlay、无数据通道 HDRI 污染。
+- l40s 真实远程验收:
+  - 命令:`.venv/bin/uef render job examples/orbit8.yaml --host l40s --timeout-sec 1800`。
+  - run:`out/renders/20260709T192339Z_e408576b/builtin_cube`。
+  - `status=ok`,`remote_host=l40s`,六通道 × 8 帧、contact sheet/index/4.000s MP4 全部通过本地复验。
+  - 与本地 `20260709T191746Z_b5cf85a4` 的 48 帧 decoded SHA-256 **全部完全一致**;
+    8 帧 luma 也完全一致,不是仅在 ±5% 容差内。
+  - `cleanup.status=ok`,`cleanup.verified=true`;远端 job tree 删除后以 `test ! -e` 复核。
+- 最终回归:
+  - `tools/check.sh` → ruff check/format、mypy 全绿;`102 passed, 2 deselected in 17.50s`。
+  - `.venv/bin/pytest -m ue -vv` → `2 passed, 102 deselected in 74.40s`。
+  - 最终真实 UE run:`out/renders/20260709T194212Z_4313e2b8/builtin_cube`,与确定性基准
+    六通道所有帧哈希一致;asset cleanup ok;turntable 4.000s;无遗留 UE 进程/RenderJobs 目录。
+  - doctor:本机与 l40s UE 5.5.4/GPU/远程哨兵正常;只有 NAS/DDC 性能与本机缺 `vulkaninfo`
+    的预期 WARN,不影响真实 Vulkan 渲染通过。
+- 正式结论:`docs/reviews/2026-07-10-formal-m1-render.md` = APPROVE;M1 DoD 完成,
+  当前主线切换到 M2 资产摄取。
