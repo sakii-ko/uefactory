@@ -66,11 +66,12 @@ def acquire_polyhaven_hdri(
                 f"HDRI download md5 mismatch: {source_url} "
                 f"expected={expected_md5} actual={actual_md5}"
             )
-        if tmp_path.stat().st_size != expected_size:
+        actual_size = tmp_path.stat().st_size
+        if actual_size != expected_size:
             tmp_path.unlink(missing_ok=True)
             raise RuntimeError(
                 f"HDRI download size mismatch: {source_url} "
-                f"expected={expected_size} actual={tmp_path.stat().st_size}"
+                f"expected={expected_size} actual={actual_size}"
             )
         tmp_path.replace(file_path)
 

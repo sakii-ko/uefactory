@@ -89,6 +89,50 @@ def test_acquire_polyhaven_hdri_reuses_checked_file(
     assert result.skipped is True
 
 
+def test_acquire_polyhaven_hdri_removes_partial_file_on_size_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    payload = b"fake-hdri"
+    md5 = hashlib.md5(payload, usedforsecurity=False).hexdigest()
+
+    def fake_urlopen(request: Any, timeout: int) -> _Response:
+        url = request.full_url
+        if url.endswith("/files/studio_small_03"):
+            return _Response(
+                json.dumps(
+                    {
+                        "hdri": {
+                            "1k": {
+                                "hdr": {
+                                    "url": "https://example.test/studio_small_03_1k.hdr",
+                                    "size": len(payload) + 1,
+                                    "md5": md5,
+                                }
+                            }
+                        }
+                    }
+                ).encode()
+            )
+        if url == "https://example.test/studio_small_03_1k.hdr":
+            return _Response(payload)
+        raise AssertionError(f"unexpected url: {url}")
+
+    monkeypatch.setattr(hdri.urllib.request, "urlopen", fake_urlopen)
+    settings = Settings(project_root=tmp_path, data_dir=tmp_path / "data")
+    file_path = settings.data_dir / "hdri/studio_small_03_1k.hdr"
+    partial_path = file_path.with_suffix(file_path.suffix + ".part")
+
+    with pytest.raises(
+        RuntimeError,
+        match=rf"HDRI download size mismatch: .* expected={len(payload) + 1} actual={len(payload)}",
+    ):
+        hdri.acquire_polyhaven_hdri(settings=settings)
+
+    assert not partial_path.exists()
+    assert not file_path.exists()
+
+
 class _Response(io.BytesIO):
     def __enter__(self) -> _Response:
         return self
