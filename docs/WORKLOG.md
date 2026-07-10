@@ -1029,3 +1029,45 @@ REVIEW REQUESTED: feat/m1-render 43d2163
 - release 文档落地后的全量门禁再次通过：100 files formatted、Mypy 91 source files 全绿，
   `675 passed,2 deselected in 139.12s`。
 - 本节状态为 `REVIEW READY`；正式 M2 全范围 review、merge 与 tag 仍须由后续追加记录关闭。
+
+## [2026-07-10] M2 正式 review #1:scene generation 闭包 — FIXED / RE-REVIEW PENDING
+
+- review 对象:`feat/m2-ingest @ a1fe3ed`;结论 `REQUEST-CHANGES`,BLOCKER=0、MAJOR=2、
+  MINOR/NIT=0。模型、许可、catalog、model package bytes/concurrency、8 场景现有证据与视觉均
+  通过；两个问题都位于 scene generation 的持续约束。
+- **MAJOR 1 已修复**:standalone `render_job(scene:<id>)` 原先未持 `scene_lock`,可能在 resolver
+  验证旧 generation 后与 build 交错。现 scene lease 覆盖 resolver → UE setup/render → host
+  artifacts；owning thread 可重入,其他 thread/process 非阻塞 busy；fork child 重置继承的 guard、
+  registry 和 handles。scene thumbnail 的外层 lease 与内部 render 可安全嵌套。
+- **MAJOR 2 已修复**:旧 scene package evidence 只 hash `inventory.assets` 推导的主文件,没有持续
+  拒绝/绑定 root 内额外文件。新 `ue_scene_package_bundle_v1` 递归扫描完整 scene root，要求每个
+  inventory `.uasset/.umap`，将同 basename 的 `.uexp/.ubulk/.uptnl` sidecar 纳入 digest，并拒绝
+  未知额外文件、缺失/空/非 regular、file/dir symlink 与路径逃逸；两次 scan + 两次 fd hash
+  检测采集中增删改。reload 后 evidence 在 finalize 不可逆提交后、catalog commit 前精确重算；
+  post-commit mismatch 写 durable failure,明确 `rollback=not_attempted_after_commit`,不碰 catalog。
+- 修复提交:`7da5c42 fix(scene): bind renders to complete package generations`，已推送远端。
+- 新增反例覆盖:
+  - same-thread reentrant、other-thread/process busy、fork guard reset/parent lease contention/release；
+  - standalone render 在 busy 时 resolver/UE/out 均未触达；
+  - extra known `.ubulk` 被完整记录且改 bytes 后拒绝，unknown extra、missing、empty、file/dir
+    symlink、FIFO、path escape、两次 hash 之间 mutation 全部拒绝；
+  - finalize 已 committed 后 package mismatch 不 rollback、不写 catalog,失败 manifest 记录不可逆边界。
+- 自动化:
+  - 首轮相关集:`76 passed`；scene/acquire/render 扩展集:`237 passed`。
+  - 最终 `TMPDIR=$PWD/data/tmp tools/check.sh`:102 files formatted、Mypy 93 source files、Ruff 全绿，
+    `691 passed,2 deselected in 82.64s`。
+- 当前 8 场景兼容性复验:
+  - immutable catalog 取当前 generation,新验证器逐 scene 双 scan/hash 全部通过；合计
+    `8 scenes / 566 package files / 353,907,808 bytes`，manifest/catalog digest 不变。
+  - 新 resolver 对 8/8 返回原 build/package digest 与完整 stencil inventory；因此无需为了约束增强
+    重建已正确闭包的 generation。
+- 真实 standalone scene render(直接验证 MAJOR 1 路径):
+  - 命令:`UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth TMPDIR=$PWD/data/tmp uv run uef render job out/scene_thumbnail_jobs/20260710T134406Z_fb55c5e9/bm_fantasy_diorama.yaml --database data/catalog.db --timeout-sec 1800`。
+  - run:`out/scene_thumbnails/20260710T160842Z_b5ab0f74/scene_bm_fantasy_diorama`；setup
+    143.643s、render 42.127s,两个 UE phase 未过滤 warning/error 均为 0；16 个 beauty/mask
+    decoded pixel hashes 与修复前 current generation 完全一致,contact sheet SHA-256 同为
+    `64f8ccdaa735d07c8a62fe349308377348f47b1260563885f2be5be389a8dc7a`。
+  - 执行代理亲眼复查新 contact sheet:8 视角主体完整、mask 对齐,无裁切/空帧/背景泄漏；渲染后
+    lease 可立即重取,`RenderJobs` 无残留。
+- 当前状态:两个 MAJOR 均有代码、反例、全量回归、现有 8 generation 字节复核和真实 UE/视觉
+  证据；等待独立 reviewer 对 `7da5c42` 之后的文档基线复核，未在复核前合并/tag。

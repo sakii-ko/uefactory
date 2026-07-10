@@ -149,8 +149,8 @@ artifact 保存完整闭包；thumbnail generation 保存闭包 digest；skip、
 同一个 `asset_id` 的 staging、import/reload/finalize、catalog 更新、thumbnail 和 model render 由
 `data/locks/assets/<asset_id>.lock` 的跨进程 `flock` 串行化。锁在 owning thread 内可重入，但其他
 thread/process 只会得到明确 busy；busy 结果不得改写 catalog。fork child 会丢弃继承的 registry
-与 file handle，避免把父进程 guard 或 lease 误当成自己的锁。builtin 与 scene render 使用各自
-生命周期，不进入 model asset lock。
+与 file handle，避免把父进程 guard 或 lease 误当成自己的锁。builtin 不持 generation lock；
+scene render 使用下文独立的 scene lease，不进入 model asset lock。
 
 ### 2.5 “归一化”的实际边界
 
@@ -259,6 +259,16 @@ package bundle、actor/component inventory、逐 mesh transform/bounds 与 build
 它直接加载 persistent level，不把 scene 合成一个临时 model，不自动添加 floor。每个静态网格
 component 分配稳定 stencil，camera target/radius 来自 scene world bounds，最终将 build 与五个
 render artifacts 原子更新到同一 scene generation。
+
+scene package evidence 递归覆盖
+`ue/UEFBase/Content/UEF/Scenes/<scene_id>/` 的完整 regular-file tree。inventory 中每个 object 的
+`.uasset/.umap` 是必需子集；同 basename 的 `.uexp/.ubulk/.uptnl` sidecar 也进入证据，其他未知
+文件、缺失/空/非 regular 文件、file/dir symlink 与路径逃逸均 fail closed。收集器执行两次目录
+扫描和两次安全文件 hash；reload 后的 approved evidence 必须与 finalize 不可逆提交后、catalog
+commit 前的重算结果完全相同。standalone `render job scene:<id>` 也会在 resolver 前取得
+`data/locks/scenes/<scene_id>.lock` 并持有到 UE setup/render 与 host artifacts 完成，避免验证旧
+generation 却加载新 package。scene lease 只允许 owning thread 重入，其他 thread/process busy；
+fork child 清空继承 registry/handle 后重新竞争。
 
 当前开放许可验收集有 8 个 level；research-only/NC SceneSpec 不属于开放集，不能因文件可读取
 就改写许可层级。
