@@ -191,6 +191,13 @@ def _write_ue_manifest(job: dict[str, object], meshes: list[dict[str, object]]) 
                 },
             }
         )
+        project_root = Path(str(job["source_file"])).parents[1]
+        for item in imported_objects:
+            object_path = str(item["object_path"])
+            relative_package = object_path.removeprefix("/Game/").partition(".")[0]
+            package_file = project_root / "ue/UEFBase/Content" / f"{relative_package}.uasset"
+            package_file.parent.mkdir(parents=True, exist_ok=True)
+            package_file.write_bytes(f"package bytes: {object_path}".encode())
     if job["job"] == "finalize_ingested_asset":
         payload.update({"transaction_state": "committed", "removed_backup": False})
     path.write_text(json.dumps(payload), encoding="utf-8")
@@ -301,6 +308,9 @@ def test_ingest_asset_runs_import_then_independent_reload_validation(
     assert manifest["source_structure_sha256"] == jobs[0]["source_structure_sha256"]
     assert manifest["requested_normalization"] == requested_normalization
     assert manifest["quality"]["checks"]["bounds_max_extent_cm"]["actual"] == 200.0
+    assert manifest["ue_package_bundle"]["policy"] == "ue_ingested_package_bundle_v1"
+    assert len(manifest["ue_package_bundle"]["files"]) == 3
+    assert len(manifest["ue_package_bundle"]["package_bundle_sha256"]) == 64
 
 
 def _write_inspect_manifest(

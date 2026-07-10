@@ -22,6 +22,7 @@ from uefactory.ingest.batch_report import (
     create_batch_report,
 )
 from uefactory.ingest.executor import IngestExecutionError, IngestResult, ingest_asset
+from uefactory.ingest.package_evidence import is_valid_package_bundle_evidence
 from uefactory.ingest.quality import (
     QUALITY_RULESET_VERSION,
     IngestQualityError,
@@ -113,11 +114,8 @@ def ingest_batch(
                 require_texture_references=require_texture_references,
             )
             existing = catalog.get_asset(asset.asset_id)
-            valid_existing_import = (
-                existing is not None
-                and existing.sha256 == staged.content_sha256
-                and existing.status in {"imported", "render_ok"}
-                and _has_valid_import_completion(
+            active_ue_package_bundle_sha256 = (
+                _valid_import_package_bundle_sha256(
                     catalog=catalog,
                     asset_id=asset.asset_id,
                     expected_bundle_sha256=staged.bundle_sha256,
@@ -129,9 +127,17 @@ def ingest_batch(
                     expected_quality_policy=quality_policy,
                     project_root=settings.project_root,
                 )
+                if existing is not None
+                and existing.sha256 == staged.content_sha256
+                and existing.status in {"imported", "render_ok"}
+                else None
+            )
+            valid_existing_import = (
+                existing is not None and active_ue_package_bundle_sha256 is not None
             )
             if valid_existing_import:
                 assert existing is not None
+                assert active_ue_package_bundle_sha256 is not None
                 thumbnail_complete = (
                     existing.status == "render_ok"
                     and _has_valid_thumbnail_completion(
@@ -140,6 +146,7 @@ def ingest_batch(
                         expected_bundle_sha256=staged.bundle_sha256,
                         expected_content_sha256=staged.content_sha256,
                         expected_normalization=asset.normalization.as_dict(),
+                        expected_ue_package_bundle_sha256=(active_ue_package_bundle_sha256),
                         project_root=settings.project_root,
                     )
                 )
@@ -258,6 +265,20 @@ def ingest_batch(
                 raise RuntimeError(
                     f"UE ingest manifest does not contain passed {QUALITY_RULESET_VERSION} quality"
                 )
+            imported_paths = ue_manifest.get("imported_object_paths")
+            package_evidence = ue_manifest.get("ue_package_bundle")
+            if (
+                not isinstance(imported_paths, list)
+                or not imported_paths
+                or any(not isinstance(path, str) for path in imported_paths)
+                or not is_valid_package_bundle_evidence(
+                    settings.project_root,
+                    asset_id=asset.asset_id,
+                    imported_object_paths=imported_paths,
+                    evidence=package_evidence,
+                )
+            ):
+                raise RuntimeError("UE ingest manifest package byte evidence is invalid")
             meshes = ue_manifest.get("static_meshes")
             if not isinstance(meshes, list) or len(meshes) != 1:
                 raise RuntimeError(
@@ -307,6 +328,7 @@ def ingest_batch(
                     "material_postprocess_policy": expected_postprocess_policy,
                     "source_structure": staged.source_structure,
                     "source_structure_sha256": staged.source_structure_sha256,
+                    "ue_package_bundle": package_evidence,
                 },
                 sha256=_sha256(ingest_result.manifest_path),
             )
@@ -555,7 +577,7 @@ def _recover_failed_import_metadata(
     return object_path, triangle_count, material_count
 
 
-def _has_valid_import_completion(
+def _valid_import_package_bundle_sha256(
     *,
     catalog: Catalog,
     asset_id: str,
@@ -567,7 +589,7 @@ def _has_valid_import_completion(
     expected_source_structure_sha256: str,
     expected_quality_policy: dict[str, bool],
     project_root: Path,
-) -> bool:
+) -> str | None:
     for artifact in catalog.list_artifacts(asset_id=asset_id):
         if artifact.kind != "import_manifest":
             continue
@@ -640,18 +662,25 @@ def _has_valid_import_completion(
         ):
             continue
         imported_paths = payload.get("imported_object_paths")
-        if not isinstance(imported_paths, list) or not imported_paths:
-            continue
-        if all(
-            isinstance(object_path, str)
-            and _is_regular_project_file(
-                project_root,
-                _ue_package_file(project_root, object_path),
-            )
-            for object_path in imported_paths
+        package_evidence = payload.get("ue_package_bundle")
+        if (
+            not isinstance(imported_paths, list)
+            or not imported_paths
+            or any(not isinstance(path, str) for path in imported_paths)
+            or artifact.params.get("ue_package_bundle") != package_evidence
         ):
-            return True
-    return False
+            continue
+        if is_valid_package_bundle_evidence(
+            project_root,
+            asset_id=asset_id,
+            imported_object_paths=imported_paths,
+            evidence=package_evidence,
+        ):
+            assert isinstance(package_evidence, dict)
+            package_bundle_sha256 = package_evidence.get("package_bundle_sha256")
+            if isinstance(package_bundle_sha256, str):
+                return package_bundle_sha256
+    return None
 
 
 def _exception_manifest_path(error: Exception) -> Path | None:
@@ -686,6 +715,7 @@ def _has_valid_thumbnail_completion(
     expected_bundle_sha256: str,
     expected_content_sha256: str,
     expected_normalization: dict[str, str | float],
+    expected_ue_package_bundle_sha256: str,
     project_root: Path,
 ) -> bool:
     required = {
@@ -706,6 +736,7 @@ def _has_valid_thumbnail_completion(
             artifact.params,
             expected_bundle_sha256=expected_bundle_sha256,
             expected_normalization=expected_normalization,
+            expected_ue_package_bundle_sha256=expected_ue_package_bundle_sha256,
         ):
             continue
         path = project_root / artifact.path
@@ -721,6 +752,7 @@ def _has_valid_thumbnail_completion(
             expected_bundle_sha256=expected_bundle_sha256,
             expected_content_sha256=expected_content_sha256,
             expected_normalization=expected_normalization,
+            expected_ue_package_bundle_sha256=expected_ue_package_bundle_sha256,
             expected_import_manifest=str(
                 artifacts["thumbnail_render_manifest"].params["import_manifest"]
             ),
@@ -738,6 +770,7 @@ def _valid_thumbnail_artifact_params(
     *,
     expected_bundle_sha256: str,
     expected_normalization: dict[str, str | float],
+    expected_ue_package_bundle_sha256: str,
 ) -> bool:
     return (
         params.get("schema_version") == 1
@@ -747,6 +780,7 @@ def _valid_thumbnail_artifact_params(
         and params.get("lighting") == "three_point"
         and params.get("subject_stencil_id") == 1
         and params.get("bundle_sha256") == expected_bundle_sha256
+        and params.get("ue_package_bundle_sha256") == expected_ue_package_bundle_sha256
         and isinstance(params.get("selected_view_index"), int)
         and not isinstance(params.get("selected_view_index"), bool)
         and 0 <= params["selected_view_index"] < 8
@@ -764,6 +798,7 @@ def _valid_thumbnail_render_manifest(
     expected_bundle_sha256: str,
     expected_content_sha256: str,
     expected_normalization: dict[str, str | float],
+    expected_ue_package_bundle_sha256: str,
     expected_import_manifest: str,
     expected_selected_view_index: int,
     artifact_ids: set[str],
@@ -791,6 +826,7 @@ def _valid_thumbnail_render_manifest(
         and asset.get("asset_id") == asset_id
         and asset.get("bundle_sha256") == expected_bundle_sha256
         and asset.get("content_sha256") == expected_content_sha256
+        and asset.get("ue_package_bundle_sha256") == expected_ue_package_bundle_sha256
         and asset.get("import_manifest") == expected_import_manifest
         and isinstance(normalization, dict)
         and normalization.get("request") == expected_normalization
@@ -809,6 +845,7 @@ def _valid_thumbnail_render_manifest(
         and commit.get("asset_id") == asset_id
         and commit.get("target_status") == "render_ok"
         and commit.get("bundle_sha256") == expected_bundle_sha256
+        and commit.get("ue_package_bundle_sha256") == expected_ue_package_bundle_sha256
         and commit.get("thumbnail_preset") == THUMBNAIL_PRESET
         and commit.get("selected_view_index") == expected_selected_view_index
         and commit.get("requested_normalization") == expected_normalization
@@ -858,14 +895,6 @@ def _thumbnail_failure_result(
             "phase": "thumbnail",
         },
     )
-
-
-def _ue_package_file(project_root: Path, object_path: str) -> Path:
-    package_path = object_path.partition(".")[0]
-    if not package_path.startswith("/Game/"):
-        return project_root / "__invalid_ue_package__"
-    relative = package_path.removeprefix("/Game/")
-    return project_root / "ue/UEFBase/Content" / f"{relative}.uasset"
 
 
 def _is_regular_project_file(project_root: Path, path: Path) -> bool:

@@ -122,6 +122,7 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
                 "asset": {
                     "import_manifest": "out/ingest/test_asset/manifest.json",
                     "bundle_sha256": "b" * 64,
+                    "ue_package_bundle_sha256": "c" * 64,
                     "normalization": {"request": requested_normalization},
                 },
             }
@@ -180,6 +181,7 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
     }
     manifest = json.loads(render_manifest.read_text(encoding="utf-8"))
     assert manifest["catalog_commit"]["target_status"] == "render_ok"
+    assert manifest["catalog_commit"]["ue_package_bundle_sha256"] == "c" * 64
     assert set(manifest["catalog_commit"]["artifact_ids"]) == {
         item.artifact_id for item in artifacts
     }
@@ -189,6 +191,7 @@ def test_thumbnail_catalog_asset_commits_render_and_artifacts_atomically(
         item.params["requested_normalization"] == requested_normalization for item in artifacts
     )
     assert all(item.params["bundle_sha256"] == "b" * 64 for item in artifacts)
+    assert all(item.params["ue_package_bundle_sha256"] == "c" * 64 for item in artifacts)
 
 
 def test_black_background_consistency_rejects_non_stenciled_foreground(

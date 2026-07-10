@@ -18,6 +18,7 @@ from uefactory.core.ingest_contracts import (
     IMPORT_MANIFEST_SCHEMA_VERSION,
 )
 from uefactory.core.paths import utc_timestamp
+from uefactory.ingest.package_evidence import collect_package_bundle_evidence
 from uefactory.ingest.quality import IngestQualityError, require_static_mesh_quality
 from uefactory.ingest.source_structure import (
     SourceStructureEvidence,
@@ -368,6 +369,13 @@ def ingest_asset(
             _write_json(manifest_path, manifest)
             raise
         manifest["reload_validation"]["status"] = "ok"
+        phase = "package_bundle_evidence"
+        manifest["ue_package_bundle"] = collect_package_bundle_evidence(
+            settings.project_root,
+            asset_id=asset_id,
+            imported_object_paths=imported_object_paths,
+        )
+        _assert_hashes_unchanged(initial_hashes, source_file, hash_root, hash_files)
         _write_json(manifest_path, manifest)
     except BaseException as exc:
         cleanup = _rollback_transaction(

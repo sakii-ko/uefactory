@@ -20,6 +20,7 @@ from uefactory.catalog import (
 )
 from uefactory.core.config import Settings
 from uefactory.core.ingest_contracts import QUALITY_CHECK_NAMES
+from uefactory.ingest.package_evidence import collect_package_bundle_evidence
 from uefactory.ingest.source_structure import inspect_source_structure
 from uefactory.render.job import (
     _canonical_digest,
@@ -173,6 +174,11 @@ def test_render_asset_payload_resolves_catalog_manifest_and_packages(tmp_path: P
         encoding="utf-8",
     )
     source_structure = inspect_source_structure(source)
+    package_evidence = collect_package_bundle_evidence(
+        settings.project_root,
+        asset_id="test_asset",
+        imported_object_paths=[object_path],
+    )
     import_manifest.write_text(
         json.dumps(
             {
@@ -186,6 +192,7 @@ def test_render_asset_payload_resolves_catalog_manifest_and_packages(tmp_path: P
                 "bundle_sha256": "b" * 64,
                 "source_structure": source_structure.payload,
                 "source_structure_sha256": source_structure.sha256,
+                "ue_package_bundle": package_evidence,
                 "quality": {
                     "ruleset_version": "m2_static_mesh_v2",
                     "policy": {
@@ -253,6 +260,7 @@ def test_render_asset_payload_resolves_catalog_manifest_and_packages(tmp_path: P
                 "material_postprocess_policy": "not_applicable",
                 "source_structure": source_structure.payload,
                 "source_structure_sha256": source_structure.sha256,
+                "ue_package_bundle": package_evidence,
             },
             sha256=hashlib.sha256(import_manifest.read_bytes()).hexdigest(),
         ),
@@ -263,10 +271,15 @@ def test_render_asset_payload_resolves_catalog_manifest_and_packages(tmp_path: P
     assert payload["kind"] == "catalog"
     assert payload["mesh_path"] == object_path
     assert payload["bundle_sha256"] == "b" * 64
+    assert payload["ue_package_bundle_sha256"] == package_evidence["package_bundle_sha256"]
     assert payload["preserve_materials"] is True
     assert payload["actor_scale"] == [2.0, 2.0, 2.0]
     assert payload["actor_location_cm"] == [0.0, 0.0, 0.0]
     assert payload["camera_target_cm"] == [0.0, 0.0, 200.0]
+
+    package.write_bytes(b"tampered uasset bytes")
+    with pytest.raises(RuntimeError, match="no valid import manifest/package inventory"):
+        _render_asset_payload(settings, spec)
 
 
 def test_render_scene_payload_resolves_catalog_build_manifest_and_packages(

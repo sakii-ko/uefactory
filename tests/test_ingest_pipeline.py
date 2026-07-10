@@ -15,6 +15,7 @@ from PIL import Image
 from uefactory.catalog import ArtifactUpsert, AssetUpsert, Catalog
 from uefactory.core.config import Settings
 from uefactory.ingest.executor import IngestResult
+from uefactory.ingest.package_evidence import collect_package_bundle_evidence
 from uefactory.ingest.pipeline import ingest_batch
 from uefactory.ingest.quality import (
     QUALITY_RULESET_VERSION,
@@ -196,6 +197,16 @@ def _fake_ingest_result(
         {"object_path": texture_path, "class": "Texture2D"},
     ]
     imported_paths = tuple(str(item["object_path"]) for item in imported_objects)
+    for object_path in imported_paths:
+        relative_package = object_path.removeprefix("/Game/").partition(".")[0]
+        package_file = settings.project_root / "ue/UEFBase/Content" / f"{relative_package}.uasset"
+        package_file.parent.mkdir(parents=True, exist_ok=True)
+        package_file.write_bytes(f"uasset fixture: {object_path}".encode())
+    package_evidence = collect_package_bundle_evidence(
+        settings.project_root,
+        asset_id=asset_id,
+        imported_object_paths=imported_paths,
+    )
     if source_structure is None or source_structure_sha256 is None:
         staged_sources = tuple((settings.data_dir / "raw/local" / asset_id).glob(f"{asset_id}.*"))
         assert len(staged_sources) == 1
@@ -233,6 +244,7 @@ def _fake_ingest_result(
                 "source_format": source_structure["source_format"],
                 "source_structure": source_structure,
                 "source_structure_sha256": source_structure_sha256,
+                "ue_package_bundle": package_evidence,
                 "imported_object_paths": list(imported_paths),
                 "imported_objects": imported_objects,
                 "texture_count": 1,
@@ -245,11 +257,6 @@ def _fake_ingest_result(
         ),
         encoding="utf-8",
     )
-    for object_path in imported_paths:
-        relative_package = object_path.removeprefix("/Game/").partition(".")[0]
-        package_file = settings.project_root / "ue/UEFBase/Content" / f"{relative_package}.uasset"
-        package_file.parent.mkdir(parents=True, exist_ok=True)
-        package_file.write_bytes(b"uasset fixture")
     return IngestResult(
         run_dir=run_dir,
         manifest_path=manifest_path,
@@ -276,6 +283,9 @@ def _commit_fake_thumbnail(
         item for item in catalog.list_artifacts(asset_id=asset_id) if item.kind == "import_manifest"
     )
     bundle_sha256 = str(import_artifact.params["bundle_sha256"])
+    package_evidence = import_artifact.params["ue_package_bundle"]
+    assert isinstance(package_evidence, dict)
+    ue_package_bundle_sha256 = str(package_evidence["package_bundle_sha256"])
     requested_normalization = dict(import_artifact.params["requested_normalization"])
     run_dir = settings.project_root / "out/fake_thumbnails" / f"{asset_id}_{ordinal}"
     run_dir.mkdir(parents=True)
@@ -305,6 +315,7 @@ def _commit_fake_thumbnail(
                     "kind": "catalog",
                     "asset_id": asset_id,
                     "bundle_sha256": bundle_sha256,
+                    "ue_package_bundle_sha256": ue_package_bundle_sha256,
                     "content_sha256": record.sha256,
                     "import_manifest": import_artifact.path,
                     "normalization": {"request": requested_normalization},
@@ -327,6 +338,7 @@ def _commit_fake_thumbnail(
                     "asset_id": asset_id,
                     "target_status": "render_ok",
                     "bundle_sha256": bundle_sha256,
+                    "ue_package_bundle_sha256": ue_package_bundle_sha256,
                     "thumbnail_preset": "catalog_thumbnail_v1",
                     "selected_view_index": 0,
                     "requested_normalization": requested_normalization,
@@ -371,6 +383,7 @@ def _commit_fake_thumbnail(
                 "subject_stencil_id": 1,
                 "selected_view_index": 0,
                 "bundle_sha256": bundle_sha256,
+                "ue_package_bundle_sha256": ue_package_bundle_sha256,
                 "requested_normalization": requested_normalization,
                 "import_manifest": import_artifact.path,
             },
@@ -470,6 +483,7 @@ def test_ingest_batch_imports_all_assets_and_second_run_skips_idempotently(
         assert artifacts[0].params["schema_version"] == 2
         assert artifacts[0].params["source_structure"]["source_format"] == "glb"
         assert len(artifacts[0].params["source_structure_sha256"]) == 64
+        assert len(artifacts[0].params["ue_package_bundle"]["package_bundle_sha256"]) == 64
         import_payload = json.loads(
             (settings.project_root / artifacts[0].path).read_text(encoding="utf-8")
         )
@@ -478,6 +492,7 @@ def test_ingest_batch_imports_all_assets_and_second_run_skips_idempotently(
             import_payload["source_structure_sha256"]
             == artifacts[0].params["source_structure_sha256"]
         )
+        assert import_payload["ue_package_bundle"] == artifacts[0].params["ue_package_bundle"]
 
     first_manifest = json.loads(first.manifest_path.read_text(encoding="utf-8"))
     second_manifest = json.loads(second.manifest_path.read_text(encoding="utf-8"))
@@ -693,6 +708,46 @@ def test_ingest_batch_repairs_missing_package_instead_of_skipping(
     assert repaired.assets[0].status == "imported"
     assert package.is_file()
     assert calls == ["repair_asset", "repair_asset"]
+
+
+def test_ingest_batch_reimports_tampered_package_bytes_instead_of_skipping(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    settings = _settings(tmp_path)
+    manifest_path = _write_batch_manifest(settings.project_root, ("tampered_package",))
+    calls: list[str] = []
+
+    def fake_ingest_asset(**kwargs: Any) -> IngestResult:
+        asset_id = str(kwargs["asset_id"])
+        calls.append(asset_id)
+        return _fake_ingest_result(
+            settings,
+            asset_id,
+            [_mesh(asset_id)],
+            bundle_sha256=str(kwargs["expected_bundle_sha256"]),
+            content_sha256=str(kwargs["expected_content_sha256"]),
+        )
+
+    monkeypatch.setattr("uefactory.ingest.pipeline.ingest_asset", fake_ingest_asset)
+    first = ingest_batch(settings=settings, manifest_path=manifest_path)
+    package = (
+        settings.project_root
+        / "ue/UEFBase/Content/UEF/Ingested/tampered_package/SM_tampered_package.uasset"
+    )
+    package.write_bytes(b"tampered package generation")
+
+    repaired = ingest_batch(settings=settings, manifest_path=manifest_path)
+    repeated = ingest_batch(settings=settings, manifest_path=manifest_path)
+
+    assert first.assets[0].status == "imported"
+    assert repaired.assets[0].status == "imported"
+    assert repeated.assets[0].status == "skipped"
+    assert calls == ["tampered_package", "tampered_package"]
+    catalog = Catalog(repaired.catalog_path, project_root=settings.project_root)
+    artifact = catalog.list_artifacts(asset_id="tampered_package")[0]
+    payload = json.loads((settings.project_root / artifact.path).read_text(encoding="utf-8"))
+    assert artifact.params["ue_package_bundle"] == payload["ue_package_bundle"]
 
 
 def test_ingest_batch_reimports_stale_quality_instead_of_skipping(
@@ -1117,6 +1172,27 @@ def test_ingest_batch_rejects_obsolete_and_forged_thumbnail_groups(
     catalog = Catalog(first.catalog_path, project_root=settings.project_root)
 
     for artifact in catalog.list_artifacts(asset_id="strict_thumbnail"):
+        if artifact.kind.startswith("thumbnail_"):
+            catalog.upsert_artifact(
+                ArtifactUpsert(
+                    artifact_id=artifact.artifact_id,
+                    asset_id=artifact.asset_id,
+                    kind=artifact.kind,
+                    path=artifact.path,
+                    params={
+                        **artifact.params,
+                        "ue_package_bundle_sha256": "0" * 64,
+                    },
+                    sha256=artifact.sha256,
+                )
+            )
+    generation_repaired = ingest_batch(
+        settings=settings,
+        manifest_path=manifest_path,
+        render_thumbnails=True,
+    )
+
+    for artifact in catalog.list_artifacts(asset_id="strict_thumbnail"):
         catalog.upsert_artifact(
             ArtifactUpsert(
                 artifact_id=artifact.artifact_id,
@@ -1134,7 +1210,7 @@ def test_ingest_batch_rejects_obsolete_and_forged_thumbnail_groups(
     )
 
     for artifact in catalog.list_artifacts(asset_id="strict_thumbnail"):
-        if artifact.artifact_id.endswith("_2"):
+        if artifact.artifact_id.endswith("_3"):
             catalog.upsert_artifact(
                 ArtifactUpsert(
                     artifact_id=artifact.artifact_id,
@@ -1151,9 +1227,10 @@ def test_ingest_batch_rejects_obsolete_and_forged_thumbnail_groups(
         render_thumbnails=True,
     )
 
+    assert generation_repaired.assets[0].status == "render_ok"
     assert obsolete_repaired.assets[0].status == "render_ok"
     assert forged_repaired.assets[0].status == "render_ok"
-    assert thumbnail_calls == ["strict_thumbnail"] * 3
+    assert thumbnail_calls == ["strict_thumbnail"] * 4
 
 
 def test_ingest_batch_marks_batch_failed_when_final_report_fails(

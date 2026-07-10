@@ -856,6 +856,7 @@ def _render_asset_payload(
 ) -> dict[str, Any]:
     # Import lazily so importing scene specs cannot recurse through
     # ingest.pipeline -> render.thumbnails -> render.job.
+    from uefactory.ingest.package_evidence import is_valid_package_bundle_evidence
     from uefactory.ingest.source_structure import is_valid_source_structure_evidence
 
     if spec.asset_id == "builtin:cube":
@@ -911,6 +912,7 @@ def _render_asset_payload(
         record_source_format = Path(record.raw_path).suffix.lower().removeprefix(".")
         source_structure = manifest.get("source_structure")
         source_structure_sha256 = manifest.get("source_structure_sha256")
+        package_evidence = manifest.get("ue_package_bundle")
         if (
             manifest.get("schema_version") != IMPORT_MANIFEST_SCHEMA_VERSION
             or artifact.params.get("schema_version") != IMPORT_ARTIFACT_SCHEMA_VERSION
@@ -927,6 +929,7 @@ def _render_asset_payload(
             != material_postprocess.get("policy")
             or artifact.params.get("source_structure") != source_structure
             or artifact.params.get("source_structure_sha256") != source_structure_sha256
+            or artifact.params.get("ue_package_bundle") != package_evidence
             or not isinstance(source_format, str)
             or source_format != record_source_format
             or not is_valid_source_structure_evidence(
@@ -971,17 +974,19 @@ def _render_asset_payload(
         ):
             continue
         imported_paths = manifest.get("imported_object_paths")
-        if not isinstance(imported_paths, list) or not imported_paths:
-            continue
-        if not all(
-            isinstance(path, str)
-            and _regular_project_file(
+        if (
+            not isinstance(imported_paths, list)
+            or not imported_paths
+            or any(not isinstance(path, str) for path in imported_paths)
+            or not is_valid_package_bundle_evidence(
                 settings.project_root,
-                _ue_object_file(settings.project_root, path),
+                asset_id=spec.asset_id,
+                imported_object_paths=imported_paths,
+                evidence=package_evidence,
             )
-            for path in imported_paths
         ):
             continue
+        assert isinstance(package_evidence, dict)
         geometry = _catalog_geometry_payload(
             mesh.get("bounds_cm"),
             resolution=spec.camera.resolution,
@@ -995,6 +1000,7 @@ def _render_asset_payload(
             "bundle_sha256": bundle_sha256,
             "content_sha256": record.sha256,
             "import_manifest": artifact.path,
+            "ue_package_bundle_sha256": package_evidence["package_bundle_sha256"],
             "preserve_materials": True,
             **geometry,
         }

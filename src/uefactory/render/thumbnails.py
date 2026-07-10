@@ -103,12 +103,16 @@ def thumbnail_catalog_asset(
         render_asset.get("import_manifest") if isinstance(render_asset, dict) else None
     )
     bundle_sha256 = render_asset.get("bundle_sha256") if isinstance(render_asset, dict) else None
+    ue_package_bundle_sha256 = (
+        render_asset.get("ue_package_bundle_sha256") if isinstance(render_asset, dict) else None
+    )
     if (
         not isinstance(requested_normalization, dict)
         or not isinstance(import_manifest, str)
         or not isinstance(bundle_sha256, str)
+        or not isinstance(ue_package_bundle_sha256, str)
     ):
-        raise RuntimeError("Thumbnail render is missing import/normalization provenance")
+        raise RuntimeError("Thumbnail render is missing import/package/normalization provenance")
     planned = (
         ("thumb_beauty", "thumbnail_beauty", thumbnail_path),
         ("thumb_mask", "thumbnail_mask", subject_mask_path),
@@ -127,6 +131,7 @@ def thumbnail_catalog_asset(
         "thumbnail_preset": THUMBNAIL_PRESET,
         "selected_view_index": selected_view_index,
         "bundle_sha256": bundle_sha256,
+        "ue_package_bundle_sha256": ue_package_bundle_sha256,
         "requested_normalization": requested_normalization,
         "import_manifest": import_manifest,
     }
@@ -156,6 +161,7 @@ def thumbnail_catalog_asset(
         "subject_stencil_id": 1,
         "selected_view_index": selected_view_index,
         "bundle_sha256": bundle_sha256,
+        "ue_package_bundle_sha256": ue_package_bundle_sha256,
         "requested_normalization": requested_normalization,
         "import_manifest": import_manifest,
     }
