@@ -5,6 +5,7 @@ import json
 import subprocess
 import threading
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,32 @@ def test_hdri_payload_uses_a_separate_beauty_sequence(tmp_path: Path) -> None:
         f"/Game/UEF/RenderJobs/{run_id}/UEF_RenderJobBeauty_{run_id}.UEF_RenderJobBeauty_{run_id}"
     )
     assert payload["asset"]["kind"] == "builtin"
+    assert payload["camera"]["distance_multiplier"] == 1.0
+    assert payload["asset"]["camera_distance_multiplier"] == 1.0
+
+
+def test_job_camera_distance_multiplier_scales_builtin_geometry(tmp_path: Path) -> None:
+    _, job_path = _local_render_fixture(tmp_path)
+    job_path.write_text(
+        job_path.read_text(encoding="utf-8").replace(
+            "  resolution: [64, 64]",
+            "  resolution: [64, 64]\n  distance_multiplier: 0.6",
+        ),
+        encoding="utf-8",
+    )
+    spec = load_jobspec(job_path)
+
+    payload = _ue_job_payload_with_lighting(
+        spec=spec,
+        run_id="20260711T120000Z_fixture",
+        run_dir=tmp_path / "out",
+        sequence_path="/Game/Fixture.Sequence",
+        lighting={"preset": "three_point", "hdri": None},
+    )
+
+    assert payload["camera"]["distance_multiplier"] == 0.6
+    assert payload["asset"]["camera_radius_cm"] == 252.0
+    assert payload["asset"]["camera_distance_multiplier"] == 0.6
 
 
 def test_catalog_geometry_centers_grounds_and_frames_asset() -> None:
@@ -120,6 +147,31 @@ def test_catalog_geometry_applies_requested_uniform_scale_to_logical_framing() -
     assert payload["actor_location_cm"] == [-20.0, -100.0, 10.0]
     assert payload["camera_target_cm"] == [0.0, 0.0, 100.0]
     assert payload["normalization"]["logical_size_cm"] == [80.0, 120.0, 200.0]
+
+
+def test_catalog_geometry_applies_job_camera_distance_multiplier() -> None:
+    base = _catalog_geometry_payload(
+        {
+            "min": [-10.0, -10.0, 0.0],
+            "max": [10.0, 10.0, 20.0],
+            "size": [20.0, 20.0, 20.0],
+        },
+        resolution=(512, 512),
+        horizontal_fov_deg=45.0,
+    )
+    closer = _catalog_geometry_payload(
+        {
+            "min": [-10.0, -10.0, 0.0],
+            "max": [10.0, 10.0, 20.0],
+            "size": [20.0, 20.0, 20.0],
+        },
+        resolution=(512, 512),
+        horizontal_fov_deg=45.0,
+        distance_multiplier=0.6,
+    )
+
+    assert closer["camera_radius_cm"] == pytest.approx(base["camera_radius_cm"] * 0.6)
+    assert closer["camera_distance_multiplier"] == 0.6
 
 
 def test_catalog_geometry_rejects_inconsistent_reported_size() -> None:
@@ -451,6 +503,23 @@ def test_render_scene_payload_rejects_missing_map_package(tmp_path: Path) -> Non
 
     with pytest.raises(RuntimeError, match="scene map package is missing"):
         _render_asset_payload(settings, spec)
+
+
+def test_render_scene_payload_combines_scene_and_job_camera_multipliers(
+    tmp_path: Path,
+) -> None:
+    settings, spec, _, _, _ = _scene_render_fixture(tmp_path)
+    closer_spec = replace(
+        spec,
+        camera=replace(spec.camera, distance_multiplier=0.6),
+    )
+
+    payload = _render_asset_payload(settings, closer_spec)
+
+    assert payload["scene_camera_distance_multiplier"] == 1.25
+    assert payload["job_camera_distance_multiplier"] == 0.6
+    assert payload["camera_distance_multiplier"] == 0.75
+    assert payload["camera_radius_cm"] == pytest.approx(795.721851 * 0.6, abs=1e-6)
 
 
 def test_render_scene_payload_rejects_missing_mesh_package(tmp_path: Path) -> None:

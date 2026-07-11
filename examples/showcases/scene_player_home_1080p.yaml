@@ -1,0 +1,17 @@
+job: render
+assets:
+  - scene:bm_player_home
+camera:
+  rig: orbit
+  views: 72
+  elevation_deg: 20.0
+  fov: 40.0
+  resolution: [1440, 1440]
+  distance_multiplier: 0.6
+lighting:
+  preset: three_point
+passes:
+  - beauty_lit
+  - object_mask
+output:
+  dir: out/showcase_source_renders

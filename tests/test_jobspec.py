@@ -33,6 +33,8 @@ def test_parse_jobspec_accepts_t13_orbit_cube() -> None:
     assert spec.asset_id == "builtin:cube"
     assert spec.camera.views == 8
     assert spec.camera.resolution == (640, 360)
+    assert spec.camera.distance_multiplier == 1.0
+    assert "distance_multiplier" not in spec.raw["camera"]
     assert spec.lighting.preset == "three_point"
     assert spec.passes == ("beauty_lit",)
     assert spec.output.dir == Path("out/renders")
@@ -45,6 +47,18 @@ def test_parse_jobspec_accepts_t14_all_passes() -> None:
     spec = parse_jobspec(raw, source_path=Path("examples/orbit8.yaml"))
 
     assert spec.passes == PASS_ORDER
+
+
+@pytest.mark.parametrize("value", [0.25, 0.6, 1, 4.0])
+def test_parse_jobspec_accepts_camera_distance_multiplier(value: float) -> None:
+    raw = valid_jobspec()
+    assert isinstance(raw["camera"], dict)
+    raw["camera"]["distance_multiplier"] = value
+
+    spec = parse_jobspec(raw)
+
+    assert spec.camera.distance_multiplier == float(value)
+    assert spec.raw["camera"]["distance_multiplier"] == value
 
 
 def test_parse_jobspec_accepts_one_catalog_asset_id() -> None:
@@ -104,6 +118,10 @@ def test_parse_jobspec_accepts_t15_none_lighting() -> None:
         ({"camera": {"elevation_deg": 90}}, "$.camera.elevation_deg"),
         ({"camera": {"fov": 9}}, "$.camera.fov"),
         ({"camera": {"resolution": [640]}}, "$.camera.resolution"),
+        ({"camera": {"distance_multiplier": 0.249}}, "$.camera.distance_multiplier"),
+        ({"camera": {"distance_multiplier": 4.001}}, "$.camera.distance_multiplier"),
+        ({"camera": {"distance_multiplier": float("inf")}}, "$.camera.distance_multiplier"),
+        ({"camera": {"distance_multiplier": float("nan")}}, "$.camera.distance_multiplier"),
         ({"assets": ["one", "two"]}, "$.assets"),
         ({"assets": ["Bad Asset"]}, "$.assets[0]"),
         ({"assets": ["catalog:chair"]}, "$.assets[0]"),

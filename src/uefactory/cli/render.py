@@ -9,9 +9,41 @@ from uefactory.cli._common import settings_from_context
 from uefactory.render.job import compare_job_outputs, render_job, render_job_remote
 from uefactory.render.jobspec import JobSpecError
 from uefactory.render.mrq_spike import compare_spike_luma, render_mrq_spike
+from uefactory.render.showcase import ShowcaseError, create_showcase
 from uefactory.render.smoke import render_smoke, render_smoke_remote
 
 render_app = typer.Typer(help="Render UEFactory jobs.")
+
+
+@render_app.command("showcase")
+def showcase_command(
+    ctx: typer.Context,
+    render_run_dir: Annotated[
+        Path,
+        typer.Argument(
+            resolve_path=False,
+            help="Verified render run directory, relative to the project root when needed.",
+        ),
+    ],
+    stage: Annotated[
+        str,
+        typer.Option("--stage", help="Lowercase milestone/stage slug for the showcase archive."),
+    ],
+) -> None:
+    settings = settings_from_context(ctx)
+    try:
+        result = create_showcase(
+            project_root=settings.project_root,
+            render_run_dir=render_run_dir,
+            stage=stage,
+        )
+    except ShowcaseError as exc:
+        typer.echo(f"Showcase failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"Showcase video: {result.video_path}")
+    typer.echo(f"Frames: {result.frame_count} at 24 fps")
+    typer.echo(f"Resolution: {result.resolution[0]}x{result.resolution[1]}")
+    typer.echo(f"Manifest: {result.manifest_path}")
 
 
 @render_app.command()

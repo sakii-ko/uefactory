@@ -504,6 +504,12 @@ def _read_half_rgba_exr(pass_name: str, frame_path: Path) -> tuple[Any, tuple[in
     return np.stack(arrays, axis=2), resolution
 
 
+def read_object_mask_exr(frame_path: Path) -> tuple[Any, tuple[int, int]]:
+    """Read one canonical half-float RGBA object-mask frame."""
+
+    return _read_half_rgba_exr("object_mask", frame_path)
+
+
 def _has_repeated_ocio_invalid_overlay(image: Image.Image) -> bool:
     np = import_module("numpy")
     pixels = np.asarray(image)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ class CameraSpec:
     elevation_deg: float
     fov: float
     resolution: tuple[int, int]
+    distance_multiplier: float
 
 
 @dataclass(frozen=True)
@@ -93,13 +95,22 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
             raise JobSpecError(str(exc)) from exc
 
     camera_raw = _mapping(root["camera"], "$.camera")
-    _require_keys(camera_raw, {"rig", "views", "elevation_deg", "fov", "resolution"}, "$.camera")
+    _require_keys(
+        camera_raw,
+        {"rig", "views", "elevation_deg", "fov", "resolution"},
+        "$.camera",
+        optional={"distance_multiplier"},
+    )
     camera = CameraSpec(
         rig=_enum(_string(camera_raw["rig"], "$.camera.rig"), {"orbit"}, "$.camera.rig"),
         views=_positive_int(camera_raw["views"], "$.camera.views"),
         elevation_deg=_number(camera_raw["elevation_deg"], "$.camera.elevation_deg"),
         fov=_number(camera_raw["fov"], "$.camera.fov"),
         resolution=_resolution(camera_raw["resolution"], "$.camera.resolution"),
+        distance_multiplier=_number(
+            camera_raw.get("distance_multiplier", 1.0),
+            "$.camera.distance_multiplier",
+        ),
     )
     if camera.views < 2:
         raise JobSpecError("$.camera.views: expected at least 2 for orbit render")
@@ -107,6 +118,11 @@ def parse_jobspec(raw: Any, *, source_path: Path | None = None) -> RenderJobSpec
         raise JobSpecError("$.camera.elevation_deg: expected value in [-89, 89]")
     if not 10.0 <= camera.fov <= 120.0:
         raise JobSpecError("$.camera.fov: expected value in [10, 120]")
+    if (
+        not math.isfinite(camera.distance_multiplier)
+        or not 0.25 <= camera.distance_multiplier <= 4.0
+    ):
+        raise JobSpecError("$.camera.distance_multiplier: expected finite value in [0.25, 4]")
 
     lighting_raw = _mapping(root["lighting"], "$.lighting")
     _require_keys(lighting_raw, {"preset"}, "$.lighting", optional={"hdri"})

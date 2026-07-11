@@ -875,6 +875,7 @@ def _ue_job_payload_with_lighting(
             "elevation_deg": spec.camera.elevation_deg,
             "fov": spec.camera.fov,
             "resolution": [width, height],
+            "distance_multiplier": spec.camera.distance_multiplier,
         },
         "frames": spec.frame_count,
         "job": spec.raw,
@@ -1034,6 +1035,7 @@ def _render_asset_payload(
             resolution=spec.camera.resolution,
             horizontal_fov_deg=spec.camera.fov,
             requested_normalization=requested_normalization,
+            distance_multiplier=spec.camera.distance_multiplier,
         )
         return {
             "kind": "catalog",
@@ -1233,7 +1235,8 @@ def _render_scene_payload(
             record.bounds,
             resolution=spec.camera.resolution,
             horizontal_fov_deg=spec.camera.fov,
-            distance_multiplier=float(distance_multiplier),
+            scene_distance_multiplier=float(distance_multiplier),
+            job_distance_multiplier=spec.camera.distance_multiplier,
         )
         expected_stencil_ids = list(range(1, int(inventory["static_mesh_actor_count"]) + 1))
         return {
@@ -1448,21 +1451,30 @@ def _scene_geometry_payload(
     *,
     resolution: tuple[int, int],
     horizontal_fov_deg: float,
-    distance_multiplier: float,
+    scene_distance_multiplier: float,
+    job_distance_multiplier: float,
 ) -> dict[str, Any]:
     base = _catalog_geometry_payload(
         bounds,
         resolution=resolution,
         horizontal_fov_deg=horizontal_fov_deg,
+        distance_multiplier=job_distance_multiplier,
     )
     canonical_bounds = base["bounds_cm"]
     minimum = canonical_bounds["min"]
     maximum = canonical_bounds["max"]
     target = [(float(low) + float(high)) / 2.0 for low, high in zip(minimum, maximum, strict=True)]
+    combined_distance_multiplier = scene_distance_multiplier * job_distance_multiplier
     return {
         "bounds_cm": canonical_bounds,
         "camera_target_cm": target,
-        "camera_radius_cm": round(float(base["camera_radius_cm"]) * distance_multiplier, 6),
+        "camera_radius_cm": round(
+            float(base["camera_radius_cm"]) * scene_distance_multiplier,
+            6,
+        ),
+        "camera_distance_multiplier": round(combined_distance_multiplier, 6),
+        "scene_camera_distance_multiplier": scene_distance_multiplier,
+        "job_camera_distance_multiplier": job_distance_multiplier,
         "camera_near_clip_cm": 0.1,
         "normalization": {
             "engine_unit": "centimeter",
@@ -1489,7 +1501,8 @@ def _builtin_render_asset_payload(spec: RenderJobSpec) -> dict[str, Any]:
         },
         "actor_location_cm": [0.0, 0.0, 0.0],
         "camera_target_cm": [0.0, 0.0, 0.0],
-        "camera_radius_cm": 420.0,
+        "camera_radius_cm": round(420.0 * spec.camera.distance_multiplier, 6),
+        "camera_distance_multiplier": spec.camera.distance_multiplier,
         "floor_location_z_cm": -52.5,
         "floor_scale_xy": 5.0,
     }
@@ -1501,7 +1514,15 @@ def _catalog_geometry_payload(
     resolution: tuple[int, int],
     horizontal_fov_deg: float,
     requested_normalization: dict[str, str | float] | None = None,
+    distance_multiplier: float = 1.0,
 ) -> dict[str, Any]:
+    if (
+        isinstance(distance_multiplier, bool)
+        or not isinstance(distance_multiplier, int | float)
+        or not math.isfinite(float(distance_multiplier))
+        or not 0.25 <= float(distance_multiplier) <= 4.0
+    ):
+        raise RuntimeError("Catalog camera distance_multiplier must be in [0.25, 4]")
     normalization_request = requested_normalization or {
         "source_units": "auto",
         "source_up_axis": "auto",
@@ -1561,13 +1582,16 @@ def _catalog_geometry_payload(
     horizontal_half = math.radians(horizontal_fov_deg) / 2.0
     vertical_half = math.atan(math.tan(horizontal_half) / aspect)
     limiting_half = min(horizontal_half, vertical_half)
-    camera_radius = max(10.0, sphere_radius / math.sin(limiting_half) * 1.2)
+    camera_radius = max(10.0, sphere_radius / math.sin(limiting_half) * 1.2) * float(
+        distance_multiplier
+    )
     return {
         "bounds_cm": {key: list(value) for key, value in vectors.items()},
         "actor_scale": [scale, scale, scale],
         "actor_location_cm": list(actor_location),
         "camera_target_cm": list(target),
         "camera_radius_cm": round(camera_radius, 6),
+        "camera_distance_multiplier": float(distance_multiplier),
         "camera_near_clip_cm": 0.1,
         "floor_location_z_cm": -2.5,
         "floor_scale_xy": max(1.0, max(scaled_size[0], scaled_size[1]) * 3.0 / 100.0),
