@@ -38,14 +38,20 @@ TMPDIR=$PWD/data/tmp UEF_DOCTOR_WRITE_TEST_MIB=8 .venv/bin/uef doctor
 TMPDIR=$PWD/data/tmp .venv/bin/uef render job examples/orbit8.yaml --timeout-sec 1800
 ```
 
-若要验证 HDRI 光照，先下载一个 CC0 小样例，再跑 HDRI job：
+若要验证 HDRI 光照，先通过统一 resource sync 获取、CPU 验证并原子发布一个 CC0 小样例，
+再跑 HDRI job：
 
 ```bash
-TMPDIR=$PWD/data/tmp .venv/bin/uef acquire hdri \
-  --asset-id studio_small_03 --resolution 1k
+TMPDIR=$PWD/data/tmp .venv/bin/uef acquire polyhaven-resources \
+  --kind hdri --source-id studio_small_03 --resolution 1k \
+  --database data/catalog.db --json
 TMPDIR=$PWD/data/tmp .venv/bin/uef render job \
   examples/orbit8_hdri.yaml --timeout-sec 1800
 ```
+
+`uef acquire hdri` 仍保留为单 HDRI 兼容入口；新流程应优先使用
+`uef acquire polyhaven-resources`，因为它同时维护 revisioned source bytes、validation evidence、
+failure journal、run receipt 与 schema v5 catalog cohort。
 
 远程 l40s 使用相同 JobSpec：
 
@@ -58,6 +64,26 @@ TMPDIR=$PWD/data/tmp .venv/bin/uef render job \
 成功后查看 `out/renders/<run_id>/builtin_cube/`：各 pass 下是 `frame_*.png` 或
 `frame_*.exr`，根目录包含 `manifest.json`、`contact_sheet.png`、`turntable.mp4` 和
 `index.html`。
+
+阶段性最高质量结果先用专用 JobSpec 生成高分辨率 beauty/mask cohort，再从经过验真的 render run
+生成独立 MP4 归档：
+
+```bash
+UEF_BLACKMYTH_ROOT=/home/chijw/workspace/projs/blackmyth \
+TMPDIR=$PWD/data/tmp .venv/bin/uef render job \
+  examples/showcases/scene_player_home_1080p.yaml \
+  --database data/catalog.db --timeout-sec 3600
+TMPDIR=$PWD/data/tmp .venv/bin/uef render showcase \
+  out/showcase_source_renders/<run_id>/scene_bm_player_home \
+  --stage m3_t3_1b
+```
+
+该命令只接受成功的 schema v3 render manifest、连续且 hash 匹配的至少 72 帧
+`beauty_lit` PNG、逐帧对应的 `object_mask` EXR，以及短边至少 1080 的偶数分辨率。单主体每帧
+foreground 必须 >=10%、bbox area >=18%、最小边缘余量 >=3%；静止、过小或裁切的 cohort 会在编码前
+拒绝。它会在
+`out/showcases/<stage>/<timestamp>_<asset>/` 原子写入 H.264/yuv420p/24 fps/faststart MP4 和
+包含归档 source manifest、beauty/mask 逐帧证据、license、git 与 ffprobe/hash 的 `manifest.json`。
 
 ## 导入 M2 模型集
 
@@ -128,7 +154,37 @@ TMPDIR=$PWD/data/tmp .venv/bin/uef scene thumbnail bm_fantasy_diorama \
 player home、cake house、old church ruins、thunderclap temple、两个 Zelda/Tilt Brush 场景和
 RPG low-poly arena。`bm_lys_piandian_research.yaml` 是明确的 research-only/NC 样例，不属于这
 8 个开放许可验收场景。构建生成持久 map 与逐 actor inventory，缩略图流程使用 scene bounds
-取景、禁止自动 floor，并将 build 与 render 产物按同一 generation 写入 schema v3 catalog。
+取景、禁止自动 floor，并将 build 与 render 产物按同一 generation 写入 schema v5 catalog。
+
+## 同步 Poly Haven HDRI/PBR resources
+
+HDRI 与 PBR texture set 是独立 catalog resource，不伪装成 StaticMesh asset。下面两条命令分别
+同步当前已验收的 Studio Small 03 HDRI 与 Aerial Asphalt 01 PBR cohort：
+
+```bash
+TMPDIR=$PWD/data/tmp .venv/bin/uef acquire polyhaven-resources \
+  --kind hdri --source-id studio_small_03 --resolution 1k \
+  --database data/catalog.db --json
+TMPDIR=$PWD/data/tmp .venv/bin/uef acquire polyhaven-resources \
+  --kind pbr_texture_set --source-id aerial_asphalt_01 --resolution 1k \
+  --database data/catalog.db --json
+```
+
+查询完整 resource cohort 与统计：
+
+```bash
+TMPDIR=$PWD/data/tmp .venv/bin/uef catalog resource-stats \
+  --database data/catalog.db --json
+TMPDIR=$PWD/data/tmp .venv/bin/uef catalog resources \
+  --database data/catalog.db --status ready --license-tier open
+TMPDIR=$PWD/data/tmp .venv/bin/uef catalog resource-show \
+  polyhaven_pbr_aerial_asphalt_01_dd67d209d4cd82d8275e9032b5ce648a \
+  --database data/catalog.db --json
+```
+
+resource id 绑定 provider source revision、profile 与 resolution；provider revision 变化会得到新 id，
+不会覆盖已经发布的 source bytes 或 evidence。PBR `ue_pbr_png_v1` 当前固定为 sRGB Diffuse、
+DirectX normal 与 data-space ARM（R=AO、G=roughness、B=metallic）。
 
 ## 数据与存储纪律
 

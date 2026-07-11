@@ -40,6 +40,9 @@
 - `docs/QUESTIONS.md` —— 只有真正需要 Owner 拍板或提供外部条件时才登记阻塞。
 - `docs/reviews/` —— 每个里程碑的独立审计结论;发现的问题先修复再放行。
 - `docs/adr/` —— 跨里程碑的不变量与重大技术选型。
+- `out/showcases/<stage>/` —— 每次切换主任务阶段前保存最高质量 MP4、source/render manifest、
+  license/attribution、frame/video hashes 与 codec probe；人物等目标类型没有合格结果时必须明确
+  `not_available`,禁止用 rejected/quarantine 产物代替。
 
 **流程**:在 `feat/m<里程碑>-<slug>` 上直接规划并实现 → 自动化测试 → 真实 UE/远程运行
 → 亲眼审阅图像/报告 → 更新 WORKLOG 与 ADR → 正式 review → Conventional Commits →
@@ -196,13 +199,36 @@
 
 ### T3.1b PolyHaven HDRI + 材质 `#acquire` `#catalog`
 
-- [x] 实装 catalog schema v4 独立 resource 模型:`resources/resource_files/resource_artifacts/
+- [x] 实装 catalog schema v5 独立 resource 模型:`resources/resource_files/resource_artifacts/
   resource_bindings`,为 HDRI/PBR texture set 提供 profile、状态机、许可、revision、文件语义与引用关系；
-  v1/v3 → v4 migration 保持既有 asset/scene rows,166 项相关回归与独立审计通过。
+  v1/v3/v4 → v5 migration 保持既有 asset/scene rows,并以 append-only `published_once` 保留 publication
+  lineage；相关回归与两路独立审计通过。
 - [x] 实装 strict CPU resource validators:Radiance HDR scanline/RLE/2:1 closure 与 PNG chunk/CRC/zlib/
   Adam7/ancillary ordering；PBR profile 固定 Diffuse + DirectX normal + ARM packed channels。59 项相关测试、
   真实 1k HDR 与 1024² PNG 通过；实现提交:`1ff2bef`。
-- [ ] 同一 adapter 契约接入 HDRI 与 texture files,替换 M1 单文件 helper 的非增量 metadata。
+- [x] 同一 adapter 契约接入 HDRI 与 texture files,替换 M1 单文件 helper 的非增量 metadata；真实
+  Studio Small 03 HDRI 与 Aerial Asphalt 01 PBR exact replay 均为 0 downloads、完整 bytes/evidence
+  重验、schema v5 `ready`，实现提交:`6f88779`。
+- [ ] 阶段 showcase gate:用通过门禁的 scene-level 数据保存首份 >=1080p/24fps MP4；人物方向当前
+  仍缺 strict skeletal/animation ingestion,必须以 `not_available` 报告真实边界而非引用 rejected build。
+
+### T3.1c Owner 优先:人物 SkeletalMesh + animation 闭环 `#character` `#blackmyth` `#ue`
+
+- [ ] 扩展 BlackMyth 只读扫描与 typed ingest contract,显式区分 static asset、scene 与 character；
+  license metadata 与来源描述冲突时 fail closed。Wukong、Kang Jin Long 与 game extraction demo 固定为
+  `research-only/nc/export=false`,不得进入开放数据集。
+- [ ] 实装 UE 5.5.4 headless SkeletalMesh/Skeleton/AnimSequence 导入、独立 reload/finalize 与完整 package
+  closure；质量门禁覆盖 skinned triangles、finite bounds、skin weights、bone hierarchy、材质/纹理引用、
+  clip duration/range 与可重现动画选择,禁止走“恰好一个 StaticMesh”的旧 M2 路径冒充成功。
+- [ ] render resolver 生成 SkeletalMesh actor、播放指定 pose/clip、分配稳定 stencil/object mask，并保存
+  animation/package/catalog/frame evidence。首个工程闭环使用开放授权的
+  `Free Game Character - Ancient` (`c8ed576c43b34345`),人物质量旗舰使用
+  `Free Character - Ancient 6` (`eb3cb4c6760fd952`)；Crabulb/Ninja 分别验证多 clip 与高骨骼压力。
+- [ ] 保存人物阶段最高质量 >=1080p/24fps MP4 与 strict showcase manifest；在此 gate 完成前人物状态
+  始终为 `not_available`,历史 Blender video、rollback build 或 provenance quarantine 不计验收。
+- **DoD**:至少 1 个开放人物从 source/license → UE skeletal packages → catalog → 动画 beauty/mask →
+  clean-tree showcase 完整闭环；随后以 Ancient 6 产出旗舰视频。fresh 与 exact replay 均可重现,
+  source/package/animation/render hashes 对账,逐帧视觉审阅通过。
 
 ### T3.2–T3.4 后续主线
 

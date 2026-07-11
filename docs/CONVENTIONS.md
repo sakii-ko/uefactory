@@ -40,6 +40,13 @@
 2. **产物**:渲染类任务必须有输出图 + `manifest.json`(含输入参数、引擎版本、耗时、校验值);批量图必须附 contact sheet(缩略图拼图)。
 3. **反例校验**:关键断言要防"假成功"——例:渲染图必须过非全黑检查;导入必须校验三角形数 > 0。
 4. **WORKLOG 记录**:产物路径 + 关键命令 + 耗时;别人不问任何问题就能复现。
+5. **阶段 showcase**:每当 `PLAN.md` 进入新的主任务阶段,必须从该阶段已通过门禁的真实数据中
+   保存一组最高质量、可直接播放的样片到 `out/showcases/<stage>/`。视觉阶段至少包含一个 MP4、
+   对应 source/render manifest、license/attribution、frame/video hashes 与 codec probe；视频默认要求
+   短边 >=1080、>=24 fps、>=3 秒、H.264/H.265 `yuv420p` + faststart。若某类目标(例如人物)
+   尚无合格结果,manifest 与 WORKLOG 必须明确 `not_available`,不得用 quarantine/rejected 结果充数。
+   单主体 turntable 还必须从 object mask 证明主体占比、包围框、边缘余量与时序变化；编码规格达标但
+   主体过小、裁切、静止或空帧的 MP4 不得作为“最高质量”放行。
 
 `tools/check.sh` 必须在每次请求 review 前全绿。
 
@@ -93,6 +100,7 @@ uefactory/
 ├── docs/                    # 本目录:规范/架构/环境/WORKLOG/QUESTIONS/adr/reviews
 ├── logs/    (gitignore)
 ├── out/     (gitignore)     # 渲染输出
+│   └── showcases/           # 每阶段最高质量 MP4 + strict manifest
 └── data/    (gitignore)     # catalog.db、下载缓存
 ```
 

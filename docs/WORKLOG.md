@@ -1365,3 +1365,73 @@ REVIEW REQUESTED: feat/m1-render 43d2163
   SceneSpec。evidence：
   `out/scene_builds/20260711T082245Z_df6d6c7b/bm_character_fight_diorama/manifest.json`。该 mixed-skeletal
   候选明确记为 rejected experiment，不计新增 scene-level 素材。
+
+## [2026-07-11] M3 T3.1b Poly Haven HDRI/PBR resources 与 stage showcase — RESOURCE APPROVE
+
+### Schema v5 与 resource adapter
+
+- catalog 从 schema v4 升至 v5；`resources` 新增 append-only `published_once`。v4 的
+  `verified/ready` 自动恢复 lineage；旧 `failed/quarantined` 只有在 bundle/content digest、唯一 primary
+  file 与精确绑定 active digest 的 `resource_source_manifest` 同时存在时才视为曾发布。SQL trigger
+  禁止清除 lineage 或绕过 `finalize_resource` 直接创建 published row。
+- HDRI/PBR 使用独立 `resources/resource_files/resource_artifacts/resource_bindings`，不改写 StaticMesh
+  asset identity。普通 upsert 不能发布 verified/ready；完整 files/artifacts cohort 在单 transaction
+  finalization，发布后 immutable；`verified -> ready` 仅可追加 profile 要求的 validation proofs。
+- 新增 listing-bound `uef acquire polyhaven-resources --kind hdri|pbr_texture_set`，复用 source lock、
+  rate/retry/quota 与 durable failure journal，但按 kind 隔离 state/run manifests。source bytes 位于 immutable
+  revision/profile/resolution root；exact replay 重验 source file、artifact file、hash、CPU validation 与
+  catalog cohort，不靠 terminal status 自证。
+- catalog reviewer 最终 `APPROVE`：broader catalog/resource `107 passed`，最终 v5 migration/control-byte
+  targeted `22 passed`，Ruff/Mypy 通过。resource sync reviewer 最终 `APPROVE`：focused `23 passed`、
+  related `107 passed`，Ruff/Mypy/diff-check 通过；两路均无遗留 BLOCKER/MAJOR/MINOR/NIT。
+
+### 真实 exact replay 与 catalog
+
+- HDRI:
+  `out/acquire/polyhaven-resources/hdri/20260711T125901Z_c3984c13/manifest.json`。Studio Small 03 exact
+  replay 为 1 request / 0 body / 0 downloads / 1 reused file，重新验证 1,686,299 bytes；1024×512 linear
+  Radiance HDR SHA-256=`30933d55e45f0795daf49f3cbefbe0e5ebcb821ee04fb0a2818c02ffc3938817`。
+  canonical source 与 `data/hdri/studio_small_03_1k.hdr` alias hash 相同、inode 不同，确认不是 hardlink。
+- PBR:
+  `out/acquire/polyhaven-resources/pbr_texture_set/20260711T125915Z_7c894939/manifest.json`。Aerial
+  Asphalt 01 exact replay 为 1 request / 0 body / 0 downloads / 3 reused files，重新验证 5,477,198 bytes；
+  三张 1024² PNG 为 sRGB Diffuse、DirectX normal 与 ARM（R=AO/G=roughness/B=metallic），physical size
+  30,000×30,000 mm。
+- `data/catalog.db` 已为 schema v5；真实 `resource-stats`=2 ready resources / 4 files / 5 artifacts /
+  0 bindings，2/2 为 `polyhaven`、`CC0-1.0/open`。HDRI/PBR source/validation/descriptor 图片与 JSON 已
+  逐项检查；PBR diffuse、normal、ARM 语义符合 profile。
+- 正式记录:`docs/reviews/2026-07-11-m3-polyhaven-resources.md`。
+
+### 本阶段 scene showcase：首版构图被新门禁拒绝
+
+- 新增高质量 source JobSpec:`examples/showcases/scene_player_home_1080p.yaml`。前两个真实尝试保留
+  fail-closed evidence：1920×1080 run 的 frame-0 beauty mean luma=`3.817 < 5`；首个 1440² run 因一次
+  DDC slow warning 被 strict setup gate 拒绝。最终 source render:
+  `out/showcase_source_renders/20260711T134429Z_727167e6/scene_bm_player_home/manifest.json`。
+- `scene:bm_player_home` 为 56 actors / 22 renderable StaticMesh components / 39,187 triangles /
+  10 materials / 11 textures，CC-BY-4.0/open。最终 source 为 72 beauty + 72 mask、1440×1440；
+  setup/render 0 unfiltered warning/error，host image/hash/mask validation 通过。
+- 首版 provisional archive:
+  `out/showcases/m3_t3_1b/20260711T141026Z_scene_bm_player_home/showcase.mp4`；H.264/yuv420p、1440²、
+  24 fps、72 frames、3.000 s、1,814,801 bytes，SHA-256=
+  `56e2be69bb29881a668b48fd686127fc265b00bc7e52e7eff6329586eb485c60`。配套 manifest 含 source/frame/
+  video/license/git/ffprobe evidence。
+- 独立视觉 reviewer 解码 72 个 object masks，量化 foreground=`4.2493%–5.3900%`、mean=`4.9058%`，
+  bbox area=`8.1985%–12.4%`；黑底占比过大，因此该 MP4 明确不作为“最高质量”放行。
+- showcase contract 已补实际 EXR mask 解码与逐帧 foreground>=10%、bbox>=18%、margin>=3% 门禁，
+  并归档 `source_render_manifest.json`。旧真实 run 在编码前确定性拒绝：frame 0
+  `foreground=0.047325 < 0.100000`，未创建 probe 输出。JobSpec 新增可选
+  `camera.distance_multiplier`，本样例设为 `0.6`；旧任务缺省 `1.0` 保持兼容。
+- 自动化：focused jobspec/job/showcase=`79 passed`；broader render/job/remote/thumbnail/showcase=
+  `123 passed`；Ruff、Mypy、diff-check 全绿。实现提交:`e4dde5e feat(render): publish verified stage
+  showcases`。最终 clean-tree UE rerender 与 archive 将作为后续 append-only 条目记录。
+
+### 人物类别边界
+
+- 当前 accepted/deliverable person samples=`0`，人物 showcase=`not_available`。不使用 failed、rollback
+  或 quarantined scene 候选替代人物数据。
+- `Character Fight` mixed-skeletal 候选 404 strict warnings 后已原子 rollback；Feudal Japanese House
+  有 12 SkeletalMeshes / 444,275 triangles，但零 StaticMesh 输出并 rollback；Genshin environment base
+  因 11/12 alpha blend components 导致 mask coverage=`1/12`，保留 build-only quarantine。
+- 下一阶段需显式实现 SkeletalMesh/Skeleton/pose-or-animation ingestion、人物 mask 与 license gate，
+  再产出人物类最高质量 video。
