@@ -1,0 +1,41 @@
+schema_version: 1
+# Compatibility-only NC source. Exclude this scene from the open-license DoD
+# and from exportable or redistributable product sets; local evidence only.
+# Build/reload/finalize succeeds, but thumbnail remains quarantined. An inside
+# orbit shows the houses clearly, while the enclosing sky sphere fills every
+# mask pixel (no background stencil 0) and BLEND smoke omits stencil ID 3. The
+# one outside-sphere probe instead made the house microscopic and too dark.
+# Do not count this scene as render_ok or weaken the visual gates for it.
+scene_id: bm_toon_houses_night
+name: Toon Houses Night Compatibility Diorama
+kind: interchange_scene
+source:
+  # Scanner evidence: 5,495,904 bytes; SHA-256
+  # b828d39838a0a92ddfd8ca24f9acec20318b27d35eb7b5aed5aa4fe058cf0118.
+  path: asset-library/derived/54745e68e80cc720/54745e68e80cc720.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: c002880a654d45969a802e5f4c9a1ab6
+  source_url: https://sketchfab.com/3d-models/c002880a654d45969a802e5f4c9a1ab6
+  license: CC-BY-NC-SA-4.0
+  license_tier: nc
+  license_url: https://creativecommons.org/licenses/by-nc-sa/4.0/
+  attribution: luyssport — Toon houses night version
+expected:
+  mesh_count: 3
+  material_count: 3
+  texture_count: 3
+  triangle_count: 9773
+build:
+  map_path: /Game/UEF/Scenes/bm_toon_houses_night/L_bm_toon_houses_night
+  export: false
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -18
+  # The source-authored 99 m sky sphere encloses the actual 15 m diorama. This
+  # inside orbit preserves a useful visual preview for the build-only source.
+  distance_multiplier: 0.12
+render:
+  no_auto_floor: true
+  lighting_intensity_multiplier: 5.0
