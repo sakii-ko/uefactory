@@ -15,14 +15,16 @@ from uefactory.acquire.hdri import (
 )
 from uefactory.acquire.models import ModelAcquireError, acquire_m2_models
 from uefactory.acquire.polyhaven import (
-    DEFAULT_RESOLUTION as DEFAULT_POLYHAVEN_RESOLUTION,
-)
-from uefactory.acquire.polyhaven import (
+    DEFAULT_REQUEST_RATE_PER_SEC,
     PolyHavenAcquireError,
+    PolyHavenRuntimeConfig,
     PolyHavenSyncResult,
     TerminalStatus,
     finalize_polyhaven_items,
     sync_polyhaven_models,
+)
+from uefactory.acquire.polyhaven import (
+    DEFAULT_RESOLUTION as DEFAULT_POLYHAVEN_RESOLUTION,
 )
 from uefactory.cli._common import settings_from_context
 from uefactory.ingest.pipeline import BatchIngestResult, ingest_batch
@@ -45,6 +47,63 @@ def acquire_polyhaven(
         bool,
         typer.Option("--force", help="Redownload files before exact verification."),
     ] = False,
+    request_rate: Annotated[
+        float,
+        typer.Option(
+            "--request-rate",
+            min=0.000001,
+            max=1_000_000,
+            help="Maximum Poly Haven HTTP request rate per second (monotonic).",
+        ),
+    ] = DEFAULT_REQUEST_RATE_PER_SEC,
+    request_burst: Annotated[
+        int,
+        typer.Option("--request-burst", min=1, max=1_000_000, help="HTTP token bucket burst."),
+    ] = 1,
+    retry_max_attempts: Annotated[
+        int,
+        typer.Option("--retry-max-attempts", min=1, help="Transient HTTP/transport attempts."),
+    ] = 5,
+    integrity_max_attempts: Annotated[
+        int,
+        typer.Option("--integrity-max-attempts", min=1, help="Checksum attempt budget."),
+    ] = 2,
+    retry_base_delay_sec: Annotated[
+        float,
+        typer.Option("--retry-base-sec", min=0.001, help="Initial exponential backoff."),
+    ] = 5.0,
+    retry_max_delay_sec: Annotated[
+        float,
+        typer.Option("--retry-max-sec", min=0.001, help="Maximum exponential backoff."),
+    ] = 900.0,
+    max_retry_after_sec: Annotated[
+        float,
+        typer.Option("--max-retry-after-sec", min=0.0, help="Maximum honored Retry-After."),
+    ] = 3_600.0,
+    max_new_items_per_day: Annotated[
+        int | None,
+        typer.Option("--max-new-items-per-day", min=0, help="Durable UTC-day item quota."),
+    ] = None,
+    max_download_bytes_per_day: Annotated[
+        int | None,
+        typer.Option(
+            "--max-download-bytes-per-day",
+            min=0,
+            help="Durable UTC-day worst-case transfer reservation quota.",
+        ),
+    ] = None,
+    max_storage_bytes: Annotated[
+        int | None,
+        typer.Option(
+            "--max-storage-bytes",
+            min=0,
+            help="Maximum Poly Haven model-tree bytes, including download growth.",
+        ),
+    ] = None,
+    min_free_bytes: Annotated[
+        int,
+        typer.Option("--min-free-bytes", min=0, help="Free-space floor before downloads."),
+    ] = 0,
     ingest: Annotated[
         bool,
         typer.Option(
@@ -76,11 +135,25 @@ def acquire_polyhaven(
 
     settings = settings_from_context(ctx)
     try:
+        runtime_config = PolyHavenRuntimeConfig(
+            request_rate_per_sec=request_rate,
+            request_burst=request_burst,
+            retry_max_attempts=retry_max_attempts,
+            integrity_max_attempts=integrity_max_attempts,
+            retry_base_delay_sec=retry_base_delay_sec,
+            retry_max_delay_sec=retry_max_delay_sec,
+            max_retry_after_sec=max_retry_after_sec,
+            max_new_items_per_day=max_new_items_per_day,
+            max_download_bytes_per_day=max_download_bytes_per_day,
+            max_storage_bytes=max_storage_bytes,
+            min_free_bytes=min_free_bytes,
+        )
         result = sync_polyhaven_models(
             settings=settings,
             limit=limit,
             resolution=resolution,
             force=force,
+            runtime_config=runtime_config,
         )
     except PolyHavenAcquireError as exc:
         typer.echo(f"Poly Haven acquisition failed: {exc}", err=True)
@@ -121,6 +194,11 @@ def acquire_polyhaven(
         )
         if result.generated_spec_path is not None:
             typer.echo(f"Generated IngestSpec: {result.generated_spec_path}")
+        elif _polyhaven_deferred_items(result):
+            typer.echo(
+                f"Poly Haven unseen revisions deferred by daily item quota: "
+                f"{_polyhaven_deferred_items(result)}"
+            )
         else:
             typer.echo("No eligible Poly Haven model revisions; source is unchanged")
         typer.echo(f"Acquisition manifest: {result.manifest_path}")
@@ -167,7 +245,11 @@ def _polyhaven_payload(
         }
     return {
         "status": (
-            "noop"
+            "deferred"
+            if batch is None
+            and result.generated_spec_path is None
+            and _polyhaven_deferred_items(result)
+            else "noop"
             if batch is None and result.generated_spec_path is None
             else ("prepared" if batch is None else batch.status)
         ),
@@ -180,6 +262,7 @@ def _polyhaven_payload(
         "downloaded_bytes": result.downloaded_bytes,
         "verified_bytes": result.verified_bytes,
         "snapshot_sha256": result.snapshot_sha256,
+        "runtime": result.runtime_evidence,
         "run_dir": str(result.run_dir),
         "manifest": str(result.manifest_path),
         "state": str(result.state_path),
@@ -207,6 +290,17 @@ def _polyhaven_payload(
         ],
         "ingest": ingest_payload,
     }
+
+
+def _polyhaven_deferred_items(result: PolyHavenSyncResult) -> int:
+    runtime = result.runtime_evidence
+    if not isinstance(runtime, Mapping):
+        return 0
+    daily = runtime.get("daily_quota")
+    if not isinstance(daily, Mapping):
+        return 0
+    value = daily.get("deferred_new_items")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
 
 
 @acquire_app.command("hdri")

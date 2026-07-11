@@ -4,16 +4,18 @@ import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
+import shutil
 import stat
 import unicodedata
 import urllib.error
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from dataclasses import dataclass, field
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, TextIO
 from urllib.parse import quote, unquote, urlsplit
@@ -22,6 +24,26 @@ from uuid import uuid4
 import yaml
 
 from uefactory import __version__
+from uefactory.acquire.runtime import (
+    AcquisitionFailure,
+    Clock,
+    DailyQuotaLimits,
+    DailyQuotaRequest,
+    DailyQuotaUsage,
+    DiskQuotaLimits,
+    DiskSnapshot,
+    FailureCategory,
+    FailureKind,
+    MonotonicTokenBucket,
+    QuotaExceeded,
+    RetryPolicy,
+    RuntimeValidationError,
+    SystemClock,
+    compute_retry_decision,
+    parse_retry_after,
+    reserve_daily_quota,
+    reserve_disk_growth,
+)
 from uefactory.catalog import Catalog
 from uefactory.core.asset_locking import asset_lock
 from uefactory.core.config import Settings
@@ -45,9 +67,11 @@ POLYHAVEN_LICENSE_URL = "https://polyhaven.com/license"
 POLYHAVEN_SOURCE = "polyhaven"
 DEFAULT_RESOLUTION = "1k"
 STATE_SCHEMA_VERSION = 2
-RUN_MANIFEST_SCHEMA_VERSION = 2
+LEGACY_RUN_MANIFEST_SCHEMA_VERSION = 2
+RUN_MANIFEST_SCHEMA_VERSION = 3
 COMMIT_INTENT_SCHEMA_VERSION = 1
 USER_AGENT = f"UEFactory/{__version__} research downloader"
+DEFAULT_REQUEST_RATE_PER_SEC = 2.0
 
 _API_HOST = "api.polyhaven.com"
 _DOWNLOAD_HOST = "dl.polyhaven.org"
@@ -66,12 +90,97 @@ _MAX_FILE_BYTES = 32 * 1024 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
 _LISTING_DIGEST_DOMAIN = b"uefactory.polyhaven-model-listing.v1\0"
 _PREPARED_MANIFEST_DIGEST_DOMAIN = b"uefactory.polyhaven-prepared-manifest.v1\0"
+_QUOTA_LEDGER_SCHEMA_VERSION = 1
+_QUOTA_DOWNLOAD_KEY_DOMAIN = b"uefactory.polyhaven-quota-download.v1\0"
+_REDIRECT_HOOK_ATTRIBUTE = "_uefactory_before_redirect_request"
+_OVERSIZE_PROBE_BYTES = 1
 
 TerminalStatus = Literal["imported", "render_ok", "skipped"]
 
 
 class PolyHavenAcquireError(RuntimeError):
     """Poly Haven metadata or downloaded bytes violated the acquisition contract."""
+
+
+@dataclass(frozen=True, slots=True)
+class PolyHavenRuntimeConfig:
+    """Serializable network pacing, retry, and quota controls for one sync."""
+
+    request_rate_per_sec: float = DEFAULT_REQUEST_RATE_PER_SEC
+    request_burst: int = 1
+    retry_max_attempts: int = 5
+    integrity_max_attempts: int = 2
+    retry_base_delay_sec: float = 5.0
+    retry_max_delay_sec: float = 900.0
+    max_retry_after_sec: float = 3_600.0
+    max_new_items_per_day: int | None = None
+    max_download_bytes_per_day: int | None = None
+    max_storage_bytes: int | None = None
+    min_free_bytes: int = 0
+    retry_policy: RetryPolicy = field(init=False, repr=False)
+    daily_quota_limits: DailyQuotaLimits = field(init=False, repr=False)
+    disk_quota_limits: DiskQuotaLimits = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        rate = self.request_rate_per_sec
+        if (
+            isinstance(rate, bool)
+            or not isinstance(rate, int | float)
+            or not math.isfinite(float(rate))
+            or not 1.0 / (366 * 24 * 60 * 60) <= float(rate) <= 1_000_000.0
+        ):
+            raise PolyHavenAcquireError(
+                "request_rate_per_sec must be a finite rate between 1/31622400 and 1000000"
+            )
+        if (
+            isinstance(self.request_burst, bool)
+            or not isinstance(self.request_burst, int)
+            or not 1 <= self.request_burst <= 1_000_000
+        ):
+            raise PolyHavenAcquireError("request_burst must be an integer between 1 and 1000000")
+        try:
+            retry_policy = RetryPolicy(
+                max_attempts=self.retry_max_attempts,
+                integrity_max_attempts=self.integrity_max_attempts,
+                base_delay_sec=self.retry_base_delay_sec,
+                max_delay_sec=self.retry_max_delay_sec,
+                max_retry_after_sec=self.max_retry_after_sec,
+            )
+            daily_limits = DailyQuotaLimits(
+                max_new_items=self.max_new_items_per_day,
+                max_download_bytes=self.max_download_bytes_per_day,
+            )
+            disk_limits = DiskQuotaLimits(
+                max_storage_bytes=self.max_storage_bytes,
+                min_free_bytes=self.min_free_bytes,
+            )
+        except RuntimeValidationError as exc:
+            raise PolyHavenAcquireError(f"invalid Poly Haven runtime configuration: {exc}") from exc
+        object.__setattr__(self, "request_rate_per_sec", float(rate))
+        object.__setattr__(self, "retry_policy", retry_policy)
+        object.__setattr__(self, "daily_quota_limits", daily_limits)
+        object.__setattr__(self, "disk_quota_limits", disk_limits)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "request_rate_per_sec": self.request_rate_per_sec,
+            "request_burst": self.request_burst,
+            "retry": {
+                "max_attempts": self.retry_policy.max_attempts,
+                "integrity_max_attempts": self.retry_policy.integrity_max_attempts,
+                "base_delay_sec": self.retry_policy.base_delay_sec,
+                "max_delay_sec": self.retry_policy.max_delay_sec,
+                "max_retry_after_sec": self.retry_policy.max_retry_after_sec,
+            },
+            "daily_quota": {
+                "max_new_items": self.daily_quota_limits.max_new_items,
+                "max_download_bytes": self.daily_quota_limits.max_download_bytes,
+            },
+            "disk_quota": {
+                "max_storage_bytes": self.disk_quota_limits.max_storage_bytes,
+                "min_free_bytes": self.disk_quota_limits.min_free_bytes,
+            },
+        }
 
 
 class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -89,7 +198,15 @@ class _AllowlistRedirectHandler(urllib.request.HTTPRedirectHandler):
         newurl: str,
     ) -> urllib.request.Request | None:
         _require_https_host(newurl, allowed_hosts=self.allowed_hosts, context="redirect target")
-        return super().redirect_request(req, fp, code, msg, headers, newurl)
+        hook = getattr(req, _REDIRECT_HOOK_ATTRIBUTE, None)
+        if hook is not None:
+            if not callable(hook):
+                raise PolyHavenAcquireError("redirect request hook is invalid")
+            hook()
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and hook is not None:
+            setattr(redirected, _REDIRECT_HOOK_ATTRIBUTE, hook)
+        return redirected
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +277,7 @@ class PolyHavenSyncResult:
     downloaded_bytes: int
     verified_bytes: int
     snapshot_sha256: str
+    runtime_evidence: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +296,598 @@ class _LoadedState:
     before_file_sha256: str | None
     before_payload_sha256: str | None
     migrated_from: int | None
+
+
+@dataclass(slots=True)
+class _RuntimeStats:
+    request_attempts: int = 0
+    retry_attempts: int = 0
+    retry_after_honored: int = 0
+    rate_limit_wait_sec: float = 0.0
+    retry_wait_sec: float = 0.0
+    disk_checks: int = 0
+    max_storage_bytes_observed: int | None = None
+    min_free_bytes_observed: int | None = None
+    new_items_reserved: int = 0
+    download_bytes_reserved: int = 0
+    download_bytes_overage: int = 0
+    download_probe_bytes_released: int = 0
+    download_body_bytes: int = 0
+    deferred_new_items: int = 0
+
+
+class _AttemptFailure(Exception):
+    def __init__(
+        self,
+        failure: AcquisitionFailure,
+        *,
+        retry_after_value: str | None = None,
+    ) -> None:
+        self.failure = failure
+        self.retry_after_value = retry_after_value
+        super().__init__(failure.message)
+
+
+class _DailyQuotaLedger:
+    def __init__(
+        self,
+        *,
+        path: Path,
+        project_root: Path,
+        clock: Clock,
+        limits: DailyQuotaLimits,
+        stats: _RuntimeStats,
+    ) -> None:
+        self.path = path
+        self.project_root = project_root
+        self.clock = clock
+        self.limits = limits
+        self.stats = stats
+        self.enabled = limits.max_new_items is not None or limits.max_download_bytes is not None
+        today = _clock_utc_now(clock).date()
+        if self.enabled and (path.exists() or path.is_symlink()):
+            _require_regular_file(path, "Poly Haven quota ledger")
+            payload = _read_json_object_strict(path, "Poly Haven quota ledger")
+            _validate_quota_ledger(payload)
+            ledger_day = date.fromisoformat(str(payload["utc_day"]))
+            _quota_usage(payload).roll_forward(today)
+            if ledger_day != today:
+                payload = _empty_quota_ledger(today)
+                self.payload = payload
+                self._persist()
+            else:
+                self.payload = payload
+        else:
+            self.payload = _empty_quota_ledger(today)
+        self.before_usage = _quota_usage(self.payload)
+
+    @property
+    def item_ids(self) -> frozenset[str]:
+        return frozenset(str(item) for item in self.payload["item_ids"])
+
+    @property
+    def usage(self) -> DailyQuotaUsage:
+        return _quota_usage(self.payload)
+
+    def allowed_unseen_ids(
+        self,
+        models: tuple[PolyHavenModel, ...],
+        *,
+        state: Mapping[str, Any],
+    ) -> frozenset[str] | None:
+        maximum = self.limits.max_new_items
+        if maximum is None:
+            return None
+        self._require_reservation_day()
+        state_items = _object(state.get("items"), "Poly Haven state items")
+        already_reserved = self.item_ids
+        remaining = max(0, maximum - self.usage.new_items_reserved)
+        allowed: set[str] = set()
+        for model in models:
+            if model.asset_id in state_items:
+                continue
+            if model.asset_id in already_reserved:
+                allowed.add(model.asset_id)
+            elif remaining:
+                allowed.add(model.asset_id)
+                remaining -= 1
+        return frozenset(allowed)
+
+    def reserve_items(self, asset_ids: tuple[str, ...]) -> None:
+        if not self.enabled:
+            return
+        existing = self.item_ids
+        fresh = tuple(sorted(set(asset_ids) - existing))
+        if not fresh:
+            return
+        self._require_reservation_day()
+        previous_payload = json.loads(json.dumps(self.payload))
+        try:
+            reservation = reserve_daily_quota(
+                limits=self.limits,
+                usage=self.usage,
+                request=DailyQuotaRequest(new_items=len(fresh)),
+            )
+        except (QuotaExceeded, RuntimeValidationError) as exc:
+            raise PolyHavenAcquireError(
+                f"Poly Haven daily quota rejected selected items: {exc}"
+            ) from exc
+        self.payload["usage"] = _quota_usage_payload(reservation.after)
+        self.payload["item_ids"] = sorted(existing | set(fresh))
+        try:
+            self._persist()
+        except BaseException:
+            self.payload = previous_payload
+            raise
+        self.stats.new_items_reserved += len(fresh)
+
+    def begin_download(
+        self,
+        *,
+        asset_id: str,
+        spec: PolyHavenFileSpec,
+        maximum_probe_bytes: int = _OVERSIZE_PROBE_BYTES,
+    ) -> str | None:
+        if isinstance(maximum_probe_bytes, bool) or maximum_probe_bytes not in {
+            0,
+            _OVERSIZE_PROBE_BYTES,
+        }:
+            raise PolyHavenAcquireError("maximum oversize probe is invalid")
+        if not self.enabled or self.limits.max_download_bytes is None:
+            return None
+        key = _quota_download_key(asset_id=asset_id, spec=spec)
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        existing = downloads.get(key)
+        if existing is not None:
+            checked = _object(existing, "quota ledger open download")
+            probe_bytes = _nonnegative_int(
+                checked.get("oversize_probe_bytes"),
+                "quota ledger oversize_probe_bytes",
+            )
+            body_bytes_claimed = _nonnegative_int(
+                checked.get("body_bytes_claimed"),
+                "quota ledger body_bytes_claimed",
+            )
+            reserved_bytes = spec.bytes + probe_bytes
+            expected = _quota_download_payload(
+                asset_id=asset_id,
+                spec=spec,
+                reserved_bytes=reserved_bytes,
+                oversize_probe_bytes=probe_bytes,
+                body_bytes_claimed=body_bytes_claimed,
+            )
+            comparable = dict(checked)
+            comparable["reserved_bytes"] = reserved_bytes
+            if (
+                comparable != expected
+                or _nonnegative_int(checked.get("reserved_bytes"), "quota ledger reserved_bytes")
+                < reserved_bytes
+            ):
+                raise PolyHavenAcquireError(
+                    "Poly Haven quota ledger download reservation conflicts"
+                )
+            return key
+        self._require_reservation_day()
+        probe_bytes = min(
+            maximum_probe_bytes,
+            self.download_probe_bytes(asset_id=asset_id, spec=spec),
+        )
+        reserved_bytes = spec.bytes + probe_bytes
+        expected = _quota_download_payload(
+            asset_id=asset_id,
+            spec=spec,
+            reserved_bytes=reserved_bytes,
+            oversize_probe_bytes=probe_bytes,
+        )
+        previous_payload = json.loads(json.dumps(self.payload))
+        reserved_usage = self._reserve_download_bytes(reserved_bytes)
+        self.payload["usage"] = _quota_usage_payload(reserved_usage)
+        downloads[key] = expected
+        try:
+            self._persist()
+        except BaseException:
+            self.payload = previous_payload
+            raise
+        self.stats.download_bytes_reserved += reserved_bytes
+        return key
+
+    def download_probe_bytes(self, *, asset_id: str, spec: PolyHavenFileSpec) -> int:
+        """Return the durable oversize probe available for this download.
+
+        The probe is charged against the configured byte quota. At an exact
+        quota boundary no probe is issued, so a valid body that exactly fills
+        the user's allowance remains downloadable without receiving an
+        unaccounted byte from the transport.
+        """
+
+        if not self.enabled or self.limits.max_download_bytes is None:
+            return _OVERSIZE_PROBE_BYTES
+        key = _quota_download_key(asset_id=asset_id, spec=spec)
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        existing = downloads.get(key)
+        if existing is not None:
+            checked = _object(existing, "quota ledger open download")
+            probe_bytes = _nonnegative_int(
+                checked.get("oversize_probe_bytes"),
+                "quota ledger oversize_probe_bytes",
+            )
+            if probe_bytes not in {0, _OVERSIZE_PROBE_BYTES}:
+                raise PolyHavenAcquireError("quota ledger oversize probe is invalid")
+            return probe_bytes
+        self._require_reservation_day()
+        maximum = self.limits.max_download_bytes
+        if maximum is None:  # Narrowed above; retained for static type checking.
+            return _OVERSIZE_PROBE_BYTES
+        remaining = maximum - self.usage.download_bytes_reserved
+        return _OVERSIZE_PROBE_BYTES if remaining >= spec.bytes + 1 else 0
+
+    def claim_download_body(self, key: str | None, count: int) -> None:
+        """Durably reserve body bytes before asking the transport for them."""
+
+        if key is None or count == 0:
+            return
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise PolyHavenAcquireError("download body claim must be a non-negative integer")
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        raw = _object(downloads.get(key), "quota ledger open download")
+        claimed = _nonnegative_int(
+            raw.get("body_bytes_claimed"),
+            "quota ledger body_bytes_claimed",
+        )
+        reserved = _nonnegative_int(raw.get("reserved_bytes"), "quota ledger reserved_bytes")
+        new_claimed = claimed + count
+        additional = max(0, new_claimed - reserved)
+        previous_payload = json.loads(json.dumps(self.payload))
+        if additional:
+            reserved_usage = self._reserve_download_bytes(additional)
+            self.payload["usage"] = _quota_usage_payload(reserved_usage)
+            raw["reserved_bytes"] = reserved + additional
+        raw["body_bytes_claimed"] = new_claimed
+        try:
+            self._persist()
+        except BaseException:
+            self.payload = previous_payload
+            raise
+        self.stats.download_bytes_reserved += additional
+
+    def release_download_body_claim(self, key: str | None, count: int) -> None:
+        """Release bytes a completed read proved were not delivered."""
+
+        if key is None or count == 0:
+            return
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise PolyHavenAcquireError("download body release must be a non-negative integer")
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        raw = _object(downloads.get(key), "quota ledger open download")
+        claimed = _nonnegative_int(
+            raw.get("body_bytes_claimed"),
+            "quota ledger body_bytes_claimed",
+        )
+        if count > claimed:
+            raise PolyHavenAcquireError("download body release exceeds its durable claim")
+        previous_payload = json.loads(json.dumps(self.payload))
+        raw["body_bytes_claimed"] = claimed - count
+        try:
+            self._persist()
+        except BaseException:
+            self.payload = previous_payload
+            raise
+
+    def claim_download_body_floor(self, key: str | None, count: int) -> None:
+        """Bind a pre-existing partial to at least its persisted body bytes."""
+
+        if key is None or count == 0:
+            return
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        raw = _object(downloads.get(key), "quota ledger open download")
+        claimed = _nonnegative_int(
+            raw.get("body_bytes_claimed"),
+            "quota ledger body_bytes_claimed",
+        )
+        if claimed < count:
+            self.claim_download_body(key, count - claimed)
+
+    def finish_oversized_download(self, key: str | None, extra_bytes: int) -> None:
+        """Atomically record received overage and close its reservation.
+
+        This deliberately bypasses the configured limit: once transport has
+        delivered an unexpected byte, the durable ledger must reflect that debt
+        and remove the reusable open reservation in the same commit.
+        """
+
+        if key is None or extra_bytes == 0:
+            return
+        if isinstance(extra_bytes, bool) or not isinstance(extra_bytes, int) or extra_bytes < 0:
+            raise PolyHavenAcquireError("download overage must be a non-negative integer")
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        raw = _object(downloads.get(key), "quota ledger open download")
+        probe_bytes = _nonnegative_int(
+            raw.get("oversize_probe_bytes"),
+            "quota ledger oversize_probe_bytes",
+        )
+        if extra_bytes > probe_bytes:
+            raise PolyHavenAcquireError("download overage exceeds its durable probe reservation")
+        previous_payload = json.loads(json.dumps(self.payload))
+        downloads.pop(key)
+        try:
+            self._persist()
+        except Exception as exc:
+            self.payload = previous_payload
+            raise PolyHavenAcquireError(
+                "Poly Haven oversized download ledger commit failed"
+            ) from exc
+        except BaseException:
+            self.payload = previous_payload
+            raise
+        self.stats.download_bytes_overage += extra_bytes
+
+    def recover_oversized_download(self, key: str | None, extra_bytes: int) -> None:
+        """Idempotently settle a durable oversized-body marker after restart."""
+
+        if key is None or extra_bytes == 0:
+            return
+        if isinstance(extra_bytes, bool) or not isinstance(extra_bytes, int) or extra_bytes < 0:
+            raise PolyHavenAcquireError("download overage must be a non-negative integer")
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        if key not in downloads:
+            # The close may already have committed before a crash prevented the
+            # marker unlink, or a UTC-day rollover may have retired the debt.
+            return
+        self.finish_oversized_download(key, extra_bytes)
+
+    def finish_download(
+        self,
+        key: str | None,
+        *,
+        release_probe: bool = True,
+    ) -> None:
+        if not isinstance(release_probe, bool):
+            raise PolyHavenAcquireError("download probe release flag must be boolean")
+        if key is None:
+            return
+        downloads = _object(self.payload["open_downloads"], "quota ledger open_downloads")
+        previous_payload = json.loads(json.dumps(self.payload))
+        raw = downloads.get(key)
+        if raw is None:
+            return
+        checked = _object(raw, "quota ledger open download")
+        probe_bytes = _nonnegative_int(
+            checked.get("oversize_probe_bytes"),
+            "quota ledger oversize_probe_bytes",
+        )
+        reserved_bytes = _nonnegative_int(
+            checked.get("reserved_bytes"),
+            "quota ledger reserved_bytes",
+        )
+        body_bytes_claimed = _nonnegative_int(
+            checked.get("body_bytes_claimed"),
+            "quota ledger body_bytes_claimed",
+        )
+        released_probe_bytes = (
+            probe_bytes
+            if release_probe and reserved_bytes - probe_bytes >= body_bytes_claimed
+            else 0
+        )
+        usage = self.usage
+        try:
+            updated_usage = DailyQuotaUsage(
+                utc_day=usage.utc_day,
+                new_items_reserved=usage.new_items_reserved,
+                download_bytes_reserved=(usage.download_bytes_reserved - released_probe_bytes),
+            )
+        except RuntimeValidationError as exc:
+            raise PolyHavenAcquireError(f"Poly Haven oversize probe release failed: {exc}") from exc
+        self.payload["usage"] = _quota_usage_payload(updated_usage)
+        downloads.pop(key)
+        try:
+            self._persist()
+        except BaseException:
+            self.payload = previous_payload
+            raise
+        self.stats.download_probe_bytes_released += released_probe_bytes
+
+    def evidence(self) -> dict[str, Any]:
+        after = self.usage
+        return {
+            "enabled": self.enabled,
+            "ledger_path": (_portable_path(self.path, self.project_root) if self.enabled else None),
+            "utc_day": after.utc_day.isoformat(),
+            "usage_before": _quota_usage_payload(self.before_usage),
+            "reserved_by_run": {
+                "new_items": self.stats.new_items_reserved,
+                "download_bytes": self.stats.download_bytes_reserved,
+            },
+            "accounted_overage_bytes": self.stats.download_bytes_overage,
+            "released_probe_bytes": self.stats.download_probe_bytes_released,
+            "deferred_new_items": self.stats.deferred_new_items,
+            "usage_after": _quota_usage_payload(after),
+            "item_reservations_after": len(self.payload["item_ids"]),
+            "open_downloads_after": len(self.payload["open_downloads"]),
+            "ledger_file_sha256": (
+                _sha256_file(self.path) if self.enabled and self.path.is_file() else None
+            ),
+        }
+
+    def _reserve_download_bytes(self, count: int) -> DailyQuotaUsage:
+        self._require_reservation_day()
+        try:
+            reservation = reserve_daily_quota(
+                limits=self.limits,
+                usage=self.usage,
+                request=DailyQuotaRequest(download_bytes=count),
+            )
+        except (QuotaExceeded, RuntimeValidationError) as exc:
+            raise PolyHavenAcquireError(
+                f"Poly Haven daily download quota rejected bytes: {exc}"
+            ) from exc
+        return reservation.after
+
+    def _require_reservation_day(self) -> None:
+        current = _clock_utc_now(self.clock).date()
+        ledger_day = self.usage.utc_day
+        if current != ledger_day:
+            raise PolyHavenAcquireError(
+                "Poly Haven UTC quota day changed during this run; restart before reserving "
+                "new work"
+            )
+
+    def _persist(self) -> None:
+        self.payload["updated_at"] = _clock_utc_now(self.clock).strftime("%Y-%m-%dT%H:%M:%SZ")
+        _validate_quota_ledger(self.payload)
+        _write_json_atomic(self.path, self.payload)
+
+
+class _AcquisitionRuntime:
+    def __init__(
+        self,
+        *,
+        config: PolyHavenRuntimeConfig,
+        clock: Clock,
+        project_root: Path,
+        data_dir: Path,
+    ) -> None:
+        self.config = config
+        self.clock = clock
+        self.project_root = project_root
+        self.data_dir = data_dir
+        self.models_root = data_dir / "acquire/polyhaven/models"
+        self.stats = _RuntimeStats()
+        try:
+            self.limiter = MonotonicTokenBucket(
+                clock=clock,
+                rate_per_sec=config.request_rate_per_sec,
+                burst=config.request_burst,
+            )
+        except RuntimeValidationError as exc:
+            raise PolyHavenAcquireError(f"invalid Poly Haven request limiter: {exc}") from exc
+        self.quota = _DailyQuotaLedger(
+            path=data_dir / "acquire/polyhaven/quota_state.json",
+            project_root=project_root,
+            clock=clock,
+            limits=config.daily_quota_limits,
+            stats=self.stats,
+        )
+
+    def start_request(self) -> None:
+        try:
+            self.stats.rate_limit_wait_sec += self.limiter.acquire()
+        except RuntimeValidationError as exc:
+            raise PolyHavenAcquireError(f"Poly Haven request limiter failed: {exc}") from exc
+        self.stats.request_attempts += 1
+
+    def run_with_retries(self, *, phase: str, operation: Any) -> Any:
+        failures_by_category: dict[FailureCategory, int] = {}
+        while True:
+            try:
+                return operation()
+            except _AttemptFailure as exc:
+                category = exc.failure.category
+                failure_count = failures_by_category.get(category, 0) + 1
+                failures_by_category[category] = failure_count
+                retry_after = None
+                if exc.retry_after_value is not None:
+                    try:
+                        retry_after = parse_retry_after(
+                            exc.retry_after_value,
+                            now=_clock_utc_now(self.clock),
+                            max_delay_sec=self.config.retry_policy.max_retry_after_sec,
+                        )
+                    except RuntimeValidationError as parse_exc:
+                        raise PolyHavenAcquireError(
+                            f"Poly Haven {phase} returned an invalid Retry-After header"
+                        ) from parse_exc
+                try:
+                    decision = compute_retry_decision(
+                        policy=self.config.retry_policy,
+                        failure=exc.failure,
+                        consecutive_failures=failure_count,
+                        now=_clock_utc_now(self.clock),
+                        retry_after=retry_after,
+                    )
+                except RuntimeValidationError as decision_exc:
+                    raise PolyHavenAcquireError(
+                        f"Poly Haven {phase} retry decision failed: {decision_exc}"
+                    ) from decision_exc
+                if not decision.will_retry or decision.delay_sec is None:
+                    suffix = "retry budget exhausted" if decision.exhausted else "not retryable"
+                    raise PolyHavenAcquireError(f"{exc.failure.message} ({suffix})") from exc
+                self.stats.retry_attempts += 1
+                if retry_after is not None:
+                    self.stats.retry_after_honored += 1
+                self.stats.retry_wait_sec += decision.delay_sec
+                self.clock.sleep(decision.delay_sec)
+
+    def record_download_body_bytes(self, count: int) -> None:
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise PolyHavenAcquireError("download body byte count must be a non-negative integer")
+        self.stats.download_body_bytes += count
+
+    def check_disk_growth(
+        self,
+        growth_bytes: int,
+        *,
+        optional_probe_bytes: int = 0,
+    ) -> int:
+        if isinstance(optional_probe_bytes, bool) or optional_probe_bytes not in {
+            0,
+            _OVERSIZE_PROBE_BYTES,
+        }:
+            raise PolyHavenAcquireError("optional disk probe is invalid")
+        snapshot = _polyhaven_disk_snapshot(models_root=self.models_root, data_dir=self.data_dir)
+        self.stats.disk_checks += 1
+        self.stats.max_storage_bytes_observed = max(
+            snapshot.storage_bytes,
+            self.stats.max_storage_bytes_observed or 0,
+        )
+        self.stats.min_free_bytes_observed = min(
+            snapshot.free_bytes,
+            self.stats.min_free_bytes_observed
+            if self.stats.min_free_bytes_observed is not None
+            else snapshot.free_bytes,
+        )
+        try:
+            reserve_disk_growth(
+                limits=self.config.disk_quota_limits,
+                snapshot=snapshot,
+                growth_bytes=growth_bytes + optional_probe_bytes,
+            )
+        except QuotaExceeded as probe_exc:
+            if optional_probe_bytes == 0:
+                raise PolyHavenAcquireError(
+                    f"Poly Haven disk quota rejected download: {probe_exc}"
+                ) from probe_exc
+            try:
+                reserve_disk_growth(
+                    limits=self.config.disk_quota_limits,
+                    snapshot=snapshot,
+                    growth_bytes=growth_bytes,
+                )
+            except (QuotaExceeded, RuntimeValidationError) as exc:
+                raise PolyHavenAcquireError(
+                    f"Poly Haven disk quota rejected download: {exc}"
+                ) from exc
+            return 0
+        except RuntimeValidationError as exc:
+            raise PolyHavenAcquireError(f"Poly Haven disk quota rejected download: {exc}") from exc
+        return optional_probe_bytes
+
+    def evidence(self) -> dict[str, Any]:
+        return {
+            "http": {
+                "request_attempts": self.stats.request_attempts,
+                "retry_attempts": self.stats.retry_attempts,
+                "retry_after_honored": self.stats.retry_after_honored,
+                "rate_limit_wait_ms": _milliseconds(self.stats.rate_limit_wait_sec),
+                "retry_wait_ms": _milliseconds(self.stats.retry_wait_sec),
+                "download_body_bytes": self.stats.download_body_bytes,
+            },
+            "daily_quota": self.quota.evidence(),
+            "disk": {
+                "checks": self.stats.disk_checks,
+                "max_storage_bytes_observed": self.stats.max_storage_bytes_observed,
+                "min_free_bytes_observed": self.stats.min_free_bytes_observed,
+            },
+        }
 
 
 def revisioned_asset_id(source_id: str, revision: str) -> str:
@@ -343,11 +1053,15 @@ def sync_polyhaven_models(
     limit: int = 1,
     resolution: str = DEFAULT_RESOLUTION,
     force: bool = False,
+    runtime_config: PolyHavenRuntimeConfig | None = None,
 ) -> PolyHavenSyncResult:
     """Discover and prepare a bounded, resumable Poly Haven model ingest batch."""
 
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
         raise PolyHavenAcquireError("limit must be an integer between 1 and 10000")
+    config = PolyHavenRuntimeConfig() if runtime_config is None else runtime_config
+    if not isinstance(config, PolyHavenRuntimeConfig):
+        raise PolyHavenAcquireError("runtime_config must be PolyHavenRuntimeConfig")
     checked_resolution = _resolution(resolution)
     project_root = settings.project_root.expanduser().resolve()
     data_dir = settings.data_dir.expanduser().resolve()
@@ -366,9 +1080,15 @@ def sync_polyhaven_models(
         "run_id": run_id,
         "status": "running",
         "started_at": started_at,
-        "request": {"force": force, "limit": limit, "resolution": checked_resolution},
+        "request": {
+            "force": force,
+            "limit": limit,
+            "resolution": checked_resolution,
+            "runtime": config.as_dict(),
+        },
     }
     _write_json_atomic(manifest_path, running_manifest)
+    runtime: _AcquisitionRuntime | None = None
     try:
         _require_data_dir_inside_project(project_root=project_root, data_dir=data_dir)
         with _source_lock(data_dir):
@@ -384,17 +1104,39 @@ def sync_polyhaven_models(
             )
             loaded_state = _load_state(state_path, project_root=project_root)
             state = loaded_state.payload
-            listing_payload = _fetch_json(POLYHAVEN_MODELS_URL)
+            runtime = _AcquisitionRuntime(
+                config=config,
+                clock=SystemClock(),
+                project_root=project_root,
+                data_dir=data_dir,
+            )
+            listing_payload = _fetch_json(POLYHAVEN_MODELS_URL, runtime=runtime)
             models = parse_polyhaven_model_listing(listing_payload)
             snapshot_sha256 = _listing_sha256(models)
-            selected, next_selection_class = _select_models(models, state=state, limit=limit)
+            allowed_unseen_ids = runtime.quota.allowed_unseen_ids(models, state=state)
+            selected, next_selection_class = _select_models(
+                models,
+                state=state,
+                limit=limit,
+                allowed_unseen_ids=allowed_unseen_ids,
+            )
+            state_items = _object(state.get("items"), "Poly Haven state items")
+            unseen_selected = tuple(
+                model.asset_id for model in selected if model.asset_id not in state_items
+            )
+            runtime.quota.reserve_items(unseen_selected)
+            if allowed_unseen_ids is not None:
+                runtime.stats.deferred_new_items = sum(
+                    model.asset_id not in state_items and model.asset_id not in allowed_unseen_ids
+                    for model in models
+                )
             sync_items: list[PolyHavenSyncItem] = []
             manifest_items: list[dict[str, Any]] = []
             for model in selected:
                 files_url = POLYHAVEN_FILES_URL.format(source_id=quote(model.source_id, safe=""))
                 package = parse_polyhaven_model_files(
                     model.source_id,
-                    _fetch_json(files_url),
+                    _fetch_json(files_url, runtime=runtime),
                     resolution=checked_resolution,
                 )
                 root_dir = _ensure_safe_directory(
@@ -412,6 +1154,8 @@ def sync_polyhaven_models(
                         file_spec,
                         destination=_safe_destination(root_dir, file_spec.relative_path),
                         force=force,
+                        asset_id=model.asset_id,
+                        runtime=runtime,
                     )
                     for file_spec in package.files
                 )
@@ -425,6 +1169,7 @@ def sync_polyhaven_models(
                     acquired_at=acquired_at or verified_at,
                     verified_at=verified_at,
                 )
+                runtime.check_disk_growth(len(_render_json(metadata)))
                 _write_json_atomic(metadata_path, metadata)
                 relative_files = tuple(
                     sorted(
@@ -515,6 +1260,7 @@ def sync_polyhaven_models(
                     "force": force,
                     "limit": limit,
                     "resolution": checked_resolution,
+                    "runtime": config.as_dict(),
                 },
                 "listing": {
                     "url": POLYHAVEN_MODELS_URL,
@@ -543,6 +1289,7 @@ def sync_polyhaven_models(
                     "downloaded_bytes": downloaded_bytes,
                     "verified_bytes": verified_bytes,
                 },
+                "runtime": runtime.evidence(),
                 "items": manifest_items,
             }
             prepare_receipt_sha256 = _prepared_manifest_payload_sha256(prepared_manifest)
@@ -551,6 +1298,13 @@ def sync_polyhaven_models(
                 new_state["items"][item.asset_id]["prepared_manifest_payload_sha256"] = (
                     prepare_receipt_sha256
                 )
+            if not sync_items:
+                noop_receipts = _object(
+                    new_state.setdefault("noop_run_receipts", {}),
+                    "Poly Haven state noop_run_receipts",
+                )
+                noop_receipts[run_id] = prepare_receipt_sha256
+                new_state["updated_at"] = completed_at
             prepared_manifest["state"]["after"] = {
                 "file_sha256": _json_file_sha256(new_state),
                 "payload_sha256": _payload_sha256(new_state),
@@ -592,12 +1346,14 @@ def sync_polyhaven_models(
             downloaded_bytes=downloaded_bytes,
             verified_bytes=verified_bytes,
             snapshot_sha256=snapshot_sha256,
+            runtime_evidence=runtime.evidence(),
         )
     except BaseException as exc:
         _persist_run_failure(
             manifest_path=manifest_path,
             intent_path=intent_path,
             error=exc,
+            runtime_evidence=runtime.evidence() if runtime is not None else None,
         )
         if isinstance(exc, PolyHavenAcquireError):
             raise
@@ -636,7 +1392,8 @@ def finalize_polyhaven_items(
         state = loaded_state.payload
         manifest = _read_json_object_strict(result.manifest_path, "Poly Haven run manifest")
         if (
-            manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
+            manifest.get("schema_version")
+            not in {LEGACY_RUN_MANIFEST_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION}
             or manifest.get("source") != POLYHAVEN_SOURCE
             or manifest.get("asset_type") != "models"
             or manifest.get("run_id") != result.run_dir.name
@@ -783,6 +1540,7 @@ def _select_models(
     *,
     state: dict[str, Any],
     limit: int,
+    allowed_unseen_ids: frozenset[str] | None = None,
 ) -> tuple[tuple[PolyHavenModel, ...], str]:
     state_items = state["items"]
     pending: list[PolyHavenModel] = []
@@ -790,7 +1548,8 @@ def _select_models(
     for model in models:
         entry = state_items.get(model.asset_id)
         if entry is None:
-            unseen.append(model)
+            if allowed_unseen_ids is None or model.asset_id in allowed_unseen_ids:
+                unseen.append(model)
         elif entry["status"] == "downloaded":
             pending.append(model)
     pending.sort(
@@ -829,6 +1588,7 @@ def _state_after_sync(
     migrated_from: int | None,
 ) -> dict[str, Any]:
     result = json.loads(json.dumps(state))
+    result.setdefault("noop_run_receipts", {})
     watermark = _listing_watermark(listing_models)
     previous_listing = state.get("last_listing")
     if (
@@ -909,6 +1669,7 @@ def _empty_state() -> dict[str, Any]:
         "updated_at": None,
         "next_selection_class": "unseen",
         "last_listing": None,
+        "noop_run_receipts": {},
         "items": {},
     }
 
@@ -940,6 +1701,8 @@ def _load_state(path: Path, *, project_root: Path) -> _LoadedState:
     file_sha256 = _sha256_file(path)
     payload_sha256 = _payload_sha256(raw_state)
     version = raw_state.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise PolyHavenAcquireError("Poly Haven state schema version is not canonical")
     migrated_from: int | None = None
     if version == 1:
         state = _migrate_v1_state(raw_state, project_root=project_root)
@@ -969,9 +1732,17 @@ def _validate_v2_state(state: dict[str, Any], *, project_root: Path) -> None:
         "last_listing",
         "items",
     }
-    if set(state) != expected_keys:
+    if frozenset(state) not in {
+        frozenset(expected_keys),
+        frozenset(expected_keys | {"noop_run_receipts"}),
+    }:
         raise PolyHavenAcquireError("Poly Haven state has an unsupported shape")
-    if state.get("schema_version") != STATE_SCHEMA_VERSION:
+    schema_version = state.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != STATE_SCHEMA_VERSION
+    ):
         raise PolyHavenAcquireError("Poly Haven state schema version is invalid")
     if state.get("source") != POLYHAVEN_SOURCE or state.get("asset_type") != "models":
         raise PolyHavenAcquireError("Poly Haven state source identity is invalid")
@@ -983,6 +1754,12 @@ def _validate_v2_state(state: dict[str, Any], *, project_root: Path) -> None:
     if state.get("next_selection_class") not in _SELECTION_CLASSES:
         raise PolyHavenAcquireError("Poly Haven state selection class is invalid")
     _validate_last_listing(state.get("last_listing"))
+    raw_noop_receipts = state.get("noop_run_receipts", {})
+    if not isinstance(raw_noop_receipts, dict):
+        raise PolyHavenAcquireError("Poly Haven state noop_run_receipts must be an object")
+    for run_id, receipt in raw_noop_receipts.items():
+        _string(run_id, "state noop run_id", max_length=128)
+        _sha256_value(receipt, f"state noop receipt {run_id}")
     items = state.get("items")
     if not isinstance(items, dict):
         raise PolyHavenAcquireError("Poly Haven state items must be an object")
@@ -1276,7 +2053,7 @@ def _prepared_manifest_payload_sha256(manifest: Mapping[str, Any]) -> str:
         raise PolyHavenAcquireError("Poly Haven run manifest is not receipt-eligible")
     state = _object(manifest.get("state"), "run manifest state")
     prepared_status = "prepared" if status == "finalized" else status
-    payload = {
+    payload: dict[str, Any] = {
         "schema_version": manifest.get("schema_version"),
         "source": manifest.get("source"),
         "asset_type": manifest.get("asset_type"),
@@ -1295,7 +2072,207 @@ def _prepared_manifest_payload_sha256(manifest: Mapping[str, Any]) -> str:
         "counts": manifest.get("counts"),
         "items": manifest.get("items"),
     }
+    if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
+        payload["runtime"] = manifest.get("runtime")
     return _domain_payload_sha256(_PREPARED_MANIFEST_DIGEST_DOMAIN, payload)
+
+
+def _validate_runtime_config_payload(value: Any) -> PolyHavenRuntimeConfig:
+    payload = _exact_object(
+        value,
+        {"request_rate_per_sec", "request_burst", "retry", "daily_quota", "disk_quota"},
+        "run manifest runtime configuration",
+    )
+    retry = _exact_object(
+        payload["retry"],
+        {
+            "max_attempts",
+            "integrity_max_attempts",
+            "base_delay_sec",
+            "max_delay_sec",
+            "max_retry_after_sec",
+        },
+        "run manifest retry configuration",
+    )
+    daily = _exact_object(
+        payload["daily_quota"],
+        {"max_new_items", "max_download_bytes"},
+        "run manifest daily quota configuration",
+    )
+    disk = _exact_object(
+        payload["disk_quota"],
+        {"max_storage_bytes", "min_free_bytes"},
+        "run manifest disk quota configuration",
+    )
+    try:
+        config = PolyHavenRuntimeConfig(
+            request_rate_per_sec=payload["request_rate_per_sec"],
+            request_burst=payload["request_burst"],
+            retry_max_attempts=retry["max_attempts"],
+            integrity_max_attempts=retry["integrity_max_attempts"],
+            retry_base_delay_sec=retry["base_delay_sec"],
+            retry_max_delay_sec=retry["max_delay_sec"],
+            max_retry_after_sec=retry["max_retry_after_sec"],
+            max_new_items_per_day=daily["max_new_items"],
+            max_download_bytes_per_day=daily["max_download_bytes"],
+            max_storage_bytes=disk["max_storage_bytes"],
+            min_free_bytes=disk["min_free_bytes"],
+        )
+    except (PolyHavenAcquireError, TypeError) as exc:
+        raise PolyHavenAcquireError("run manifest runtime configuration is invalid") from exc
+    if _payload_sha256(config.as_dict()) != _payload_sha256(payload):
+        raise PolyHavenAcquireError("run manifest runtime configuration is not canonical")
+    return config
+
+
+def _runtime_usage_payload(value: Any, context: str) -> dict[str, Any]:
+    payload = _exact_object(
+        value,
+        {"new_items_reserved", "download_bytes_reserved"},
+        context,
+    )
+    _nonnegative_int(payload["new_items_reserved"], f"{context}.new_items_reserved")
+    _nonnegative_int(payload["download_bytes_reserved"], f"{context}.download_bytes_reserved")
+    return payload
+
+
+def _validate_runtime_evidence(
+    value: Any,
+    *,
+    config: PolyHavenRuntimeConfig,
+    project_root: Path,
+    downloaded_bytes: int,
+) -> None:
+    payload = _exact_object(value, {"http", "daily_quota", "disk"}, "run manifest runtime")
+    http = _exact_object(
+        payload["http"],
+        {
+            "request_attempts",
+            "retry_attempts",
+            "retry_after_honored",
+            "rate_limit_wait_ms",
+            "retry_wait_ms",
+            "download_body_bytes",
+        },
+        "run manifest runtime.http",
+    )
+    for key, raw in http.items():
+        _nonnegative_int(raw, f"run manifest runtime.http.{key}")
+    if http["request_attempts"] < 1 or http["retry_attempts"] > http["request_attempts"]:
+        raise PolyHavenAcquireError("run manifest HTTP attempt accounting differs")
+    if http["retry_after_honored"] > http["retry_attempts"]:
+        raise PolyHavenAcquireError("run manifest Retry-After accounting differs")
+    if http["download_body_bytes"] != downloaded_bytes:
+        raise PolyHavenAcquireError("run manifest download body accounting differs")
+
+    daily = _exact_object(
+        payload["daily_quota"],
+        {
+            "enabled",
+            "ledger_path",
+            "utc_day",
+            "usage_before",
+            "reserved_by_run",
+            "accounted_overage_bytes",
+            "released_probe_bytes",
+            "deferred_new_items",
+            "usage_after",
+            "item_reservations_after",
+            "open_downloads_after",
+            "ledger_file_sha256",
+        },
+        "run manifest runtime.daily_quota",
+    )
+    enabled = daily["enabled"]
+    expected_enabled = (
+        config.daily_quota_limits.max_new_items is not None
+        or config.daily_quota_limits.max_download_bytes is not None
+    )
+    if not isinstance(enabled, bool) or enabled is not expected_enabled:
+        raise PolyHavenAcquireError("run manifest daily quota enablement differs")
+    raw_day = daily["utc_day"]
+    if not isinstance(raw_day, str):
+        raise PolyHavenAcquireError("run manifest daily quota day is invalid")
+    try:
+        parsed_day = date.fromisoformat(raw_day)
+    except ValueError as exc:
+        raise PolyHavenAcquireError("run manifest daily quota day is invalid") from exc
+    if parsed_day.isoformat() != raw_day:
+        raise PolyHavenAcquireError("run manifest daily quota day is not canonical")
+    before = _runtime_usage_payload(daily["usage_before"], "daily quota usage_before")
+    after = _runtime_usage_payload(daily["usage_after"], "daily quota usage_after")
+    reserved = _exact_object(
+        daily["reserved_by_run"],
+        {"new_items", "download_bytes"},
+        "daily quota reserved_by_run",
+    )
+    for key, raw in reserved.items():
+        _nonnegative_int(raw, f"daily quota reserved_by_run.{key}")
+    accounted_overage = _nonnegative_int(
+        daily["accounted_overage_bytes"], "daily quota accounted_overage_bytes"
+    )
+    released_probe_bytes = _nonnegative_int(
+        daily["released_probe_bytes"], "daily quota released_probe_bytes"
+    )
+    deferred_new_items = _nonnegative_int(
+        daily["deferred_new_items"], "daily quota deferred_new_items"
+    )
+    if (
+        before["new_items_reserved"] + reserved["new_items"] != after["new_items_reserved"]
+        or before["download_bytes_reserved"] + reserved["download_bytes"] - released_probe_bytes
+        != after["download_bytes_reserved"]
+    ):
+        raise PolyHavenAcquireError("run manifest daily quota reservation accounting differs")
+    item_count = _nonnegative_int(
+        daily["item_reservations_after"], "daily quota item_reservations_after"
+    )
+    _nonnegative_int(daily["open_downloads_after"], "daily quota open_downloads_after")
+    if item_count != after["new_items_reserved"]:
+        raise PolyHavenAcquireError("run manifest daily item reservation accounting differs")
+    ledger_path = daily["ledger_path"]
+    ledger_hash = daily["ledger_file_sha256"]
+    if enabled:
+        _portable_state_path(
+            ledger_path,
+            project_root=project_root,
+            context="run manifest daily quota ledger_path",
+        )
+        if ledger_hash is not None:
+            _sha256_value(ledger_hash, "run manifest daily quota ledger hash")
+    elif (
+        ledger_path is not None
+        or ledger_hash is not None
+        or any(before.values())
+        or any(after.values())
+        or any(reserved.values())
+        or accounted_overage
+        or released_probe_bytes
+        or item_count
+        or daily["open_downloads_after"]
+        or deferred_new_items
+    ):
+        raise PolyHavenAcquireError("disabled run manifest daily quota contains accounting")
+    if accounted_overage:
+        raise PolyHavenAcquireError("receipt-eligible run contains download overage accounting")
+    if (
+        config.daily_quota_limits.max_download_bytes is not None
+        and downloaded_bytes > after["download_bytes_reserved"]
+    ):
+        raise PolyHavenAcquireError("run downloaded bytes exceed durable quota reservations")
+
+    disk = _exact_object(
+        payload["disk"],
+        {"checks", "max_storage_bytes_observed", "min_free_bytes_observed"},
+        "run manifest runtime.disk",
+    )
+    checks = _nonnegative_int(disk["checks"], "run manifest runtime.disk.checks")
+    for key in ("max_storage_bytes_observed", "min_free_bytes_observed"):
+        raw = disk[key]
+        if checks == 0:
+            if raw is not None:
+                raise PolyHavenAcquireError("run manifest disk observation exists without checks")
+        else:
+            _nonnegative_int(raw, f"run manifest runtime.disk.{key}")
 
 
 def _validate_prepared_manifest_receipt(
@@ -1306,6 +2283,14 @@ def _validate_prepared_manifest_receipt(
     require_current_state_receipt: bool = True,
 ) -> None:
     status = manifest.get("status")
+    version = manifest.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        raise PolyHavenAcquireError("Poly Haven run manifest schema version is not canonical")
+    has_runtime_receipt = version == RUN_MANIFEST_SCHEMA_VERSION
+    if version == LEGACY_RUN_MANIFEST_SCHEMA_VERSION and status == "noop":
+        raise PolyHavenAcquireError(
+            "legacy schema-2 no-op receipts are unverifiable and may not be replayed"
+        )
     base_keys = {
         "schema_version",
         "source",
@@ -1322,13 +2307,15 @@ def _validate_prepared_manifest_receipt(
         "items",
         "prepare_receipt_sha256",
     }
+    if has_runtime_receipt:
+        base_keys.add("runtime")
     expected_keys = base_keys | (
         {"finalized_at", "finalization"} if status == "finalized" else set()
     )
     if status not in {"prepared", "finalized", "noop"} or set(manifest) != expected_keys:
         raise PolyHavenAcquireError("Poly Haven run manifest has an unsupported receipt shape")
     if (
-        manifest.get("schema_version") != RUN_MANIFEST_SCHEMA_VERSION
+        version not in {LEGACY_RUN_MANIFEST_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION}
         or manifest.get("source") != POLYHAVEN_SOURCE
         or manifest.get("asset_type") != "models"
     ):
@@ -1337,13 +2324,17 @@ def _validate_prepared_manifest_receipt(
     _timestamp(manifest.get("started_at"), "run manifest started_at")
     _timestamp(manifest.get("completed_at"), "run manifest completed_at")
 
-    request = _exact_object(
-        manifest.get("request"), {"force", "limit", "resolution"}, "run manifest request"
-    )
+    request_keys = {"force", "limit", "resolution"}
+    if has_runtime_receipt:
+        request_keys.add("runtime")
+    request = _exact_object(manifest.get("request"), request_keys, "run manifest request")
     if not isinstance(request["force"], bool):
         raise PolyHavenAcquireError("run manifest request.force must be boolean")
     _positive_int(request["limit"], "run manifest request.limit")
     _resolution(request["resolution"])
+    runtime_config = (
+        _validate_runtime_config_payload(request["runtime"]) if has_runtime_receipt else None
+    )
 
     listing = _exact_object(
         manifest.get("listing"),
@@ -1431,6 +2422,13 @@ def _validate_prepared_manifest_receipt(
     )
     for key, value in counts.items():
         _nonnegative_int(value, f"run manifest counts.{key}")
+    if runtime_config is not None:
+        _validate_runtime_evidence(
+            manifest.get("runtime"),
+            config=runtime_config,
+            project_root=project_root,
+            downloaded_bytes=counts["downloaded_bytes"],
+        )
     raw_items = manifest.get("items")
     if not isinstance(raw_items, list):
         raise PolyHavenAcquireError("Poly Haven run manifest items must be a list")
@@ -1531,7 +2529,6 @@ def _validate_prepared_manifest_receipt(
             item_counts["downloaded_files"] != downloaded_actions
             or item_counts["reused_files"] != reused_actions
             or item_counts["verified_bytes"] != verified_file_bytes
-            or item_counts["downloaded_bytes"] > verified_file_bytes
         ):
             raise PolyHavenAcquireError(f"run manifest item accounting differs for {asset_id!r}")
         state_item = state.get("items", {}).get(asset_id)
@@ -1545,6 +2542,13 @@ def _validate_prepared_manifest_receipt(
     actual_receipt_sha256 = _prepared_manifest_payload_sha256(manifest)
     if prepare_receipt_sha256 != actual_receipt_sha256:
         raise PolyHavenAcquireError("Poly Haven prepared manifest receipt changed")
+    if status == "noop":
+        noop_receipts = _object(
+            state.get("noop_run_receipts"),
+            "Poly Haven state noop_run_receipts",
+        )
+        if noop_receipts.get(manifest["run_id"]) != prepare_receipt_sha256:
+            raise PolyHavenAcquireError("Poly Haven no-op receipt is not anchored in state")
     if status == "finalized":
         _validated_finalization_payload(
             manifest=manifest,
@@ -1835,85 +2839,277 @@ def _acquire_file(
     *,
     destination: Path,
     force: bool,
+    asset_id: str | None = None,
+    runtime: _AcquisitionRuntime | None = None,
 ) -> _DownloadedFile:
+    if runtime is not None and asset_id is None:
+        raise PolyHavenAcquireError("runtime-controlled downloads require an asset_id")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists() or destination.is_symlink():
-        _require_regular_file(destination, "Poly Haven destination")
-        if not force:
-            sha256 = _verify_file(destination, spec, context="existing Poly Haven file")
-            return _DownloadedFile(
-                spec=spec,
-                path=destination,
-                sha256=sha256,
-                reused=True,
-                downloaded_bytes=0,
-            )
     partial = destination.with_name(f".{destination.name}.part")
+    destination_exists = destination.exists() or destination.is_symlink()
+    if destination_exists:
+        _require_regular_file(destination, "Poly Haven destination")
+    partial_size: int | None = None
     if partial.exists() or partial.is_symlink():
         _require_regular_file(partial, "Poly Haven partial download")
-        if force:
+        partial_size = partial.stat().st_size
+        if partial_size > spec.bytes:
+            if partial_size != spec.bytes + _OVERSIZE_PROBE_BYTES:
+                raise PolyHavenAcquireError("Poly Haven partial exceeds the bounded oversize probe")
+            if runtime is not None and asset_id is not None:
+                runtime.quota.recover_oversized_download(
+                    _quota_download_key(asset_id=asset_id, spec=spec),
+                    _OVERSIZE_PROBE_BYTES,
+                )
             partial.unlink()
-    offset = partial.stat().st_size if partial.exists() else 0
-    if offset > spec.bytes:
-        partial.unlink()
-        offset = 0
-    downloaded_bytes = 0
-    if offset < spec.bytes:
-        request = urllib.request.Request(spec.url, headers={"User-Agent": USER_AGENT})
-        if offset:
-            request.add_header("Range", f"bytes={offset}-")
-        try:
-            response = _open_url(request, timeout=300, allowed_hosts=frozenset({_DOWNLOAD_HOST}))
-            with response:
-                _validate_response_url(response, expected_host=_DOWNLOAD_HOST)
-                status = _response_status(response)
-                mode = "ab"
-                if offset:
-                    if status == 206:
-                        _validate_content_range(response, offset=offset, total=spec.bytes)
-                    elif status == 200:
-                        offset = 0
-                        mode = "wb"
-                    else:
-                        raise PolyHavenAcquireError(
-                            f"Poly Haven resume returned HTTP {status} for {spec.url}"
-                        )
-                elif status not in {200, 206}:
-                    raise PolyHavenAcquireError(
-                        f"Poly Haven download returned HTTP {status} for {spec.url}"
-                    )
-                written = offset
-                with partial.open(mode) as file:
-                    while chunk := response.read(_HASH_CHUNK_BYTES):
-                        written += len(chunk)
-                        if written > spec.bytes:
-                            raise PolyHavenAcquireError(
-                                f"Poly Haven download exceeds expected size: {spec.url}"
-                            )
-                        file.write(chunk)
-                        downloaded_bytes += len(chunk)
-                    file.flush()
-                    os.fsync(file.fileno())
-        except PolyHavenAcquireError:
-            raise
-        except (OSError, urllib.error.URLError) as exc:
+            _fsync_directory(partial.parent)
             raise PolyHavenAcquireError(
-                f"cannot download Poly Haven file {spec.url}: {exc}"
-            ) from exc
-    actual_size = partial.stat().st_size if partial.exists() else 0
-    if actual_size != spec.bytes:
-        raise PolyHavenAcquireError(
-            f"Poly Haven download size mismatch: {spec.url} "
-            f"expected={spec.bytes} actual={actual_size}"
+                "recovered a previously received oversized Poly Haven response"
+            )
+
+    probe_release_is_safe = partial_size is None or partial_size < spec.bytes
+    if destination_exists and not force:
+        sha256 = _verify_file(destination, spec, context="existing Poly Haven file")
+        if runtime is not None and asset_id is not None:
+            runtime.quota.finish_download(
+                _quota_download_key(asset_id=asset_id, spec=spec),
+                release_probe=probe_release_is_safe,
+            )
+        if partial_size is not None:
+            partial.unlink()
+            _fsync_directory(partial.parent)
+        return _DownloadedFile(
+            spec=spec,
+            path=destination,
+            sha256=sha256,
+            reused=True,
+            downloaded_bytes=0,
         )
-    try:
-        sha256 = _verify_file(partial, spec, context="Poly Haven download")
-    except PolyHavenAcquireError:
-        partial.unlink(missing_ok=True)
-        _fsync_directory(partial.parent)
-        raise
+    if force:
+        if runtime is not None and asset_id is not None:
+            # A crash may have left either a replaced destination or an
+            # in-progress forced partial bound to the old reservation. Settle
+            # it before --force creates a distinct transfer reservation.
+            runtime.quota.finish_download(
+                _quota_download_key(asset_id=asset_id, spec=spec),
+                release_probe=probe_release_is_safe,
+            )
+        if partial_size is not None:
+            partial.unlink()
+            _fsync_directory(partial.parent)
+            partial_size = None
+    retain_probe_on_close = partial_size == spec.bytes
+    downloaded_bytes = 0
+
+    def close_quota_download() -> None:
+        nonlocal retain_probe_on_close
+        if runtime is not None and asset_id is not None:
+            runtime.quota.finish_download(
+                _quota_download_key(asset_id=asset_id, spec=spec),
+                release_probe=not retain_probe_on_close,
+            )
+        retain_probe_on_close = False
+
+    def attempt() -> str:
+        nonlocal downloaded_bytes, retain_probe_on_close
+        offset = partial.stat().st_size if partial.exists() else 0
+        if offset > spec.bytes:
+            raise PolyHavenAcquireError("Poly Haven partial changed beyond its expected size")
+        if offset == spec.bytes:
+            # Re-entering with a complete partial means the prior attempt did
+            # not durably prove the EOF/sentinel read. Conservatively consume
+            # its probe just like a complete partial found after restart.
+            retain_probe_on_close = True
+        quota_key: str | None = None
+        probe_bytes = _OVERSIZE_PROBE_BYTES
+        body_bytes_claimed = 0
+        body_bytes_received = 0
+
+        def release_unused_body_claim() -> None:
+            nonlocal body_bytes_claimed
+            unused = body_bytes_claimed - body_bytes_received
+            if unused < 0:
+                raise PolyHavenAcquireError("download body exceeded its durable claim")
+            if runtime is not None:
+                runtime.quota.release_download_body_claim(quota_key, unused)
+            body_bytes_claimed = body_bytes_received
+
+        if offset < spec.bytes:
+            if runtime is not None and asset_id is not None:
+                probe_bytes = runtime.quota.download_probe_bytes(
+                    asset_id=asset_id,
+                    spec=spec,
+                )
+                probe_bytes = runtime.check_disk_growth(
+                    spec.bytes - offset,
+                    optional_probe_bytes=probe_bytes,
+                )
+                quota_key = runtime.quota.begin_download(
+                    asset_id=asset_id,
+                    spec=spec,
+                    maximum_probe_bytes=probe_bytes,
+                )
+                runtime.quota.claim_download_body_floor(quota_key, offset)
+            request = urllib.request.Request(spec.url, headers={"User-Agent": USER_AGENT})
+            if offset:
+                request.add_header("Range", f"bytes={offset}-")
+            body_bytes_claimed = spec.bytes - offset + probe_bytes
+            if runtime is not None:
+                runtime.quota.claim_download_body(quota_key, body_bytes_claimed)
+                runtime.start_request()
+                _set_redirect_request_hook(request, runtime.start_request)
+            try:
+                response = _open_url(
+                    request,
+                    timeout=300,
+                    allowed_hosts=frozenset({_DOWNLOAD_HOST}),
+                )
+            except urllib.error.HTTPError as exc:
+                release_unused_body_claim()
+                failure = _http_attempt_failure(exc.code, phase="download", headers=exc.headers)
+                exc.close()
+                raise failure from exc
+            except (OSError, urllib.error.URLError) as exc:
+                release_unused_body_claim()
+                raise _transport_attempt_failure("download") from exc
+            try:
+                with response:
+                    _validate_response_url(response, expected_host=_DOWNLOAD_HOST)
+                    status = _response_status(response)
+                    mode = "ab"
+                    if offset:
+                        if status == 206:
+                            _validate_content_range(response, offset=offset, total=spec.bytes)
+                            _validate_content_length(
+                                response,
+                                expected_bytes=spec.bytes - offset,
+                                required=probe_bytes == 0,
+                            )
+                        elif status == 200:
+                            _validate_content_length(
+                                response,
+                                expected_bytes=spec.bytes,
+                                required=probe_bytes == 0,
+                            )
+                            if runtime is not None:
+                                runtime.quota.claim_download_body(quota_key, offset)
+                            body_bytes_claimed += offset
+                            offset = 0
+                            mode = "wb"
+                        elif status >= 400:
+                            raise _http_attempt_failure(
+                                status,
+                                phase="download",
+                                headers=getattr(response, "headers", None),
+                            )
+                        else:
+                            raise PolyHavenAcquireError(
+                                f"Poly Haven resume returned HTTP {status} for {spec.url}"
+                            )
+                    elif status not in {200, 206}:
+                        if status >= 400:
+                            raise _http_attempt_failure(
+                                status,
+                                phase="download",
+                                headers=getattr(response, "headers", None),
+                            )
+                        raise PolyHavenAcquireError(
+                            f"Poly Haven download returned HTTP {status} for {spec.url}"
+                        )
+                    else:
+                        _validate_content_length(
+                            response,
+                            expected_bytes=spec.bytes,
+                            required=probe_bytes == 0,
+                        )
+                    written = offset
+                    with partial.open(mode) as file:
+                        while True:
+                            remaining = spec.bytes - written
+                            # Read at most one sentinel byte beyond the declared
+                            # closure when quota headroom reserved that probe.
+                            # At an exact hard-quota boundary, stop after the
+                            # declared closure instead of receiving an
+                            # unaccounted byte from the transport.
+                            readable = remaining + probe_bytes
+                            if readable == 0:
+                                break
+                            read_size = min(_HASH_CHUNK_BYTES, readable)
+                            chunk = response.read(read_size)
+                            if len(chunk) > read_size:
+                                excess = len(chunk) - read_size
+                                if runtime is not None:
+                                    runtime.quota.claim_download_body(quota_key, excess)
+                                body_bytes_claimed += excess
+                                body_bytes_received += len(chunk)
+                                raise PolyHavenAcquireError(
+                                    "Poly Haven response returned more bytes than requested"
+                                )
+                            body_bytes_received += len(chunk)
+                            if not chunk:
+                                break
+                            downloaded_bytes += len(chunk)
+                            if runtime is not None:
+                                runtime.record_download_body_bytes(len(chunk))
+                            written += len(chunk)
+                            if written > spec.bytes:
+                                overage = written - spec.bytes
+                                # Preserve the single probe byte in the partial
+                                # until the ledger atomically records that it was
+                                # consumed. If that commit fails, restart can
+                                # recognize and settle the debt without network.
+                                file.write(chunk)
+                                file.flush()
+                                os.fsync(file.fileno())
+                                if runtime is not None:
+                                    runtime.quota.finish_oversized_download(
+                                        quota_key,
+                                        overage,
+                                    )
+                                partial.unlink(missing_ok=True)
+                                _fsync_directory(partial.parent)
+                                raise PolyHavenAcquireError(
+                                    f"Poly Haven download exceeds expected size: {spec.url}"
+                                )
+                            file.write(chunk)
+                        file.flush()
+                        os.fsync(file.fileno())
+            except _AttemptFailure:
+                raise
+            except (OSError, urllib.error.URLError) as exc:
+                raise _transport_attempt_failure("download") from exc
+            finally:
+                release_unused_body_claim()
+        actual_size = partial.stat().st_size if partial.exists() else 0
+        if actual_size != spec.bytes:
+            raise _AttemptFailure(
+                AcquisitionFailure(
+                    kind=FailureKind.SHORT_READ,
+                    phase="download",
+                    message=(
+                        f"Poly Haven download size mismatch: expected={spec.bytes} "
+                        f"actual={actual_size}"
+                    ),
+                )
+            )
+        try:
+            return _verify_file(partial, spec, context="Poly Haven download")
+        except PolyHavenAcquireError as exc:
+            close_quota_download()
+            partial.unlink(missing_ok=True)
+            _fsync_directory(partial.parent)
+            raise _AttemptFailure(
+                AcquisitionFailure(
+                    kind=FailureKind.INTEGRITY,
+                    phase="download",
+                    message=str(exc),
+                )
+            ) from exc
+
+    sha256 = _run_retryable(runtime=runtime, phase="download", operation=attempt)
     partial.replace(destination)
     _fsync_directory(destination.parent)
+    close_quota_download()
     return _DownloadedFile(
         spec=spec,
         path=destination,
@@ -1943,7 +3139,139 @@ def _verify_file(path: Path, spec: PolyHavenFileSpec, *, context: str) -> str:
     return sha256.hexdigest()
 
 
-def _fetch_json(url: str) -> dict[str, Any]:
+def _run_retryable(
+    *,
+    runtime: _AcquisitionRuntime | None,
+    phase: str,
+    operation: Any,
+) -> Any:
+    if runtime is not None:
+        return runtime.run_with_retries(phase=phase, operation=operation)
+    try:
+        return operation()
+    except _AttemptFailure as exc:
+        raise PolyHavenAcquireError(exc.failure.message) from exc
+
+
+def _set_redirect_request_hook(
+    request: urllib.request.Request,
+    hook: Callable[[], None],
+) -> None:
+    setattr(request, _REDIRECT_HOOK_ATTRIBUTE, hook)
+
+
+def _response_header(headers: Any, name: str) -> str | None:
+    if headers is None:
+        return None
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if isinstance(value, str):
+            return value
+    items = getattr(headers, "items", None)
+    if callable(items):
+        for key, value in items():
+            if (
+                isinstance(key, str)
+                and key.casefold() == name.casefold()
+                and isinstance(value, str)
+            ):
+                return value
+    return None
+
+
+def _validate_content_length(
+    response: Any,
+    *,
+    expected_bytes: int,
+    required: bool = False,
+) -> None:
+    if not isinstance(required, bool):
+        raise PolyHavenAcquireError("Content-Length requirement flag must be boolean")
+    headers = getattr(response, "headers", None)
+    content_lengths = _response_header_values(headers, "Content-Length")
+    transfer_encodings = _response_header_values(headers, "Transfer-Encoding")
+    if content_lengths and transfer_encodings:
+        raise PolyHavenAcquireError(
+            "Poly Haven response has ambiguous Content-Length and Transfer-Encoding framing"
+        )
+    if not content_lengths:
+        if required:
+            raise PolyHavenAcquireError(
+                "Poly Haven response requires an exact Content-Length without an oversize probe"
+            )
+        return
+    if len(content_lengths) != 1:
+        raise PolyHavenAcquireError("Poly Haven response Content-Length is ambiguous")
+    value = content_lengths[0]
+    if len(value) > 20 or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
+        raise PolyHavenAcquireError("Poly Haven response Content-Length is invalid")
+    if int(value) != expected_bytes:
+        raise PolyHavenAcquireError(
+            "Poly Haven response Content-Length differs from its expected body"
+        )
+
+
+def _response_header_values(headers: Any, name: str) -> tuple[str, ...]:
+    if headers is None:
+        return ()
+    get_all = getattr(headers, "get_all", None)
+    if callable(get_all):
+        values = get_all(name)
+        if values is not None:
+            if not isinstance(values, list | tuple) or any(
+                not isinstance(value, str) for value in values
+            ):
+                raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+            return tuple(values)
+    items = getattr(headers, "items", None)
+    if callable(items):
+        matches: list[str] = []
+        for key, value in items():
+            if isinstance(key, str) and key.casefold() == name.casefold():
+                if not isinstance(value, str):
+                    raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+                matches.append(value)
+        return tuple(matches)
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+        value = getter(name)
+        if value is None:
+            return ()
+        if not isinstance(value, str):
+            raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+        return (value,)
+    raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+
+
+def _http_attempt_failure(status: int, *, phase: str, headers: Any) -> _AttemptFailure:
+    if not 400 <= status <= 599:
+        raise PolyHavenAcquireError(f"Poly Haven {phase} returned unexpected HTTP {status}")
+    try:
+        failure = AcquisitionFailure.from_http(
+            phase=phase,
+            status=status,
+            message=f"Poly Haven {phase} returned HTTP {status}",
+        )
+    except RuntimeValidationError as exc:
+        raise PolyHavenAcquireError(f"Poly Haven {phase} HTTP failure is invalid") from exc
+    return _AttemptFailure(
+        failure,
+        retry_after_value=_response_header(headers, "Retry-After"),
+    )
+
+
+def _transport_attempt_failure(phase: str) -> _AttemptFailure:
+    return _AttemptFailure(
+        AcquisitionFailure(
+            kind=FailureKind.TRANSPORT,
+            phase=phase,
+            message=f"cannot complete Poly Haven {phase} request",
+        )
+    )
+
+
+def _fetch_json(url: str, *, runtime: _AcquisitionRuntime | None = None) -> dict[str, Any]:
     parsed = urlsplit(url)
     if (
         parsed.scheme != "https"
@@ -1952,16 +3280,41 @@ def _fetch_json(url: str) -> dict[str, Any]:
         or parsed.password
     ):
         raise PolyHavenAcquireError(f"unapproved Poly Haven API URL: {url}")
-    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with _open_url(request, timeout=60, allowed_hosts=frozenset({_API_HOST})) as response:
-            _validate_response_url(response, expected_host=_API_HOST)
-            status = _response_status(response)
-            if status != 200:
-                raise PolyHavenAcquireError(f"Poly Haven API returned HTTP {status}: {url}")
-            payload = response.read(_MAX_API_JSON_BYTES + 1)
-    except (OSError, urllib.error.URLError) as exc:
-        raise PolyHavenAcquireError(f"cannot fetch Poly Haven API {url}: {exc}") from exc
+
+    def attempt() -> bytes:
+        request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        if runtime is not None:
+            runtime.start_request()
+            _set_redirect_request_hook(request, runtime.start_request)
+        try:
+            response = _open_url(request, timeout=60, allowed_hosts=frozenset({_API_HOST}))
+        except urllib.error.HTTPError as exc:
+            failure = _http_attempt_failure(exc.code, phase="api", headers=exc.headers)
+            exc.close()
+            raise failure from exc
+        except (OSError, urllib.error.URLError) as exc:
+            raise _transport_attempt_failure("api") from exc
+        try:
+            with response:
+                _validate_response_url(response, expected_host=_API_HOST)
+                status = _response_status(response)
+                if status != 200:
+                    if status >= 400:
+                        raise _http_attempt_failure(
+                            status,
+                            phase="api",
+                            headers=getattr(response, "headers", None),
+                        )
+                    raise PolyHavenAcquireError(
+                        f"Poly Haven API returned unexpected HTTP {status}: {url}"
+                    )
+                return response.read(_MAX_API_JSON_BYTES + 1)
+        except _AttemptFailure:
+            raise
+        except (OSError, urllib.error.URLError) as exc:
+            raise _transport_attempt_failure("api") from exc
+
+    payload = _run_retryable(runtime=runtime, phase="api", operation=attempt)
     if len(payload) > _MAX_API_JSON_BYTES:
         raise PolyHavenAcquireError(f"Poly Haven API response exceeds 64 MiB: {url}")
     try:
@@ -3353,7 +4706,13 @@ def _require_state_base(path: Path, loaded: _LoadedState) -> None:
         raise PolyHavenAcquireError("Poly Haven state changed before commit")
 
 
-def _persist_run_failure(*, manifest_path: Path, intent_path: Path, error: BaseException) -> None:
+def _persist_run_failure(
+    *,
+    manifest_path: Path,
+    intent_path: Path,
+    error: BaseException,
+    runtime_evidence: Mapping[str, Any] | None = None,
+) -> None:
     try:
         if intent_path.exists() and _intent_targets_manifest(intent_path, manifest_path):
             _write_json_atomic(
@@ -3375,6 +4734,8 @@ def _persist_run_failure(*, manifest_path: Path, intent_path: Path, error: BaseE
         payload["status"] = "failed" if isinstance(error, Exception) else "interrupted"
         payload["completed_at"] = _utc_now()
         payload["error"] = {"type": type(error).__name__, "message": str(error)}
+        if runtime_evidence is not None:
+            payload["runtime"] = dict(runtime_evidence)
         _write_json_atomic(manifest_path, payload)
     except BaseException:
         return
@@ -3798,6 +5159,220 @@ def _reject_symlink_components(path: Path, *, project_root: Path, context: str) 
             raise PolyHavenAcquireError(f"{context} may not traverse a symlink: {current}")
 
 
+def _empty_quota_ledger(utc_day: date) -> dict[str, Any]:
+    return {
+        "schema_version": _QUOTA_LEDGER_SCHEMA_VERSION,
+        "source": POLYHAVEN_SOURCE,
+        "asset_type": "models",
+        "utc_day": utc_day.isoformat(),
+        "updated_at": None,
+        "usage": {"new_items_reserved": 0, "download_bytes_reserved": 0},
+        "item_ids": [],
+        "open_downloads": {},
+    }
+
+
+def _quota_usage(payload: Mapping[str, Any]) -> DailyQuotaUsage:
+    usage = _object(payload.get("usage"), "Poly Haven quota ledger usage")
+    try:
+        utc_day = date.fromisoformat(str(payload.get("utc_day")))
+    except ValueError as exc:
+        raise PolyHavenAcquireError("Poly Haven quota ledger utc_day is invalid") from exc
+    try:
+        return DailyQuotaUsage(
+            utc_day=utc_day,
+            new_items_reserved=_nonnegative_int(
+                usage.get("new_items_reserved"), "quota new_items_reserved"
+            ),
+            download_bytes_reserved=_nonnegative_int(
+                usage.get("download_bytes_reserved"), "quota download_bytes_reserved"
+            ),
+        )
+    except RuntimeValidationError as exc:
+        raise PolyHavenAcquireError(f"Poly Haven quota ledger usage is invalid: {exc}") from exc
+
+
+def _quota_usage_payload(usage: DailyQuotaUsage) -> dict[str, int]:
+    return {
+        "new_items_reserved": usage.new_items_reserved,
+        "download_bytes_reserved": usage.download_bytes_reserved,
+    }
+
+
+def _quota_download_payload(
+    *,
+    asset_id: str,
+    spec: PolyHavenFileSpec,
+    reserved_bytes: int,
+    oversize_probe_bytes: int = _OVERSIZE_PROBE_BYTES,
+    body_bytes_claimed: int = 0,
+) -> dict[str, Any]:
+    return {
+        "asset_id": asset_id,
+        "relative_path": spec.relative_path.as_posix(),
+        "bytes": spec.bytes,
+        "md5": spec.md5,
+        "reserved_bytes": reserved_bytes,
+        "oversize_probe_bytes": oversize_probe_bytes,
+        "body_bytes_claimed": body_bytes_claimed,
+    }
+
+
+def _quota_download_key(*, asset_id: str, spec: PolyHavenFileSpec) -> str:
+    return _domain_payload_sha256(
+        _QUOTA_DOWNLOAD_KEY_DOMAIN,
+        {
+            "asset_id": asset_id,
+            "relative_path": spec.relative_path.as_posix(),
+            "bytes": spec.bytes,
+            "md5": spec.md5,
+        },
+    )
+
+
+def _validate_quota_ledger(payload: Mapping[str, Any]) -> None:
+    expected = {
+        "schema_version",
+        "source",
+        "asset_type",
+        "utc_day",
+        "updated_at",
+        "usage",
+        "item_ids",
+        "open_downloads",
+    }
+    if set(payload) != expected:
+        raise PolyHavenAcquireError("Poly Haven quota ledger has an unsupported shape")
+    schema_version = payload.get("schema_version")
+    if (
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version != _QUOTA_LEDGER_SCHEMA_VERSION
+        or payload.get("source") != POLYHAVEN_SOURCE
+        or payload.get("asset_type") != "models"
+    ):
+        raise PolyHavenAcquireError("Poly Haven quota ledger identity is invalid")
+    raw_day = payload.get("utc_day")
+    if not isinstance(raw_day, str):
+        raise PolyHavenAcquireError("Poly Haven quota ledger utc_day is invalid")
+    try:
+        parsed_day = date.fromisoformat(raw_day)
+    except ValueError as exc:
+        raise PolyHavenAcquireError("Poly Haven quota ledger utc_day is invalid") from exc
+    if parsed_day.isoformat() != raw_day:
+        raise PolyHavenAcquireError("Poly Haven quota ledger utc_day is not canonical")
+    updated_at = payload.get("updated_at")
+    if updated_at is not None:
+        _timestamp(updated_at, "quota ledger updated_at")
+    usage = _quota_usage(payload)
+    item_ids = payload.get("item_ids")
+    if (
+        not isinstance(item_ids, list)
+        or any(not isinstance(item, str) for item in item_ids)
+        or item_ids != sorted(set(item_ids))
+    ):
+        raise PolyHavenAcquireError("Poly Haven quota ledger item_ids are invalid")
+    for asset_id in item_ids:
+        try:
+            validate_asset_id(asset_id)
+        except ValueError as exc:
+            raise PolyHavenAcquireError(
+                "Poly Haven quota ledger contains an invalid asset id"
+            ) from exc
+    if usage.new_items_reserved != len(item_ids):
+        raise PolyHavenAcquireError("Poly Haven quota ledger item accounting differs")
+    downloads = _object(payload.get("open_downloads"), "quota ledger open_downloads")
+    open_reserved_total = 0
+    for key, raw_download in downloads.items():
+        _sha256_value(key, "quota ledger download key")
+        download = _exact_object(
+            raw_download,
+            {
+                "asset_id",
+                "relative_path",
+                "bytes",
+                "md5",
+                "reserved_bytes",
+                "oversize_probe_bytes",
+                "body_bytes_claimed",
+            },
+            "quota ledger open download",
+        )
+        asset_id = _string(download["asset_id"], "quota download asset_id", max_length=64)
+        try:
+            validate_asset_id(asset_id)
+        except ValueError as exc:
+            raise PolyHavenAcquireError("quota download asset_id is invalid") from exc
+        relative_path = _relative_path(download["relative_path"], "quota download relative_path")
+        size = _positive_int(download["bytes"], "quota download bytes")
+        md5 = _string(download["md5"], "quota download md5", max_length=32)
+        if _MD5_PATTERN.fullmatch(md5) is None:
+            raise PolyHavenAcquireError("quota download md5 is invalid")
+        reserved = _nonnegative_int(download["reserved_bytes"], "quota reserved_bytes")
+        probe_bytes = _nonnegative_int(
+            download["oversize_probe_bytes"], "quota oversize_probe_bytes"
+        )
+        body_bytes_claimed = _nonnegative_int(
+            download["body_bytes_claimed"], "quota body_bytes_claimed"
+        )
+        if probe_bytes not in {0, _OVERSIZE_PROBE_BYTES} or reserved < size + probe_bytes:
+            raise PolyHavenAcquireError(
+                "quota download reservation is smaller than its file and oversize probe"
+            )
+        if body_bytes_claimed > reserved:
+            raise PolyHavenAcquireError(
+                "quota download body claims exceed their durable reservation"
+            )
+        open_reserved_total += reserved
+        spec = PolyHavenFileSpec(
+            relative_path=relative_path,
+            url="https://dl.polyhaven.org/ledger-validation",
+            bytes=size,
+            md5=md5,
+        )
+        if key != _quota_download_key(asset_id=asset_id, spec=spec):
+            raise PolyHavenAcquireError("Poly Haven quota ledger download key differs")
+    if open_reserved_total > usage.download_bytes_reserved:
+        raise PolyHavenAcquireError("Poly Haven quota ledger open download accounting differs")
+
+
+def _clock_utc_now(clock: Clock) -> datetime:
+    value = clock.utc_now()
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise PolyHavenAcquireError("Poly Haven runtime clock must return timezone-aware UTC")
+    return value.astimezone(UTC)
+
+
+def _polyhaven_disk_snapshot(*, models_root: Path, data_dir: Path) -> DiskSnapshot:
+    storage_bytes = 0
+    if models_root.exists() or models_root.is_symlink():
+        if models_root.is_symlink() or not models_root.is_dir():
+            raise PolyHavenAcquireError("Poly Haven model storage root is unsafe")
+        for directory, names, filenames in os.walk(models_root, followlinks=False):
+            base = Path(directory)
+            for name in names:
+                child = base / name
+                if child.is_symlink():
+                    raise PolyHavenAcquireError(
+                        f"Poly Haven model storage contains a symlink: {child}"
+                    )
+            for name in filenames:
+                child = base / name
+                _require_regular_file(child, "Poly Haven model storage file")
+                storage_bytes += child.stat().st_size
+    usage = shutil.disk_usage(data_dir)
+    try:
+        return DiskSnapshot(storage_bytes=storage_bytes, free_bytes=usage.free)
+    except RuntimeValidationError as exc:
+        raise PolyHavenAcquireError(f"Poly Haven disk snapshot is invalid: {exc}") from exc
+
+
+def _milliseconds(seconds: float) -> int:
+    if not math.isfinite(seconds) or seconds < 0:
+        raise PolyHavenAcquireError("Poly Haven runtime wait accounting is invalid")
+    return int(round(seconds * 1_000))
+
+
 def _utc_now() -> str:
     return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -3817,6 +5392,7 @@ def _next_utc_timestamp(*previous_values: Any) -> str:
 
 
 __all__ = [
+    "DEFAULT_REQUEST_RATE_PER_SEC",
     "DEFAULT_RESOLUTION",
     "POLYHAVEN_LICENSE",
     "POLYHAVEN_LICENSE_URL",
@@ -3824,6 +5400,7 @@ __all__ = [
     "PolyHavenFileSpec",
     "PolyHavenModel",
     "PolyHavenModelPackage",
+    "PolyHavenRuntimeConfig",
     "PolyHavenSyncItem",
     "PolyHavenSyncResult",
     "TerminalStatus",
