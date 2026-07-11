@@ -264,6 +264,10 @@ def test_v1_catalog_migrates_to_latest_without_changing_asset_rows(tmp_path: Pat
 
     connection = sqlite3.connect(catalog.database_path)
     try:
+        connection.execute("DROP TABLE resource_bindings")
+        connection.execute("DROP TABLE resource_artifacts")
+        connection.execute("DROP TABLE resource_files")
+        connection.execute("DROP TABLE resources")
         connection.execute("DROP TABLE scene_artifacts")
         connection.execute("DROP TABLE scene_objects")
         connection.execute("DROP TABLE scenes")

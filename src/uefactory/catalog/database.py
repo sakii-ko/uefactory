@@ -12,11 +12,31 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSET_STATUSES = frozenset({"raw", "imported", "render_ok", "failed"})
 SCENE_STATUSES = frozenset({"raw", "built", "render_ok", "failed", "quarantined"})
+RESOURCE_KINDS = frozenset({"hdri", "pbr_texture_set"})
+RESOURCE_STATUSES = frozenset({"verified", "ready", "failed", "quarantined"})
+RESOURCE_COLOR_SPACES = frozenset({"srgb", "linear", "data"})
+RESOURCE_NORMAL_CONVENTIONS = frozenset({"opengl", "directx"})
+RESOURCE_CHANNELS = frozenset({"r", "g", "b", "a"})
+RESOURCE_PROFILES = {
+    "hdri": frozenset({"radiance_hdr_v1", "radiance_exr_v1"}),
+    "pbr_texture_set": frozenset({"ue_pbr_png_v1"}),
+}
+RESOURCE_REQUIRED_ARTIFACT_KINDS = {
+    "verified": frozenset({"resource_source_manifest"}),
+    "hdri": frozenset({"resource_source_manifest", "hdri_validation_manifest"}),
+    "pbr_texture_set": frozenset(
+        {
+            "resource_source_manifest",
+            "pbr_material_descriptor",
+            "pbr_validation_manifest",
+        }
+    ),
+}
 LICENSE_TIERS = frozenset({"open", "nc", "ue-only"})
 SCENE_BUILD_ARTIFACT_KINDS = frozenset(
     {
@@ -179,6 +199,219 @@ class ArtifactRecord:
             "path": self.path,
             "params": self.params,
             "sha256": self.sha256,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class ResourceUpsert:
+    resource_id: str
+    resource_kind: str
+    profile: str
+    resolution: str
+    name: str
+    source: str
+    source_id: str
+    source_url: str
+    source_revision: str
+    source_revision_scheme: str
+    license: str
+    license_tier: str
+    license_url: str
+    attribution: str = ""
+    status: str = "verified"
+    tags: tuple[str, ...] = ()
+    bundle_sha256: str | None = None
+    content_sha256: str | None = None
+    physical_size_mm: tuple[float, float] | None = None
+    error: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ResourceRecord:
+    resource_id: str
+    resource_kind: str
+    profile: str
+    resolution: str
+    name: str
+    source: str
+    source_id: str
+    source_url: str
+    source_revision: str
+    source_revision_scheme: str
+    license: str
+    license_tier: str
+    license_url: str
+    attribution: str
+    status: str
+    tags: tuple[str, ...]
+    bundle_sha256: str | None
+    content_sha256: str | None
+    physical_size_mm: tuple[float, float] | None
+    error: dict[str, Any] | None
+    created_at: str
+    updated_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "resource_id": self.resource_id,
+            "resource_kind": self.resource_kind,
+            "profile": self.profile,
+            "resolution": self.resolution,
+            "name": self.name,
+            "source": self.source,
+            "source_id": self.source_id,
+            "source_url": self.source_url,
+            "source_revision": self.source_revision,
+            "source_revision_scheme": self.source_revision_scheme,
+            "license": self.license,
+            "license_tier": self.license_tier,
+            "license_url": self.license_url,
+            "attribution": self.attribution,
+            "status": self.status,
+            "tags": list(self.tags),
+            "bundle_sha256": self.bundle_sha256,
+            "content_sha256": self.content_sha256,
+            "physical_size_mm": (
+                None if self.physical_size_mm is None else list(self.physical_size_mm)
+            ),
+            "error": self.error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass(frozen=True)
+class ResourceFileUpsert:
+    file_id: str
+    resource_id: str
+    semantic_role: str
+    provider_role: str
+    resolution: str
+    format: str
+    path: str | Path
+    source_url: str
+    byte_size: int
+    sha256: str
+    color_space: str
+    provider_md5: str | None = None
+    normal_convention: str | None = None
+    channels: Mapping[str, str] | None = None
+    width: int | None = None
+    height: int | None = None
+    is_primary: bool = False
+    params: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ResourceFileRecord:
+    file_id: str
+    resource_id: str
+    semantic_role: str
+    provider_role: str
+    resolution: str
+    format: str
+    path: str
+    source_url: str
+    byte_size: int
+    provider_md5: str | None
+    sha256: str
+    color_space: str
+    normal_convention: str | None
+    channels: dict[str, str]
+    width: int | None
+    height: int | None
+    is_primary: bool
+    params: dict[str, Any]
+    created_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "file_id": self.file_id,
+            "resource_id": self.resource_id,
+            "semantic_role": self.semantic_role,
+            "provider_role": self.provider_role,
+            "resolution": self.resolution,
+            "format": self.format,
+            "path": self.path,
+            "source_url": self.source_url,
+            "byte_size": self.byte_size,
+            "provider_md5": self.provider_md5,
+            "sha256": self.sha256,
+            "color_space": self.color_space,
+            "normal_convention": self.normal_convention,
+            "channels": self.channels,
+            "width": self.width,
+            "height": self.height,
+            "is_primary": self.is_primary,
+            "params": self.params,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class ResourceArtifactUpsert:
+    artifact_id: str
+    resource_id: str
+    kind: str
+    path: str | Path
+    params: Mapping[str, Any] | None = None
+    sha256: str | None = None
+
+
+@dataclass(frozen=True)
+class ResourceArtifactRecord:
+    artifact_id: str
+    resource_id: str
+    kind: str
+    path: str
+    params: dict[str, Any]
+    sha256: str | None
+    created_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "artifact_id": self.artifact_id,
+            "resource_id": self.resource_id,
+            "kind": self.kind,
+            "path": self.path,
+            "params": self.params,
+            "sha256": self.sha256,
+            "created_at": self.created_at,
+        }
+
+
+@dataclass(frozen=True)
+class ResourceBindingUpsert:
+    binding_id: str
+    resource_id: str
+    role: str
+    asset_id: str | None = None
+    scene_id: str | None = None
+    consumer_resource_id: str | None = None
+    params: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class ResourceBindingRecord:
+    binding_id: str
+    resource_id: str
+    role: str
+    asset_id: str | None
+    scene_id: str | None
+    consumer_resource_id: str | None
+    params: dict[str, Any]
+    created_at: str
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "binding_id": self.binding_id,
+            "resource_id": self.resource_id,
+            "role": self.role,
+            "asset_id": self.asset_id,
+            "scene_id": self.scene_id,
+            "consumer_resource_id": self.consumer_resource_id,
+            "params": self.params,
             "created_at": self.created_at,
         }
 
@@ -354,6 +587,32 @@ class CatalogStats:
         return {
             "total_assets": self.total_assets,
             "total_artifacts": self.total_artifacts,
+            "by_status": self.by_status,
+            "by_source": self.by_source,
+            "by_license": self.by_license,
+            "by_license_tier": self.by_license_tier,
+        }
+
+
+@dataclass(frozen=True)
+class ResourceStats:
+    total_resources: int
+    total_files: int
+    total_artifacts: int
+    total_bindings: int
+    by_kind: dict[str, int]
+    by_status: dict[str, int]
+    by_source: dict[str, int]
+    by_license: dict[str, int]
+    by_license_tier: dict[str, int]
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "total_resources": self.total_resources,
+            "total_files": self.total_files,
+            "total_artifacts": self.total_artifacts,
+            "total_bindings": self.total_bindings,
+            "by_kind": self.by_kind,
             "by_status": self.by_status,
             "by_source": self.by_source,
             "by_license": self.by_license,
@@ -735,6 +994,443 @@ class Catalog:
                 f"SELECT * FROM artifacts{where} ORDER BY artifact_id", parameters
             ).fetchall()
             return tuple(_artifact_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def upsert_resource(self, resource: ResourceUpsert) -> ResourceRecord:
+        return self.upsert_resources((resource,))[0]
+
+    def upsert_resources(self, resources: Iterable[ResourceUpsert]) -> tuple[ResourceRecord, ...]:
+        items = tuple(resources)
+        if any(item.status in {"verified", "ready"} for item in items):
+            raise CatalogValidationError(
+                "verified and ready resources require finalize_resource with complete evidence"
+            )
+        prepared = tuple(self._prepare_resource(item) for item in items)
+        if not prepared:
+            return ()
+        _reject_batch_duplicates(prepared, "resource_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for values in prepared:
+                _upsert_prepared_resource(connection, values)
+            connection.commit()
+        except (CatalogConflictError, CatalogValidationError):
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise CatalogConflictError(f"resource upsert conflicts with catalog: {exc}") from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        records = tuple(self.get_resource(str(values["resource_id"])) for values in prepared)
+        if any(record is None for record in records):  # pragma: no cover
+            raise CatalogError("resource disappeared after commit")
+        return tuple(record for record in records if record is not None)
+
+    def finalize_resource(
+        self,
+        resource: ResourceUpsert,
+        files: Iterable[ResourceFileUpsert],
+        artifacts: Iterable[ResourceArtifactUpsert],
+    ) -> tuple[
+        ResourceRecord,
+        tuple[ResourceFileRecord, ...],
+        tuple[ResourceArtifactRecord, ...],
+    ]:
+        """Atomically publish a complete verified or consumer-ready resource package."""
+
+        if resource.status not in {"verified", "ready"}:
+            raise CatalogValidationError(
+                "finalize_resource requires resource status 'verified' or 'ready'"
+            )
+        file_items = tuple(files)
+        artifact_items = tuple(artifacts)
+        if any(item.resource_id != resource.resource_id for item in file_items):
+            raise CatalogValidationError(
+                "finalize_resource requires every file.resource_id to match resource.resource_id"
+            )
+        if any(item.resource_id != resource.resource_id for item in artifact_items):
+            raise CatalogValidationError(
+                "finalize_resource requires every artifact.resource_id to match "
+                "resource.resource_id"
+            )
+        prepared_resource = self._prepare_resource(resource)
+        prepared_files = tuple(self._prepare_resource_file(item) for item in file_items)
+        prepared_artifacts = tuple(self._prepare_resource_artifact(item) for item in artifact_items)
+        _reject_batch_duplicates(prepared_files, "file_id")
+        _reject_batch_duplicate_fields(prepared_files, ("resource_id", "path"))
+        _reject_batch_duplicates(prepared_artifacts, "artifact_id")
+        _validate_resource_evidence(
+            prepared_resource,
+            prepared_files,
+            prepared_artifacts,
+        )
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT * FROM resources WHERE resource_id = ?", (resource.resource_id,)
+            ).fetchone()
+            if existing is not None and (
+                existing["status"] == "ready"
+                or (existing["status"] == "verified" and resource.status == "verified")
+            ):
+                _assert_published_resource_cohort_unchanged(
+                    connection,
+                    existing=existing,
+                    resource=prepared_resource,
+                    files=prepared_files,
+                    artifacts=prepared_artifacts,
+                )
+                connection.rollback()
+            else:
+                _upsert_prepared_resource(connection, prepared_resource)
+                connection.execute(
+                    "DELETE FROM resource_files WHERE resource_id = ?", (resource.resource_id,)
+                )
+                connection.execute(
+                    "DELETE FROM resource_artifacts WHERE resource_id = ?",
+                    (resource.resource_id,),
+                )
+                for values in prepared_files:
+                    _upsert_prepared_resource_file(
+                        connection, values, allow_published_mutation=True
+                    )
+                for values in prepared_artifacts:
+                    _upsert_prepared_resource_artifact(
+                        connection, values, allow_published_mutation=True
+                    )
+                connection.commit()
+        except (CatalogConflictError, CatalogValidationError):
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise CatalogConflictError(
+                f"resource finalization conflicts with catalog: {exc}"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+        resource_record = self.get_resource(resource.resource_id)
+        file_records = self.list_resource_files(resource_id=resource.resource_id)
+        artifact_records = self.list_resource_artifacts(resource_id=resource.resource_id)
+        if resource_record is None:  # pragma: no cover
+            raise CatalogError("finalized resource disappeared after commit")
+        return resource_record, file_records, artifact_records
+
+    def upsert_resource_files(
+        self, files: Iterable[ResourceFileUpsert]
+    ) -> tuple[ResourceFileRecord, ...]:
+        prepared = tuple(self._prepare_resource_file(item) for item in files)
+        if not prepared:
+            return ()
+        _reject_batch_duplicates(prepared, "file_id")
+        _reject_batch_duplicate_fields(prepared, ("resource_id", "path"))
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for values in prepared:
+                _upsert_prepared_resource_file(connection, values)
+            connection.commit()
+        except CatalogConflictError:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise CatalogConflictError(
+                f"resource file upsert conflicts with catalog: {exc}"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        records = tuple(self.get_resource_file(str(values["file_id"])) for values in prepared)
+        if any(record is None for record in records):  # pragma: no cover
+            raise CatalogError("resource file disappeared after commit")
+        return tuple(record for record in records if record is not None)
+
+    def upsert_resource_file(self, item: ResourceFileUpsert) -> ResourceFileRecord:
+        return self.upsert_resource_files((item,))[0]
+
+    def upsert_resource_artifacts(
+        self, artifacts: Iterable[ResourceArtifactUpsert]
+    ) -> tuple[ResourceArtifactRecord, ...]:
+        prepared = tuple(self._prepare_resource_artifact(item) for item in artifacts)
+        if not prepared:
+            return ()
+        _reject_batch_duplicates(prepared, "artifact_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for values in prepared:
+                _upsert_prepared_resource_artifact(connection, values)
+            connection.commit()
+        except CatalogConflictError:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise CatalogConflictError(
+                f"resource artifact upsert conflicts with catalog: {exc}"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        records = tuple(
+            self.get_resource_artifact(str(values["artifact_id"])) for values in prepared
+        )
+        if any(record is None for record in records):  # pragma: no cover
+            raise CatalogError("resource artifact disappeared after commit")
+        return tuple(record for record in records if record is not None)
+
+    def upsert_resource_artifact(self, item: ResourceArtifactUpsert) -> ResourceArtifactRecord:
+        return self.upsert_resource_artifacts((item,))[0]
+
+    def upsert_resource_bindings(
+        self, bindings: Iterable[ResourceBindingUpsert]
+    ) -> tuple[ResourceBindingRecord, ...]:
+        prepared = tuple(self._prepare_resource_binding(item) for item in bindings)
+        if not prepared:
+            return ()
+        _reject_batch_duplicates(prepared, "binding_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for values in prepared:
+                _upsert_prepared_resource_binding(connection, values)
+            connection.commit()
+        except CatalogConflictError:
+            connection.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            connection.rollback()
+            raise CatalogConflictError(
+                f"resource binding upsert conflicts with catalog: {exc}"
+            ) from exc
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        records = tuple(self.get_resource_binding(str(values["binding_id"])) for values in prepared)
+        if any(record is None for record in records):  # pragma: no cover
+            raise CatalogError("resource binding disappeared after commit")
+        return tuple(record for record in records if record is not None)
+
+    def upsert_resource_binding(self, item: ResourceBindingUpsert) -> ResourceBindingRecord:
+        return self.upsert_resource_bindings((item,))[0]
+
+    def get_resource(self, resource_id: str) -> ResourceRecord | None:
+        _validate_slug(resource_id, "resource_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            return None if row is None else _resource_from_row(row)
+        finally:
+            connection.close()
+
+    def show_resource(self, resource_id: str) -> ResourceRecord | None:
+        return self.get_resource(resource_id)
+
+    def list_resources(
+        self,
+        *,
+        resource_id: str | None = None,
+        resource_kind: str | None = None,
+        profile: str | None = None,
+        resolution: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        license: str | None = None,
+        tag: str | None = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> tuple[ResourceRecord, ...]:
+        clauses: list[str] = []
+        parameters: list[str | int] = []
+        if resource_id is not None:
+            _validate_slug(resource_id, "resource_id")
+            clauses.append("resources.resource_id = ?")
+            parameters.append(resource_id)
+        if resource_kind is not None:
+            _validate_resource_kind(resource_kind)
+            clauses.append("resources.resource_kind = ?")
+            parameters.append(resource_kind)
+        if profile is not None:
+            _validate_slug(profile, "profile")
+            clauses.append("resources.profile = ?")
+            parameters.append(profile)
+        if resolution is not None:
+            _validate_resource_token(resolution, "resolution")
+            clauses.append("resources.resolution = ?")
+            parameters.append(resolution)
+        if status is not None:
+            _validate_resource_status(status)
+            clauses.append("resources.status = ?")
+            parameters.append(status)
+        if source is not None:
+            _validate_slug(source, "source")
+            clauses.append("resources.source = ?")
+            parameters.append(source)
+        if license is not None:
+            _validate_license_name(license)
+            clauses.append("resources.license = ?")
+            parameters.append(license)
+        if tag is not None:
+            _validate_tag(tag)
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(resources.tags_json) WHERE json_each.value = ?)"
+            )
+            parameters.append(tag)
+        _validate_page(limit=limit, offset=offset)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        parameters.extend((limit, offset))
+        self.initialize()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT resources.* FROM resources{where} ORDER BY resource_id LIMIT ? OFFSET ?",
+                parameters,
+            ).fetchall()
+            return tuple(_resource_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def get_resource_file(self, file_id: str) -> ResourceFileRecord | None:
+        _validate_slug(file_id, "file_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM resource_files WHERE file_id = ?", (file_id,)
+            ).fetchone()
+            return None if row is None else _resource_file_from_row(row)
+        finally:
+            connection.close()
+
+    def list_resource_files(
+        self,
+        *,
+        resource_id: str | None = None,
+        semantic_role: str | None = None,
+    ) -> tuple[ResourceFileRecord, ...]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if resource_id is not None:
+            _validate_slug(resource_id, "resource_id")
+            clauses.append("resource_id = ?")
+            parameters.append(resource_id)
+        if semantic_role is not None:
+            _validate_slug(semantic_role, "semantic_role")
+            clauses.append("semantic_role = ?")
+            parameters.append(semantic_role)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        self.initialize()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM resource_files{where} ORDER BY file_id", parameters
+            ).fetchall()
+            return tuple(_resource_file_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def get_resource_artifact(self, artifact_id: str) -> ResourceArtifactRecord | None:
+        _validate_slug(artifact_id, "artifact_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM resource_artifacts WHERE artifact_id = ?", (artifact_id,)
+            ).fetchone()
+            return None if row is None else _resource_artifact_from_row(row)
+        finally:
+            connection.close()
+
+    def list_resource_artifacts(
+        self, *, resource_id: str | None = None, kind: str | None = None
+    ) -> tuple[ResourceArtifactRecord, ...]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        if resource_id is not None:
+            _validate_slug(resource_id, "resource_id")
+            clauses.append("resource_id = ?")
+            parameters.append(resource_id)
+        if kind is not None:
+            _validate_slug(kind, "kind")
+            clauses.append("kind = ?")
+            parameters.append(kind)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        self.initialize()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM resource_artifacts{where} ORDER BY artifact_id", parameters
+            ).fetchall()
+            return tuple(_resource_artifact_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def get_resource_binding(self, binding_id: str) -> ResourceBindingRecord | None:
+        _validate_slug(binding_id, "binding_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            row = connection.execute(
+                "SELECT * FROM resource_bindings WHERE binding_id = ?", (binding_id,)
+            ).fetchone()
+            return None if row is None else _resource_binding_from_row(row)
+        finally:
+            connection.close()
+
+    def list_resource_bindings(
+        self,
+        *,
+        resource_id: str | None = None,
+        asset_id: str | None = None,
+        scene_id: str | None = None,
+        consumer_resource_id: str | None = None,
+    ) -> tuple[ResourceBindingRecord, ...]:
+        clauses: list[str] = []
+        parameters: list[str] = []
+        for field, value in (
+            ("resource_id", resource_id),
+            ("asset_id", asset_id),
+            ("scene_id", scene_id),
+            ("consumer_resource_id", consumer_resource_id),
+        ):
+            if value is not None:
+                _validate_slug(value, field)
+                clauses.append(f"{field} = ?")
+                parameters.append(value)
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        self.initialize()
+        connection = self._connect()
+        try:
+            rows = connection.execute(
+                f"SELECT * FROM resource_bindings{where} ORDER BY binding_id", parameters
+            ).fetchall()
+            return tuple(_resource_binding_from_row(row) for row in rows)
         finally:
             connection.close()
 
@@ -1217,6 +1913,32 @@ class Catalog:
         finally:
             connection.close()
 
+    def resource_stats(self) -> ResourceStats:
+        self.initialize()
+        connection = self._connect()
+        try:
+            return ResourceStats(
+                total_resources=int(
+                    connection.execute("SELECT count(*) FROM resources").fetchone()[0]
+                ),
+                total_files=int(
+                    connection.execute("SELECT count(*) FROM resource_files").fetchone()[0]
+                ),
+                total_artifacts=int(
+                    connection.execute("SELECT count(*) FROM resource_artifacts").fetchone()[0]
+                ),
+                total_bindings=int(
+                    connection.execute("SELECT count(*) FROM resource_bindings").fetchone()[0]
+                ),
+                by_kind=_resource_group_counts(connection, "resource_kind"),
+                by_status=_resource_group_counts(connection, "status"),
+                by_source=_resource_group_counts(connection, "source"),
+                by_license=_resource_group_counts(connection, "license"),
+                by_license_tier=_resource_group_counts(connection, "license_tier"),
+            )
+        finally:
+            connection.close()
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.database_path,
@@ -1301,6 +2023,219 @@ class Catalog:
             "path": path,
             "params_json": params_json,
             "sha256": artifact.sha256,
+            "created_at": _utc_now(),
+        }
+
+    def _prepare_resource(self, resource: ResourceUpsert) -> dict[str, Any]:
+        _validate_slug(resource.resource_id, "resource_id")
+        _validate_resource_kind(resource.resource_kind)
+        _validate_slug(resource.profile, "profile")
+        if resource.profile not in RESOURCE_PROFILES[resource.resource_kind]:
+            allowed = ", ".join(sorted(RESOURCE_PROFILES[resource.resource_kind]))
+            raise CatalogValidationError(
+                f"profile for {resource.resource_kind!r} must be one of: {allowed}"
+            )
+        _validate_resource_token(resource.resolution, "resolution")
+        _validate_text(resource.name, "name")
+        _validate_slug(resource.source, "source")
+        _validate_text(resource.source_id, "source_id")
+        _validate_uri(resource.source_url, "source_url")
+        _validate_text(resource.source_revision, "source_revision")
+        if len(resource.source_revision) > 128:
+            raise CatalogValidationError("source_revision must contain at most 128 characters")
+        _validate_slug(resource.source_revision_scheme, "source_revision_scheme")
+        _validate_license(resource.license, resource.license_tier)
+        _validate_uri(resource.license_url, "license_url")
+        if (
+            not isinstance(resource.attribution, str)
+            or resource.attribution != resource.attribution.strip()
+        ):
+            raise CatalogValidationError("attribution must be text without surrounding whitespace")
+        _validate_resource_status(resource.status)
+        tags = _normalize_tags(resource.tags)
+        if resource.bundle_sha256 is not None:
+            _validate_sha256(resource.bundle_sha256, "bundle_sha256")
+        if resource.content_sha256 is not None:
+            _validate_sha256(resource.content_sha256, "content_sha256")
+        physical_width_mm: float | None = None
+        physical_height_mm: float | None = None
+        if resource.physical_size_mm is not None:
+            if (
+                not isinstance(resource.physical_size_mm, tuple | list)
+                or len(resource.physical_size_mm) != 2
+            ):
+                raise CatalogValidationError("physical_size_mm must contain exactly two numbers")
+            width, height = resource.physical_size_mm
+            if any(
+                isinstance(value, bool)
+                or not isinstance(value, int | float)
+                or not math.isfinite(float(value))
+                or float(value) <= 0.0
+                for value in (width, height)
+            ):
+                raise CatalogValidationError("physical_size_mm values must be finite and positive")
+            physical_width_mm = float(width)
+            physical_height_mm = float(height)
+        error_json = (
+            _json_object(resource.error, "error", require_nonempty=True)
+            if resource.error is not None
+            else None
+        )
+        _validate_resource_status_payload(
+            resource_kind=resource.resource_kind,
+            status=resource.status,
+            bundle_sha256=resource.bundle_sha256,
+            content_sha256=resource.content_sha256,
+            physical_size_mm=resource.physical_size_mm,
+            error=resource.error,
+        )
+        now = _utc_now()
+        return {
+            "resource_id": resource.resource_id,
+            "resource_kind": resource.resource_kind,
+            "profile": resource.profile,
+            "resolution": resource.resolution,
+            "name": resource.name.strip(),
+            "source": resource.source,
+            "source_id": resource.source_id.strip(),
+            "source_url": resource.source_url.strip(),
+            "source_revision": resource.source_revision,
+            "source_revision_scheme": resource.source_revision_scheme,
+            "license": resource.license,
+            "license_tier": resource.license_tier,
+            "license_url": resource.license_url.strip(),
+            "attribution": resource.attribution,
+            "status": resource.status,
+            "tags_json": json.dumps(tags, ensure_ascii=False, separators=(",", ":")),
+            "bundle_sha256": resource.bundle_sha256,
+            "content_sha256": resource.content_sha256,
+            "physical_width_mm": physical_width_mm,
+            "physical_height_mm": physical_height_mm,
+            "error_json": error_json,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _prepare_resource_file(self, item: ResourceFileUpsert) -> dict[str, Any]:
+        _validate_slug(item.file_id, "file_id")
+        _validate_slug(item.resource_id, "resource_id")
+        _validate_slug(item.semantic_role, "semantic_role")
+        _validate_text(item.provider_role, "provider_role")
+        if len(item.provider_role) > 128:
+            raise CatalogValidationError("provider_role must contain at most 128 characters")
+        _validate_resource_token(item.resolution, "resolution")
+        _validate_slug(item.format, "format")
+        path = _relative_path(item.path, self.project_root, "path")
+        _validate_uri(item.source_url, "source_url")
+        if (
+            isinstance(item.byte_size, bool)
+            or not isinstance(item.byte_size, int)
+            or item.byte_size <= 0
+        ):
+            raise CatalogValidationError("byte_size must be a positive integer")
+        if item.provider_md5 is not None and (
+            not isinstance(item.provider_md5, str)
+            or len(item.provider_md5) != 32
+            or any(character not in "0123456789abcdef" for character in item.provider_md5)
+        ):
+            raise CatalogValidationError(
+                "provider_md5 must be a lowercase 32-character MD5 or null"
+            )
+        _validate_sha256(item.sha256, "sha256")
+        if item.color_space not in RESOURCE_COLOR_SPACES:
+            allowed = ", ".join(sorted(RESOURCE_COLOR_SPACES))
+            raise CatalogValidationError(f"color_space must be one of: {allowed}")
+        if (
+            item.normal_convention is not None
+            and item.normal_convention not in RESOURCE_NORMAL_CONVENTIONS
+        ):
+            allowed = ", ".join(sorted(RESOURCE_NORMAL_CONVENTIONS))
+            raise CatalogValidationError(f"normal_convention must be null or one of: {allowed}")
+        if (item.width is None) != (item.height is None):
+            raise CatalogValidationError("width and height must be provided together")
+        for value, field in ((item.width, "width"), (item.height, "height")):
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            ):
+                raise CatalogValidationError(f"{field} must be a positive integer or null")
+        if not isinstance(item.is_primary, bool):
+            raise CatalogValidationError("is_primary must be a boolean")
+        channels = {} if item.channels is None else item.channels
+        if not isinstance(channels, Mapping):
+            raise CatalogValidationError("channels must be a JSON object")
+        for channel, semantic in channels.items():
+            if channel not in RESOURCE_CHANNELS:
+                allowed = ", ".join(sorted(RESOURCE_CHANNELS))
+                raise CatalogValidationError(f"channels keys must be one of: {allowed}")
+            _validate_slug(semantic, f"channels[{channel!r}]")
+        channels_json = _json_object(channels, "channels")
+        params_json = _json_object({} if item.params is None else item.params, "params")
+        return {
+            "file_id": item.file_id,
+            "resource_id": item.resource_id,
+            "semantic_role": item.semantic_role,
+            "provider_role": item.provider_role,
+            "resolution": item.resolution,
+            "format": item.format,
+            "path": path,
+            "source_url": item.source_url.strip(),
+            "byte_size": item.byte_size,
+            "provider_md5": item.provider_md5,
+            "sha256": item.sha256,
+            "color_space": item.color_space,
+            "normal_convention": item.normal_convention,
+            "channels_json": channels_json,
+            "width": item.width,
+            "height": item.height,
+            "is_primary": int(item.is_primary),
+            "params_json": params_json,
+            "created_at": _utc_now(),
+        }
+
+    def _prepare_resource_artifact(self, item: ResourceArtifactUpsert) -> dict[str, Any]:
+        _validate_slug(item.artifact_id, "artifact_id")
+        _validate_slug(item.resource_id, "resource_id")
+        _validate_slug(item.kind, "kind")
+        path = _relative_path(item.path, self.project_root, "path")
+        params_json = _json_object({} if item.params is None else item.params, "params")
+        if item.sha256 is not None:
+            _validate_sha256(item.sha256, "sha256")
+        return {
+            "artifact_id": item.artifact_id,
+            "resource_id": item.resource_id,
+            "kind": item.kind,
+            "path": path,
+            "params_json": params_json,
+            "sha256": item.sha256,
+            "created_at": _utc_now(),
+        }
+
+    def _prepare_resource_binding(self, item: ResourceBindingUpsert) -> dict[str, Any]:
+        _validate_slug(item.binding_id, "binding_id")
+        _validate_slug(item.resource_id, "resource_id")
+        _validate_slug(item.role, "role")
+        consumers = (item.asset_id, item.scene_id, item.consumer_resource_id)
+        if sum(value is not None for value in consumers) != 1:
+            raise CatalogValidationError(
+                "resource binding requires exactly one asset, scene, or resource consumer"
+            )
+        for value, field in (
+            (item.asset_id, "asset_id"),
+            (item.scene_id, "scene_id"),
+            (item.consumer_resource_id, "consumer_resource_id"),
+        ):
+            if value is not None:
+                _validate_slug(value, field)
+        if item.consumer_resource_id == item.resource_id:
+            raise CatalogValidationError("a resource may not bind to itself")
+        return {
+            "binding_id": item.binding_id,
+            "resource_id": item.resource_id,
+            "role": item.role,
+            "asset_id": item.asset_id,
+            "scene_id": item.scene_id,
+            "consumer_resource_id": item.consumer_resource_id,
+            "params_json": _json_object({} if item.params is None else item.params, "params"),
             "created_at": _utc_now(),
         }
 
@@ -1485,6 +2420,39 @@ def _validate_scene_status(status: str) -> None:
         raise CatalogValidationError(f"scene status must be one of: {allowed}")
 
 
+def _validate_resource_kind(resource_kind: str) -> None:
+    if resource_kind not in RESOURCE_KINDS:
+        allowed = ", ".join(sorted(RESOURCE_KINDS))
+        raise CatalogValidationError(f"resource_kind must be one of: {allowed}")
+
+
+def _validate_resource_status(status: str) -> None:
+    if status not in RESOURCE_STATUSES:
+        allowed = ", ".join(sorted(RESOURCE_STATUSES))
+        raise CatalogValidationError(f"resource status must be one of: {allowed}")
+
+
+def _validate_resource_token(value: str, field: str) -> None:
+    if (
+        not isinstance(value, str)
+        or not 1 <= len(value) <= 32
+        or value != value.strip()
+        or value[0] not in "abcdefghijklmnopqrstuvwxyz0123456789"
+        or any(character not in "abcdefghijklmnopqrstuvwxyz0123456789_-" for character in value)
+        or value.endswith(("_", "-"))
+    ):
+        raise CatalogValidationError(
+            f"{field} must be a 1 to 32 character lowercase resource token"
+        )
+
+
+def _validate_page(*, limit: int, offset: int) -> None:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10_000:
+        raise CatalogValidationError("limit must be between 1 and 10000")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise CatalogValidationError("offset must be non-negative")
+
+
 def _validate_license_name(license_name: str) -> None:
     if license_name not in SUPPORTED_LICENSES:
         allowed = ", ".join(sorted(SUPPORTED_LICENSES))
@@ -1589,6 +2557,30 @@ def _validate_status_payload(
             raise CatalogValidationError(f"{status} assets require ue_package_path")
         if tri_count is None or tri_count <= 0:
             raise CatalogValidationError(f"{status} assets require tri_count > 0")
+
+
+def _validate_resource_status_payload(
+    *,
+    resource_kind: str,
+    status: str,
+    bundle_sha256: str | None,
+    content_sha256: str | None,
+    physical_size_mm: tuple[float, float] | None,
+    error: Mapping[str, Any] | None,
+) -> None:
+    if status in {"failed", "quarantined"}:
+        if not error:
+            raise CatalogValidationError(f"{status} resources require a non-empty structured error")
+    elif error is not None:
+        raise CatalogValidationError(
+            "only failed or quarantined resources may contain error details"
+        )
+    if status in {"verified", "ready"} and (bundle_sha256 is None or content_sha256 is None):
+        raise CatalogValidationError(f"{status} resources require bundle_sha256 and content_sha256")
+    if resource_kind == "hdri" and physical_size_mm is not None:
+        raise CatalogValidationError("HDRI resources may not define physical_size_mm")
+    if resource_kind == "pbr_texture_set" and status == "ready" and physical_size_mm is None:
+        raise CatalogValidationError("ready PBR texture sets require physical_size_mm")
 
 
 def _validate_scene_status_payload(
@@ -1781,11 +2773,251 @@ def _normalize_json_value(value: Any, field: str) -> Any:
     )
 
 
+def _validate_resource_evidence(
+    resource: Mapping[str, Any],
+    files: tuple[dict[str, Any], ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> None:
+    if not files:
+        raise CatalogValidationError("finalize_resource requires at least one source file")
+    if not artifacts:
+        raise CatalogValidationError("finalize_resource requires evidence artifacts")
+    if any(item["resolution"] != resource["resolution"] for item in files):
+        raise CatalogValidationError(
+            "every resource file must use the finalized resource resolution"
+        )
+    primary_files = [item for item in files if item["is_primary"] == 1]
+    if len(primary_files) != 1:
+        raise CatalogValidationError("finalize_resource requires exactly one primary file")
+    artifact_counts = Counter(str(item["kind"]) for item in artifacts)
+    required_kinds = RESOURCE_REQUIRED_ARTIFACT_KINDS[
+        "verified" if resource["status"] == "verified" else str(resource["resource_kind"])
+    ]
+    missing_or_ambiguous = sorted(kind for kind in required_kinds if artifact_counts.get(kind) != 1)
+    if missing_or_ambiguous:
+        raise CatalogValidationError(
+            "resource evidence requires exactly one of each artifact kind: "
+            + ", ".join(missing_or_ambiguous)
+        )
+    for artifact in artifacts:
+        if artifact["sha256"] is None:
+            raise CatalogValidationError("resource evidence artifacts require sha256")
+        if artifact["kind"] in required_kinds:
+            _validate_resource_artifact_binding(resource, artifact)
+
+    if resource["status"] != "ready":
+        return
+    if resource["resource_kind"] == "hdri":
+        _validate_ready_hdri(resource, files, artifacts)
+    elif resource["resource_kind"] == "pbr_texture_set":
+        _validate_ready_pbr(resource, files, artifacts)
+    else:  # pragma: no cover - resource kind validation is closed above this layer
+        raise CatalogValidationError("unsupported ready resource kind")
+
+
+def _validate_resource_artifact_binding(
+    resource: Mapping[str, Any], artifact: Mapping[str, Any]
+) -> None:
+    params = json.loads(str(artifact["params_json"]))
+    expected = {
+        "schema_version": 1,
+        "resource_id": resource["resource_id"],
+        "resource_kind": resource["resource_kind"],
+        "profile": resource["profile"],
+        "resolution": resource["resolution"],
+        "bundle_sha256": resource["bundle_sha256"],
+        "content_sha256": resource["content_sha256"],
+    }
+    changed = [key for key, value in expected.items() if params.get(key) != value]
+    if changed:
+        raise CatalogValidationError(
+            f"resource artifact {artifact['kind']!r} does not bind active evidence: "
+            + ", ".join(changed)
+        )
+
+
+def _artifact_params(artifacts: tuple[dict[str, Any], ...], kind: str) -> dict[str, Any]:
+    artifact = next(item for item in artifacts if item["kind"] == kind)
+    return json.loads(str(artifact["params_json"]))
+
+
+def _validate_ready_hdri(
+    resource: Mapping[str, Any],
+    files: tuple[dict[str, Any], ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> None:
+    if len(files) != 1:
+        raise CatalogValidationError("ready HDRI profiles require exactly one radiance file")
+    item = files[0]
+    expected_format = "hdr" if resource["profile"] == "radiance_hdr_v1" else "exr"
+    if item["semantic_role"] != "environment_radiance":
+        raise CatalogValidationError("ready HDRI primary file must be environment_radiance")
+    if item["format"] != expected_format:
+        raise CatalogValidationError(
+            f"ready HDRI profile {resource['profile']!r} requires {expected_format!r} format"
+        )
+    if item["color_space"] != "linear" or item["normal_convention"] is not None:
+        raise CatalogValidationError("ready HDRI radiance must be linear and not a normal map")
+    width = item["width"]
+    height = item["height"]
+    if width is None or height is None or width != height * 2:
+        raise CatalogValidationError("ready HDRI radiance must decode to a positive 2:1 image")
+    validation = _artifact_params(artifacts, "hdri_validation_manifest")
+    if (
+        validation.get("validation_status") != "passed"
+        or validation.get("width") != width
+        or validation.get("height") != height
+        or validation.get("file_id") != item["file_id"]
+    ):
+        raise CatalogValidationError("HDRI validation manifest does not prove active radiance")
+
+
+def _validate_ready_pbr(
+    resource: Mapping[str, Any],
+    files: tuple[dict[str, Any], ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> None:
+    if resource["profile"] != "ue_pbr_png_v1":  # pragma: no cover - closed profile enum
+        raise CatalogValidationError("unsupported ready PBR profile")
+    if any(item["format"] != "png" for item in files):
+        raise CatalogValidationError("ue_pbr_png_v1 requires only PNG source maps")
+    if any(item["width"] is None or item["height"] is None for item in files):
+        raise CatalogValidationError("ready PBR maps require decoded width and height")
+    dimensions = {(item["width"], item["height"]) for item in files}
+    if len(dimensions) != 1:
+        raise CatalogValidationError("ready PBR maps must share one decoded resolution")
+    by_role: dict[str, list[dict[str, Any]]] = {}
+    for item in files:
+        by_role.setdefault(str(item["semantic_role"]), []).append(item)
+    for role in ("base_color", "normal"):
+        if len(by_role.get(role, ())) != 1:
+            raise CatalogValidationError(f"ready PBR profile requires exactly one {role} map")
+    roughness = by_role.get("roughness", ())
+    packed = by_role.get("packed_material", ())
+    if (len(roughness) == 1) == (len(packed) == 1):
+        raise CatalogValidationError(
+            "ready PBR profile requires exactly one roughness or packed_material source"
+        )
+    if len(roughness) > 1 or len(packed) > 1:
+        raise CatalogValidationError("ready PBR material roles must be unambiguous")
+    base_color = by_role["base_color"][0]
+    normal = by_role["normal"][0]
+    if base_color["color_space"] != "srgb" or base_color["is_primary"] != 1:
+        raise CatalogValidationError("ready PBR base_color must be the primary sRGB map")
+    if normal["color_space"] not in {"linear", "data"}:
+        raise CatalogValidationError("ready PBR normal map must use a non-color space")
+    if normal["normal_convention"] != "directx":
+        raise CatalogValidationError("ue_pbr_png_v1 requires a DirectX normal map")
+    for role, items in by_role.items():
+        if role != "base_color" and any(item["color_space"] == "srgb" for item in items):
+            raise CatalogValidationError(f"ready PBR {role} maps may not use sRGB")
+    if packed:
+        channel_values = tuple(json.loads(str(packed[0]["channels_json"])).values())
+        required_channels = {"ambient_occlusion", "roughness", "metallic"}
+        if not required_channels <= set(channel_values) or len(channel_values) != len(
+            set(channel_values)
+        ):
+            raise CatalogValidationError(
+                "packed_material channels must map distinct ambient_occlusion, roughness, "
+                "and metallic semantics"
+            )
+    descriptor = _artifact_params(artifacts, "pbr_material_descriptor")
+    validation = _artifact_params(artifacts, "pbr_validation_manifest")
+    expected_file_ids = sorted(str(item["file_id"]) for item in files)
+    expected_physical_size = [
+        resource["physical_width_mm"],
+        resource["physical_height_mm"],
+    ]
+    if (
+        descriptor.get("file_ids") != expected_file_ids
+        or descriptor.get("physical_size_mm") != expected_physical_size
+    ):
+        raise CatalogValidationError("PBR material descriptor does not bind the file cohort")
+    if (
+        validation.get("validation_status") != "passed"
+        or validation.get("file_ids") != expected_file_ids
+    ):
+        raise CatalogValidationError("PBR validation manifest does not prove the file cohort")
+
+
+def _assert_published_resource_cohort_unchanged(
+    connection: sqlite3.Connection,
+    *,
+    existing: sqlite3.Row,
+    resource: Mapping[str, Any],
+    files: tuple[dict[str, Any], ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> None:
+    immutable_resource_fields = (
+        "name",
+        "resource_kind",
+        "profile",
+        "resolution",
+        "source",
+        "source_id",
+        "source_url",
+        "source_revision",
+        "source_revision_scheme",
+        "license",
+        "license_tier",
+        "license_url",
+        "attribution",
+        "tags_json",
+        "bundle_sha256",
+        "content_sha256",
+        "physical_width_mm",
+        "physical_height_mm",
+    )
+    changed = [field for field in immutable_resource_fields if existing[field] != resource[field]]
+    if resource["status"] != existing["status"]:
+        changed.append("status")
+    if changed:
+        raise CatalogConflictError(
+            "published resource evidence is immutable: " + ", ".join(changed)
+        )
+
+    def comparable(values: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: values[key] for key in values if key != "created_at"}
+
+    existing_files = tuple(
+        comparable(dict(row))
+        for row in connection.execute(
+            "SELECT * FROM resource_files WHERE resource_id = ? ORDER BY file_id",
+            (resource["resource_id"],),
+        )
+    )
+    proposed_files = tuple(
+        comparable(item) for item in sorted(files, key=lambda row: row["file_id"])
+    )
+    existing_artifacts = tuple(
+        comparable(dict(row))
+        for row in connection.execute(
+            "SELECT * FROM resource_artifacts WHERE resource_id = ? ORDER BY artifact_id",
+            (resource["resource_id"],),
+        )
+    )
+    proposed_artifacts = tuple(
+        comparable(item) for item in sorted(artifacts, key=lambda row: row["artifact_id"])
+    )
+    if existing_files != proposed_files or existing_artifacts != proposed_artifacts:
+        raise CatalogConflictError("published resource file and artifact evidence is immutable")
+
+
 def _reject_batch_duplicates(rows: tuple[dict[str, Any], ...], key: str) -> None:
     counts = Counter(str(row[key]) for row in rows)
     duplicates = sorted(value for value, count in counts.items() if count > 1)
     if duplicates:
         raise CatalogConflictError(f"duplicate {key} in transaction: {', '.join(duplicates)}")
+
+
+def _reject_batch_duplicate_fields(
+    rows: tuple[dict[str, Any], ...], fields: tuple[str, ...]
+) -> None:
+    counts = Counter(tuple(str(row[field]) for field in fields) for row in rows)
+    duplicates = sorted(values for values, count in counts.items() if count > 1)
+    if duplicates:
+        rendered = ", ".join("/".join(values) for values in duplicates)
+        raise CatalogConflictError(f"duplicate {'/'.join(fields)} in transaction: {rendered}")
 
 
 def _upsert_prepared_asset(
@@ -1830,6 +3062,157 @@ def _upsert_prepared_artifact(
             f"artifact_id {values['artifact_id']!r} is already bound to another artifact"
         )
     connection.execute(_UPSERT_ARTIFACT_SQL, values)
+
+
+def _upsert_prepared_resource(
+    connection: sqlite3.Connection,
+    values: Mapping[str, Any],
+) -> None:
+    provenance_fields = (
+        "resource_kind",
+        "profile",
+        "resolution",
+        "source",
+        "source_id",
+        "source_url",
+        "source_revision",
+        "source_revision_scheme",
+        "license",
+        "license_tier",
+        "license_url",
+        "attribution",
+    )
+    existing = connection.execute(
+        "SELECT * FROM resources WHERE resource_id = ?", (values["resource_id"],)
+    ).fetchone()
+    if existing is not None:
+        changed = [field for field in provenance_fields if existing[field] != values[field]]
+        for field in (
+            "bundle_sha256",
+            "content_sha256",
+            "physical_width_mm",
+            "physical_height_mm",
+        ):
+            if existing[field] is not None and existing[field] != values[field]:
+                changed.append(field)
+        if changed:
+            raise CatalogConflictError(
+                f"resource_id {values['resource_id']!r} has immutable conflicts: "
+                + ", ".join(changed)
+            )
+        transitions = {
+            "verified": {"verified", "ready", "failed", "quarantined"},
+            "ready": {"ready"},
+            "failed": {"failed", "verified", "ready", "quarantined"},
+            "quarantined": {"quarantined"},
+        }
+        if values["status"] not in transitions[str(existing["status"])]:
+            raise CatalogValidationError(
+                f"illegal resource status transition: {existing['status']} -> {values['status']}"
+            )
+    connection.execute(_UPSERT_RESOURCE_SQL, values)
+
+
+def _upsert_prepared_resource_file(
+    connection: sqlite3.Connection,
+    values: Mapping[str, Any],
+    *,
+    allow_published_mutation: bool = False,
+) -> None:
+    parent = connection.execute(
+        "SELECT status FROM resources WHERE resource_id = ?", (values["resource_id"],)
+    ).fetchone()
+    if parent is None:
+        raise CatalogValidationError("resource file requires an existing resource")
+    existing = connection.execute(
+        "SELECT * FROM resource_files WHERE file_id = ?", (values["file_id"],)
+    ).fetchone()
+    published = parent["status"] in {"verified", "ready"}
+    if published and existing is None and not allow_published_mutation:
+        raise CatalogConflictError("published resource file evidence is immutable")
+    if existing is not None:
+        immutable_fields = tuple(key for key in values if key not in {"params_json", "created_at"})
+        changed = [field for field in immutable_fields if existing[field] != values[field]]
+        if (
+            published
+            and not allow_published_mutation
+            and existing["params_json"] != values["params_json"]
+        ):
+            changed.append("params_json")
+        if changed:
+            raise CatalogConflictError(
+                f"resource file {values['file_id']!r} has immutable conflicts: "
+                + ", ".join(changed)
+            )
+    connection.execute(_UPSERT_RESOURCE_FILE_SQL, values)
+
+
+def _upsert_prepared_resource_artifact(
+    connection: sqlite3.Connection,
+    values: Mapping[str, Any],
+    *,
+    allow_published_mutation: bool = False,
+) -> None:
+    parent = connection.execute(
+        "SELECT resource_kind, status FROM resources WHERE resource_id = ?",
+        (values["resource_id"],),
+    ).fetchone()
+    if parent is None:
+        raise CatalogValidationError("resource artifact requires an existing resource")
+    existing = connection.execute(
+        "SELECT * FROM resource_artifacts WHERE artifact_id = ?",
+        (values["artifact_id"],),
+    ).fetchone()
+    identity = (values["resource_id"], values["kind"], values["path"])
+    if (
+        existing is not None
+        and tuple(existing[field] for field in ("resource_id", "kind", "path")) != identity
+    ):
+        raise CatalogConflictError(
+            f"resource artifact {values['artifact_id']!r} is bound to another identity"
+        )
+    required_key = "verified" if parent["status"] == "verified" else str(parent["resource_kind"])
+    required = RESOURCE_REQUIRED_ARTIFACT_KINDS.get(required_key, frozenset())
+    if (
+        parent["status"] in {"verified", "ready"}
+        and values["kind"] in required
+        and not allow_published_mutation
+        and (
+            existing is None
+            or any(existing[field] != values[field] for field in ("params_json", "sha256"))
+        )
+    ):
+        raise CatalogConflictError("published resource required artifacts are immutable")
+    connection.execute(_UPSERT_RESOURCE_ARTIFACT_SQL, values)
+
+
+def _upsert_prepared_resource_binding(
+    connection: sqlite3.Connection,
+    values: Mapping[str, Any],
+) -> None:
+    referenced = connection.execute(
+        "SELECT status FROM resources WHERE resource_id = ?", (values["resource_id"],)
+    ).fetchone()
+    if referenced is None or referenced["status"] != "ready":
+        raise CatalogValidationError("resource bindings require a ready referenced resource")
+    identity_fields = (
+        "resource_id",
+        "role",
+        "asset_id",
+        "scene_id",
+        "consumer_resource_id",
+    )
+    existing = connection.execute(
+        "SELECT * FROM resource_bindings WHERE binding_id = ?", (values["binding_id"],)
+    ).fetchone()
+    if existing is not None:
+        changed = [field for field in identity_fields if existing[field] != values[field]]
+        if changed:
+            raise CatalogConflictError(
+                f"resource binding {values['binding_id']!r} has immutable conflicts: "
+                + ", ".join(changed)
+            )
+    connection.execute(_UPSERT_RESOURCE_BINDING_SQL, values)
 
 
 def _upsert_prepared_scene(
@@ -1979,6 +3362,92 @@ def _artifact_from_row(row: sqlite3.Row) -> ArtifactRecord:
     )
 
 
+def _resource_from_row(row: sqlite3.Row) -> ResourceRecord:
+    physical_size_mm = (
+        None
+        if row["physical_width_mm"] is None
+        else (float(row["physical_width_mm"]), float(row["physical_height_mm"]))
+    )
+    error = None if row["error_json"] is None else json.loads(str(row["error_json"]))
+    return ResourceRecord(
+        resource_id=str(row["resource_id"]),
+        resource_kind=str(row["resource_kind"]),
+        profile=str(row["profile"]),
+        resolution=str(row["resolution"]),
+        name=str(row["name"]),
+        source=str(row["source"]),
+        source_id=str(row["source_id"]),
+        source_url=str(row["source_url"]),
+        source_revision=str(row["source_revision"]),
+        source_revision_scheme=str(row["source_revision_scheme"]),
+        license=str(row["license"]),
+        license_tier=str(row["license_tier"]),
+        license_url=str(row["license_url"]),
+        attribution=str(row["attribution"]),
+        status=str(row["status"]),
+        tags=tuple(str(tag) for tag in json.loads(str(row["tags_json"]))),
+        bundle_sha256=(None if row["bundle_sha256"] is None else str(row["bundle_sha256"])),
+        content_sha256=(None if row["content_sha256"] is None else str(row["content_sha256"])),
+        physical_size_mm=physical_size_mm,
+        error=error,
+        created_at=str(row["created_at"]),
+        updated_at=str(row["updated_at"]),
+    )
+
+
+def _resource_file_from_row(row: sqlite3.Row) -> ResourceFileRecord:
+    return ResourceFileRecord(
+        file_id=str(row["file_id"]),
+        resource_id=str(row["resource_id"]),
+        semantic_role=str(row["semantic_role"]),
+        provider_role=str(row["provider_role"]),
+        resolution=str(row["resolution"]),
+        format=str(row["format"]),
+        path=str(row["path"]),
+        source_url=str(row["source_url"]),
+        byte_size=int(row["byte_size"]),
+        provider_md5=None if row["provider_md5"] is None else str(row["provider_md5"]),
+        sha256=str(row["sha256"]),
+        color_space=str(row["color_space"]),
+        normal_convention=(
+            None if row["normal_convention"] is None else str(row["normal_convention"])
+        ),
+        channels=json.loads(str(row["channels_json"])),
+        width=None if row["width"] is None else int(row["width"]),
+        height=None if row["height"] is None else int(row["height"]),
+        is_primary=bool(row["is_primary"]),
+        params=json.loads(str(row["params_json"])),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _resource_artifact_from_row(row: sqlite3.Row) -> ResourceArtifactRecord:
+    return ResourceArtifactRecord(
+        artifact_id=str(row["artifact_id"]),
+        resource_id=str(row["resource_id"]),
+        kind=str(row["kind"]),
+        path=str(row["path"]),
+        params=json.loads(str(row["params_json"])),
+        sha256=None if row["sha256"] is None else str(row["sha256"]),
+        created_at=str(row["created_at"]),
+    )
+
+
+def _resource_binding_from_row(row: sqlite3.Row) -> ResourceBindingRecord:
+    return ResourceBindingRecord(
+        binding_id=str(row["binding_id"]),
+        resource_id=str(row["resource_id"]),
+        role=str(row["role"]),
+        asset_id=None if row["asset_id"] is None else str(row["asset_id"]),
+        scene_id=None if row["scene_id"] is None else str(row["scene_id"]),
+        consumer_resource_id=(
+            None if row["consumer_resource_id"] is None else str(row["consumer_resource_id"])
+        ),
+        params=json.loads(str(row["params_json"])),
+        created_at=str(row["created_at"]),
+    )
+
+
 def _scene_from_row(row: sqlite3.Row) -> SceneRecord:
     bounds = None if row["bounds_json"] is None else json.loads(str(row["bounds_json"]))
     error = None if row["error_json"] is None else json.loads(str(row["error_json"]))
@@ -2049,6 +3518,18 @@ def _group_counts(connection: sqlite3.Connection, column: str) -> dict[str, int]
         str(row[0]): int(row[1])
         for row in connection.execute(
             f"SELECT {column}, count(*) FROM assets GROUP BY {column} ORDER BY {column}"
+        )
+    }
+
+
+def _resource_group_counts(connection: sqlite3.Connection, column: str) -> dict[str, int]:
+    allowed = {"resource_kind", "status", "source", "license", "license_tier"}
+    if column not in allowed:  # pragma: no cover - internal programming guard
+        raise CatalogError(f"unsupported resource stats column: {column}")
+    return {
+        str(row[0]): int(row[1])
+        for row in connection.execute(
+            f"SELECT {column}, count(*) FROM resources GROUP BY {column} ORDER BY {column}"
         )
     }
 
@@ -2469,6 +3950,240 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         """,
         "UPDATE scenes SET status = status",
     ),
+    4: (
+        f"""
+        CREATE TABLE resources (
+            resource_id TEXT PRIMARY KEY
+                CHECK(length(resource_id) BETWEEN 1 AND 64)
+                CHECK(substr(resource_id, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(resource_id NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(resource_id, '__') = 0)
+                CHECK(substr(resource_id, -1, 1) <> '_'),
+            resource_kind TEXT NOT NULL CHECK(resource_kind IN ('hdri', 'pbr_texture_set')),
+            profile TEXT NOT NULL
+                CHECK(length(profile) BETWEEN 1 AND 64)
+                CHECK(substr(profile, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(profile NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(profile, '__') = 0)
+                CHECK(substr(profile, -1, 1) <> '_'),
+            resolution TEXT NOT NULL
+                CHECK(length(resolution) BETWEEN 1 AND 32)
+                CHECK(resolution = lower(resolution))
+                CHECK(resolution NOT GLOB '*[^a-z0-9_-]*')
+                CHECK(substr(resolution, 1, 1) GLOB '[a-z0-9]')
+                CHECK(substr(resolution, -1, 1) NOT IN ('_', '-')),
+            name TEXT NOT NULL CHECK(length(trim(name)) > 0 AND name = trim(name)),
+            source TEXT NOT NULL
+                CHECK(length(source) BETWEEN 1 AND 64)
+                CHECK(substr(source, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(source NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(source, '__') = 0)
+                CHECK(substr(source, -1, 1) <> '_'),
+            source_id TEXT NOT NULL
+                CHECK(length(trim(source_id)) > 0 AND source_id = trim(source_id)),
+            source_url TEXT NOT NULL
+                CHECK(source_url = trim(source_url))
+                CHECK(source_url LIKE 'http://%' OR source_url LIKE 'https://%'
+                      OR source_url LIKE 'file://%' OR source_url LIKE 'urn:%'),
+            source_revision TEXT NOT NULL
+                CHECK(length(source_revision) BETWEEN 1 AND 128)
+                CHECK(source_revision = trim(source_revision)),
+            source_revision_scheme TEXT NOT NULL
+                CHECK(length(source_revision_scheme) BETWEEN 1 AND 64)
+                CHECK(substr(source_revision_scheme, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(source_revision_scheme NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(source_revision_scheme, '__') = 0)
+                CHECK(substr(source_revision_scheme, -1, 1) <> '_'),
+            license TEXT NOT NULL CHECK(license IN ({_ALL_LICENSE_SQL})),
+            license_tier TEXT NOT NULL CHECK(license_tier IN ('open', 'nc', 'ue-only')),
+            license_url TEXT NOT NULL
+                CHECK(license_url = trim(license_url))
+                CHECK(license_url LIKE 'http://%' OR license_url LIKE 'https://%'
+                      OR license_url LIKE 'file://%' OR license_url LIKE 'urn:%'),
+            attribution TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL CHECK(status IN ('verified', 'ready', 'failed', 'quarantined')),
+            tags_json TEXT NOT NULL DEFAULT '[]'
+                CHECK(json_valid(tags_json) AND json_type(tags_json) = 'array'),
+            bundle_sha256 TEXT
+                CHECK(bundle_sha256 IS NULL OR (
+                    length(bundle_sha256) = 64 AND bundle_sha256 = lower(bundle_sha256)
+                    AND bundle_sha256 NOT GLOB '*[^0-9a-f]*'
+                )),
+            content_sha256 TEXT
+                CHECK(content_sha256 IS NULL OR (
+                    length(content_sha256) = 64 AND content_sha256 = lower(content_sha256)
+                    AND content_sha256 NOT GLOB '*[^0-9a-f]*'
+                )),
+            physical_width_mm REAL
+                CHECK(physical_width_mm IS NULL OR (
+                    typeof(physical_width_mm) IN ('integer', 'real') AND physical_width_mm > 0
+                )),
+            physical_height_mm REAL
+                CHECK(physical_height_mm IS NULL OR (
+                    typeof(physical_height_mm) IN ('integer', 'real') AND physical_height_mm > 0
+                )),
+            error_json TEXT
+                CHECK(CASE WHEN error_json IS NULL THEN 1
+                           ELSE json_valid(error_json) AND json_type(error_json) = 'object' END),
+            created_at TEXT NOT NULL
+                CHECK(created_at GLOB '????-??-??T??:??:??Z')
+                CHECK(strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = created_at),
+            updated_at TEXT NOT NULL
+                CHECK(updated_at GLOB '????-??-??T??:??:??Z')
+                CHECK(strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) = updated_at)
+                CHECK(updated_at >= created_at),
+            UNIQUE(source, resource_kind, source_id, source_revision, profile, resolution),
+            CHECK(
+                (license_tier = 'open' AND license IN ({_OPEN_LICENSE_SQL}))
+                OR (license_tier = 'nc' AND license IN ({_NC_LICENSE_SQL}))
+                OR (license_tier = 'ue-only' AND license IN ({_UE_ONLY_LICENSE_SQL}))
+            ),
+            CHECK((status IN ('failed', 'quarantined') AND error_json IS NOT NULL)
+                  OR (status NOT IN ('failed', 'quarantined') AND error_json IS NULL)),
+            CHECK(status NOT IN ('verified', 'ready')
+                  OR (bundle_sha256 IS NOT NULL AND content_sha256 IS NOT NULL)),
+            CHECK((physical_width_mm IS NULL) = (physical_height_mm IS NULL)),
+            CHECK(resource_kind <> 'hdri'
+                  OR (physical_width_mm IS NULL AND physical_height_mm IS NULL)),
+            CHECK(resource_kind <> 'pbr_texture_set' OR status <> 'ready'
+                  OR (physical_width_mm IS NOT NULL AND physical_height_mm IS NOT NULL))
+        )
+        """,
+        f"""
+        CREATE TABLE resource_files (
+            file_id TEXT PRIMARY KEY
+                CHECK(length(file_id) BETWEEN 1 AND 64)
+                CHECK(substr(file_id, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(file_id NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(file_id, '__') = 0)
+                CHECK(substr(file_id, -1, 1) <> '_'),
+            resource_id TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+            semantic_role TEXT NOT NULL
+                CHECK(length(semantic_role) BETWEEN 1 AND 64)
+                CHECK(substr(semantic_role, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(semantic_role NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(semantic_role, '__') = 0)
+                CHECK(substr(semantic_role, -1, 1) <> '_'),
+            provider_role TEXT NOT NULL
+                CHECK(length(provider_role) BETWEEN 1 AND 128)
+                CHECK(provider_role = trim(provider_role)),
+            resolution TEXT NOT NULL
+                CHECK(length(resolution) BETWEEN 1 AND 32)
+                CHECK(resolution = lower(resolution))
+                CHECK(resolution NOT GLOB '*[^a-z0-9_-]*')
+                CHECK(substr(resolution, 1, 1) GLOB '[a-z0-9]')
+                CHECK(substr(resolution, -1, 1) NOT IN ('_', '-')),
+            format TEXT NOT NULL
+                CHECK(length(format) BETWEEN 1 AND 64)
+                CHECK(substr(format, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(format NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(format, '__') = 0)
+                CHECK(substr(format, -1, 1) <> '_'),
+            path TEXT NOT NULL CHECK({_ARTIFACT_PATH_CHECK}),
+            source_url TEXT NOT NULL
+                CHECK(source_url = trim(source_url))
+                CHECK(source_url LIKE 'http://%' OR source_url LIKE 'https://%'
+                      OR source_url LIKE 'file://%' OR source_url LIKE 'urn:%'),
+            byte_size INTEGER NOT NULL CHECK(typeof(byte_size) = 'integer' AND byte_size > 0),
+            provider_md5 TEXT
+                CHECK(provider_md5 IS NULL OR (
+                    length(provider_md5) = 32 AND provider_md5 = lower(provider_md5)
+                    AND provider_md5 NOT GLOB '*[^0-9a-f]*'
+                )),
+            sha256 TEXT NOT NULL
+                CHECK(length(sha256) = 64 AND sha256 = lower(sha256)
+                      AND sha256 NOT GLOB '*[^0-9a-f]*'),
+            color_space TEXT NOT NULL CHECK(color_space IN ('srgb', 'linear', 'data')),
+            normal_convention TEXT CHECK(normal_convention IN ('opengl', 'directx')),
+            channels_json TEXT NOT NULL DEFAULT '{{}}'
+                CHECK(json_valid(channels_json) AND json_type(channels_json) = 'object'),
+            width INTEGER CHECK(width IS NULL OR (typeof(width) = 'integer' AND width > 0)),
+            height INTEGER CHECK(height IS NULL OR (typeof(height) = 'integer' AND height > 0)),
+            is_primary INTEGER NOT NULL CHECK(is_primary IN (0, 1)),
+            params_json TEXT NOT NULL DEFAULT '{{}}'
+                CHECK(json_valid(params_json) AND json_type(params_json) = 'object'),
+            created_at TEXT NOT NULL
+                CHECK(created_at GLOB '????-??-??T??:??:??Z')
+                CHECK(strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = created_at),
+            UNIQUE(resource_id, path),
+            CHECK((width IS NULL) = (height IS NULL))
+        )
+        """,
+        f"""
+        CREATE TABLE resource_artifacts (
+            artifact_id TEXT PRIMARY KEY
+                CHECK(length(artifact_id) BETWEEN 1 AND 96)
+                CHECK(substr(artifact_id, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(artifact_id NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(artifact_id, '__') = 0)
+                CHECK(substr(artifact_id, -1, 1) <> '_'),
+            resource_id TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+            kind TEXT NOT NULL
+                CHECK(length(kind) BETWEEN 1 AND 96)
+                CHECK(substr(kind, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(kind NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(kind, '__') = 0)
+                CHECK(substr(kind, -1, 1) <> '_'),
+            path TEXT NOT NULL CHECK({_ARTIFACT_PATH_CHECK}),
+            params_json TEXT NOT NULL DEFAULT '{{}}'
+                CHECK(json_valid(params_json) AND json_type(params_json) = 'object'),
+            sha256 TEXT
+                CHECK(sha256 IS NULL OR (
+                    length(sha256) = 64 AND sha256 = lower(sha256)
+                    AND sha256 NOT GLOB '*[^0-9a-f]*'
+                )),
+            created_at TEXT NOT NULL
+                CHECK(created_at GLOB '????-??-??T??:??:??Z')
+                CHECK(strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = created_at),
+            UNIQUE(resource_id, kind, path)
+        )
+        """,
+        """
+        CREATE TABLE resource_bindings (
+            binding_id TEXT PRIMARY KEY
+                CHECK(length(binding_id) BETWEEN 1 AND 64)
+                CHECK(substr(binding_id, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(binding_id NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(binding_id, '__') = 0)
+                CHECK(substr(binding_id, -1, 1) <> '_'),
+            resource_id TEXT NOT NULL REFERENCES resources(resource_id) ON DELETE CASCADE,
+            role TEXT NOT NULL
+                CHECK(length(role) BETWEEN 1 AND 64)
+                CHECK(substr(role, 1, 1) BETWEEN 'a' AND 'z')
+                CHECK(role NOT GLOB '*[^a-z0-9_]*')
+                CHECK(instr(role, '__') = 0)
+                CHECK(substr(role, -1, 1) <> '_'),
+            asset_id TEXT REFERENCES assets(asset_id) ON DELETE CASCADE,
+            scene_id TEXT REFERENCES scenes(scene_id) ON DELETE CASCADE,
+            consumer_resource_id TEXT REFERENCES resources(resource_id) ON DELETE CASCADE,
+            params_json TEXT NOT NULL DEFAULT '{}'
+                CHECK(json_valid(params_json) AND json_type(params_json) = 'object'),
+            created_at TEXT NOT NULL
+                CHECK(created_at GLOB '????-??-??T??:??:??Z')
+                CHECK(strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = created_at),
+            CHECK((asset_id IS NOT NULL) + (scene_id IS NOT NULL)
+                  + (consumer_resource_id IS NOT NULL) = 1),
+            CHECK(consumer_resource_id IS NULL OR consumer_resource_id <> resource_id)
+        )
+        """,
+        "CREATE INDEX resources_kind_idx ON resources(resource_kind)",
+        "CREATE INDEX resources_status_idx ON resources(status)",
+        "CREATE INDEX resources_source_idx ON resources(source)",
+        "CREATE INDEX resources_license_idx ON resources(license)",
+        "CREATE INDEX resource_files_resource_idx ON resource_files(resource_id)",
+        "CREATE INDEX resource_files_role_idx ON resource_files(semantic_role)",
+        "CREATE UNIQUE INDEX resource_files_primary_idx ON resource_files(resource_id) "
+        "WHERE is_primary = 1",
+        "CREATE INDEX resource_artifacts_resource_idx ON resource_artifacts(resource_id)",
+        "CREATE INDEX resource_bindings_resource_idx ON resource_bindings(resource_id)",
+        "CREATE UNIQUE INDEX resource_bindings_asset_role_idx "
+        "ON resource_bindings(asset_id, role) WHERE asset_id IS NOT NULL",
+        "CREATE UNIQUE INDEX resource_bindings_scene_role_idx "
+        "ON resource_bindings(scene_id, role) WHERE scene_id IS NOT NULL",
+        "CREATE UNIQUE INDEX resource_bindings_consumer_role_idx "
+        "ON resource_bindings(consumer_resource_id, role) "
+        "WHERE consumer_resource_id IS NOT NULL",
+    ),
 }
 
 _UPSERT_ASSET_SQL = """
@@ -2509,6 +4224,67 @@ INSERT INTO artifacts (
 ON CONFLICT(artifact_id) DO UPDATE SET
     params_json = excluded.params_json,
     sha256 = excluded.sha256
+"""
+
+_UPSERT_RESOURCE_SQL = """
+INSERT INTO resources (
+    resource_id, resource_kind, profile, resolution, name, source, source_id, source_url,
+    source_revision, source_revision_scheme, license, license_tier, license_url, attribution,
+    status, tags_json, bundle_sha256, content_sha256, physical_width_mm, physical_height_mm,
+    error_json, created_at, updated_at
+) VALUES (
+    :resource_id, :resource_kind, :profile, :resolution, :name, :source, :source_id, :source_url,
+    :source_revision, :source_revision_scheme, :license, :license_tier, :license_url,
+    :attribution, :status, :tags_json, :bundle_sha256, :content_sha256, :physical_width_mm,
+    :physical_height_mm, :error_json, :created_at, :updated_at
+)
+ON CONFLICT(resource_id) DO UPDATE SET
+    name = excluded.name,
+    status = excluded.status,
+    tags_json = excluded.tags_json,
+    bundle_sha256 = COALESCE(resources.bundle_sha256, excluded.bundle_sha256),
+    content_sha256 = COALESCE(resources.content_sha256, excluded.content_sha256),
+    physical_width_mm = COALESCE(resources.physical_width_mm, excluded.physical_width_mm),
+    physical_height_mm = COALESCE(resources.physical_height_mm, excluded.physical_height_mm),
+    error_json = excluded.error_json,
+    updated_at = excluded.updated_at
+"""
+
+_UPSERT_RESOURCE_FILE_SQL = """
+INSERT INTO resource_files (
+    file_id, resource_id, semantic_role, provider_role, resolution, format, path, source_url,
+    byte_size, provider_md5, sha256, color_space, normal_convention, channels_json, width,
+    height, is_primary, params_json, created_at
+) VALUES (
+    :file_id, :resource_id, :semantic_role, :provider_role, :resolution, :format, :path,
+    :source_url, :byte_size, :provider_md5, :sha256, :color_space, :normal_convention,
+    :channels_json, :width, :height, :is_primary, :params_json, :created_at
+)
+ON CONFLICT(file_id) DO UPDATE SET
+    params_json = excluded.params_json
+"""
+
+_UPSERT_RESOURCE_ARTIFACT_SQL = """
+INSERT INTO resource_artifacts (
+    artifact_id, resource_id, kind, path, params_json, sha256, created_at
+) VALUES (
+    :artifact_id, :resource_id, :kind, :path, :params_json, :sha256, :created_at
+)
+ON CONFLICT(artifact_id) DO UPDATE SET
+    params_json = excluded.params_json,
+    sha256 = excluded.sha256
+"""
+
+_UPSERT_RESOURCE_BINDING_SQL = """
+INSERT INTO resource_bindings (
+    binding_id, resource_id, role, asset_id, scene_id, consumer_resource_id, params_json,
+    created_at
+) VALUES (
+    :binding_id, :resource_id, :role, :asset_id, :scene_id, :consumer_resource_id,
+    :params_json, :created_at
+)
+ON CONFLICT(binding_id) DO UPDATE SET
+    params_json = excluded.params_json
 """
 
 _UPSERT_SCENE_SQL = """
