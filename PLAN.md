@@ -2,9 +2,9 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-10(第 12 次) · 当前阶段:**M2 `v0.3.0` 发布完成,M3 待启动** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 已通过正式审计、合入 `main` 并标记 `v0.3.0`**
-> **当前主线:M3 持续获取——PolyHaven adapter 打样 → Objaverse LVIS 灌库 →
-> 质量门禁/去重 → 每日增量调度与 24h 无人值守验收。**
+> 最后更新:2026-07-11(第 14 次) · 当前阶段:**M3 T3.0 runtime controls / T3.1b PolyHaven resources** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 `v0.3.0`**
+> **当前主线:T3.0 retry/rate/quota 持久化 → T3.1b PolyHaven HDRI/PBR adapters →
+> Objaverse LVIS → 去重/每日调度/24h 验收。T3.1a models hardened slice 已 APPROVE。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
 
@@ -148,7 +148,52 @@
 实现时允许为测试并行准备样例和 catalog,但不允许用未经过前序门禁的结果冒充后序 DoD。
 实现分支:`feat/m2-ingest`;最终提交 `3f46bda`,合并提交 `f140f51`。下一 Sprint 在新的 M3 功能分支启动。
 
-## 5. 风险与已知约束
+## 5. 当前 Sprint:M3 任务清单(持续获取)
+
+> M3 不把“下载成功”当作完成。每个 provider revision 必须形成 discover → verified bytes →
+> strict IngestSpec → UE/package/catalog/thumbnail → terminal evidence 的可恢复闭环；未知许可在 payload
+> 下载前 fail closed。HDRI/材质与 StaticMesh 的 catalog 语义不同,不得用模型行伪装。
+
+### T3.0 持久 acquisition control plane `#acquire` `#infra`
+
+- [x] 定义 PolyHaven live listing/files adapter、revisioned logical id、source-scoped lock、原子 state/run
+  manifest、verified file closure 与 Range resume；官方 521-model listing 已真实解析。
+- [x] 关闭正式预审问题:terminal 必须从 batch/catalog/import/current package/thumbnail 证据派生；state 与
+  run manifest 用 durable commit-intent 可恢复双写；redirect 在连接前做 host allowlist；cursor/watermark、
+  no-change、pending fairness、glTF URI closure、保留路径、CAS 与 byte counters 全部有反例。最终独立复审
+  `APPROVE`:139 acquire tests,Barber/ArmChair public/private terminal replay 与所有 hash 均稳定。
+- [ ] 增加持久 retry/backoff/`Retry-After`、请求速率和 item/byte/disk quota；任何 crash/restart 不丢项、
+  不越过失败 revision,且不会让单个坏资产永久饿死 unseen 队列。
+- **DoD**:脚本化 crash window、并发 source lock、redirect/oversize/hash/closure/schema drift、429/503、
+  quota 与 restart 全绿；每个 run 的计数可与 state/journal 精确对账。
+
+### T3.1a PolyHaven dynamic models v1 `#acquire` `#ingest`
+
+- [x] live API 实验闭环:ArmChair 1k glTF 5 files / 769,144 bytes 经真实 UE import/reload/finalize/
+  thumbnail 达到 `render_ok`;立即重跑 IngestSpec 为 `skipped`,未启动 UE,contact sheet bytes 相同。
+- [x] BlackMyth 追加 scene 候选:挑战柱、Concrete Column 完整 `render_ok`;环境基座因透明 mask、Soul
+  Reaper Scythe 因近黑薄侧面 luma 明确 build-only quarantine；skinned 日式房屋零 StaticMesh,安全 rollback。
+- [x] 在 T3.0 硬化后的代码上重放 3 个动态 PolyHaven model revisions:ArmChair、Barber Shop Chair、
+  Barrel 均有完整 provenance、package bytes、catalog、contact sheets 与 terminal receipt。
+- **DoD(已达成)**:fresh 3/3 `render_ok`;精确重放 3/3 `skipped` 且 0 UE；run/state/generated spec/batch/catalog/
+  package/artifacts 哈希闭环,逐 contact sheet 视觉通过。
+
+### T3.1b PolyHaven HDRI + 材质 `#acquire` `#catalog`
+
+- [x] 实装 catalog schema v4 独立 resource 模型:`resources/resource_files/resource_artifacts/
+  resource_bindings`,为 HDRI/PBR texture set 提供 profile、状态机、许可、revision、文件语义与引用关系；
+  v1/v3 → v4 migration 保持既有 asset/scene rows,166 项相关回归与独立审计通过。
+- [ ] 同一 adapter 契约接入 HDRI 与 texture files,替换 M1 单文件 helper 的非增量 metadata。
+
+### T3.2–T3.4 后续主线
+
+- [ ] T3.2:Objaverse LVIS bounded shard → 分批全量;逐对象许可映射,未知/禁用许可零 payload。
+- [ ] T3.3:exact content dedupe 保留多来源 origin;近似 pHash/embedding 进入可审计 quarantine,不静默删源。
+- [ ] T3.4:`uef acquire daily` + JSON/HTML 日报 + supervisor restart;真实墙钟运行 ≥24h,全程无人工干预。
+
+实现分支:`feat/m3-acquire`。M3 v1 只有在 T3.0–T3.4 DoD、真实 24h 证据与正式 review 全部通过后发布。
+
+## 6. 风险与已知约束
 
 1. **GPU 显存占用会动态变化**:2026-07-10 doctor 时 H100 约 79GiB 可用,但历史上曾只剩 ~12GiB。
    UE/ingest 重任务前必须 doctor;若 OOM,记录现场并升级给 Owner。**禁止 kill 任何不是我们启动的进程。**
@@ -161,7 +206,7 @@
 8. **WAN 带宽未知**:引擎 provision(几十 GB)与批量产物回传可能很慢;一切大传输走 `rsync --partial` 断点续传 + 远端 tmux,首次实测带宽记入 WORKLOG,作为 M4 调度参数。
 9. **l40s 是容器,随时可能重建**:持久数据只放它自己的 NAS;每次任务前 doctor 校验哨兵还在,不在就自动重新 `node init + provision`(幂等设计的意义)。
 
-## 6. 当前假设(Owner 可推翻)
+## 7. 当前假设(Owner 可推翻)
 
 - A1:引擎用已就位的 **UE 5.5.4 预编译 Linux 版**,不自己编引擎(ADR-001)。
 - A2:资产用途按"研究/内部数据生产"处理,商用合规问题出现时再升级。

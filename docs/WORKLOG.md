@@ -1103,3 +1103,154 @@ REVIEW REQUESTED: feat/m1-render 43d2163
 - 发布引用约束:本 release bookkeeping commit 是 annotated tag `v0.3.0` 的 peeled target；发布后
   `origin/main`、本地 `main` 与 `v0.3.0^{}` 必须完全相同,CLI 版本必须为 `0.3.0`。提交后立即创建、
   推送并逐项核验这些引用；不以新的 post-tag 文档提交移动发布目标。
+
+## [2026-07-10] M3 T3.1a live acquisition / scene 扩展实验 — REVIEW FIXES IN PROGRESS
+
+- 基线:`v0.3.0` / `5d9070a`;实现分支:`feat/m3-acquire`。本节记录真实实验事实,不代表 M3
+  control plane 已放行；独立预审发现的 terminal evidence / crash recovery 问题正在后续修复。
+
+### BlackMyth 追加 scene candidates
+
+- scanner 仍为 14 records / 13 open / 1 nc / 0 quarantine。新增两个 portable open SceneSpec:
+  `examples/scenes/bm_genshin_challenge_post.yaml` 与
+  `examples/scenes/bm_genshin_environment_base.yaml`;scene/acquire 契约集 `123 passed`。
+- `bm_genshin_challenge_post`:
+  - build:`out/scene_builds/20260710T164602Z_b9204d37/bm_genshin_challenge_post/manifest.json`；
+    3 meshes / 1,416 triangles / 3 materials / 7 textures,primary/reload/finalize 全部零未过滤
+    warning/error,完整 package bundle 已写 catalog。
+  - render:`out/scene_thumbnails/20260710T164711Z_c469e93d/scene_bm_genshin_challenge_post/manifest.json`；
+    8-view beauty/mask、setup/render 零未过滤 warning/error,status=`render_ok`。
+  - 执行代理打开最终 contact sheet:挑战柱构图完整,红色 emissive 火焰可见,8 视角 mask 对齐,
+    无裁切/空帧/背景泄漏。
+- `bm_genshin_environment_base`:
+  - 首次 strict build 在 source manifest 的 5 textures 与 UE 实际 7 textures 不一致时 fail closed；
+    host rollback 成功且 `SceneTransactions` 为空。以 UE inventory 修正 expected 后,build/reload/finalize
+    在 `out/scene_builds/20260710T164224Z_b5fd58f9/bm_genshin_environment_base/manifest.json`
+    成功:12 meshes / 4,969 triangles / 2 materials / 7 textures。
+  - beauty 8 视角视觉完整(圆形草地、岩石、红色水晶/骨骼均可见),但 12 primitives 中 11 个共用
+    `alphaMode=BLEND` material,custom depth 只观察到 stencil 1；coverage=`1/12=0.083333`,低于
+    schema 最低 0.6。失败证据:
+    `out/scene_thumbnails/20260710T164331Z_1a9eb59b/scene_bm_genshin_environment_base/manifest.json`。
+    决定:保留为 build-only / transparent-mask quarantine,不降低门槛、不计 `render_ok`。
+- Feudal Japanese House open candidate(12 skinned meshes / 444,275 triangles)strict probe:
+  `out/scene_builds/20260710T165310Z_083516c0/bm_feudal_japanese_house/manifest.json`。Interchange
+  只生成 SkeletalMesh、零 StaticMesh,主阶段 fail closed；12 条 skinned-child warning 与错误均完整记录,
+  独立 rollback 成功,未写 catalog/最终 package。实验 spec 未纳入受检 examples；后续需显式 staticization。
+
+### PolyHaven dynamic models v1 实验闭环
+
+- 官方 live API 条件已复核:研究/非商业使用,所有请求带唯一 User-Agent；API 提供 listing、metadata、
+  file URL/size/hash 与依赖 closure。`/assets?type=models` 当前返回 521 models。live 数据暴露重复 tag
+  (`Camera_01`)与尾空格(`food_lychee_01`),adapter 改为逐值严格校验后稳定 trim/dedupe,不静默接受
+  非字符串/控制字符。
+- download-only run:
+  `out/acquire/polyhaven/20260710T170346Z_5689ff7b/manifest.json`。选择 revisioned id
+  `polyhaven_armchair_01_8a04a102d4a1`,5 files / 769,144 verified bytes；官方 MD5 与本地 SHA-256
+  全部一致,生成 strict IngestSpec,state 仅为 nonterminal `downloaded`。
+- fresh UE run:
+  `out/acquire/polyhaven/20260710T170411Z_a8213ec0/manifest.json` →
+  `out/ingest_batches/20260710T170419Z_79ff31df/manifest.json`。primary/reload/finalize 与 thumbnail
+  setup/render 全部零未过滤 warning/error；catalog `data/catalog_m3_polyhaven.db` 为 1 asset /
+  6 artifacts / `render_ok`,5,626 triangles / 1 material。当前 UE package 完整闭包为 5 files /
+  4,526,980 bytes。
+- 执行代理打开 8-view asset contact sheet 与 batch sheet:扶手椅居中、完整、落地,各角度轮廓/材质
+  正常,mask 与主体逐帧对齐。asset sheet:
+  `out/thumbnails/20260710T170709Z_423cb378/polyhaven_armchair_01_8a04a102d4a1/contact_sheet.png`。
+- 同一 generated IngestSpec 立即复跑:
+  `out/ingest_batches/20260710T171004Z_d8af7ccb/manifest.json`,1/1 `skipped`,无 UE log/进程；fresh/
+  skip batch contact sheet SHA-256 均为
+  `bca0568d14ee54e94498c6a15ac09e84f3dbe1786617780465a76a6ef0bd311f`。
+
+### 独立预审与当前边界
+
+- 独立 reviewer 对首版 control plane 判定 1 BLOCKER + 9 MAJOR:caller 可无资产级证据声明 terminal、
+  state/run 双文件崩溃窗口、hash/watermark 语义漂移、selection 不收敛/饥饿、redirect 连接后才校验、
+  glTF closure/保留路径未前置、acquired_at/byte counters 漂移与 finalizer CAS 不足。
+- live 兼容性额外抽查通过:521 listing 全量可解析；最早 20 + 最新 15 个 1k glTF package 可解析；
+  30 个 glTF URI set 与官方 include closure 精确一致。
+- 决定:上方成功运行只证明下载→M2 ingest substrate 的纵向可行性,不把首版 JSON terminal 当 release
+  evidence。后续 state schema v2 将旧 v1 terminal 全部安全降级为 nonterminal,以 strict batch/catalog/
+  import/current package/thumbnail evidence 自动派生 terminal receipt,并增加 durable commit-intent、
+  redirect preflight、no-change/fairness/closure/CAS 回归后重放真实 run。
+
+## [2026-07-11] M3 hardened models / resource schema / scene 扩展 — APPROVED SLICE
+
+### PolyHaven control plane 关闭预审问题
+
+- 实装并验证 state/run schema v2:downloaded 与 terminal 分离；terminal 只能由 strict downstream
+  batch、catalog asset/artifact rows、import manifest、当前 UE package bytes、thumbnail manifest 与原始
+  staging closure 自动派生。旧 v1 terminal migration 一律降级为 nonterminal 后重新验证。
+- source state 与 run manifest 通过 durable commit-intent 原子收敛；四种 crash disk position、source/
+  asset lock、redirect 连接前 allowlist、full revision watermark、no-op、pending/unseen 轮转、精确 glTF
+  URI closure、reserved paths、稳定 acquired_at、Range 真实传输 byte accounting 均有反例。
+- prepared run 以 domain-separated digest 锚进 selected state item；finalizer 对 manifest request/listing/
+  counts、完整 acquisition projection 与 generated spec 做 CAS。terminal replay 重新派生 raw/catalog/
+  artifact/package/thumbnail canonical receipt；后续全局 state 前进不破坏历史 replay,但 selected state、
+  finalization 或 terminal→nonterminal cohort 漂移均 fail closed。
+- 最终独立只读复审结论:`APPROVE`,无遗留 BLOCKER/MAJOR/MINOR。验证:`139 passed` acquire tests；
+  ruff format/check、mypy 54 source files、py_compile、diff-check 全绿；Barber 与 ArmChair public/private
+  replay 前后 state/catalog/run/spec hash 均不变,SQLite integrity_check 通过,无 commit_intent 残留。
+- 实现提交:`79ea635 feat(acquire): harden PolyHaven model sync`；已推送 `feat/m3-acquire`。
+
+### 三个动态 PolyHaven revisions 的 hardened 真实闭环
+
+- ArmChair revision `8a04a102d4a1…`:hardened acquisition
+  `out/acquire/polyhaven/20260711T050808Z_d8ce797d/manifest.json` 复用 5/5 files、传输 0 bytes；batch
+  `out/ingest_batches/20260711T050810Z_c8f41999/manifest.json` 为 `skipped`,未启动 UE；strict terminal
+  receipt 成功封存并可重复重放。
+- Barber Shop Chair revision `f111fa76f5cc…`:
+  - acquisition:`out/acquire/polyhaven/20260711T050110Z_6ad80fda/manifest.json`,5 files /
+    879,179 verified+downloaded bytes。
+  - batch:`out/ingest_batches/20260711T050115Z_ee790dbf/manifest.json`;import primary/reload/finalize、
+    thumbnail setup/render 全部 0 未过滤 warning/error。4,280 triangles / 1 material；UE package closure
+    5 files / 5,319,809 bytes,最终 terminal=`render_ok`。
+  - contact sheet:
+    `out/thumbnails/20260711T050521Z_308e8d1e/polyhaven_barbershopchair_01_f111fa76f5cc/contact_sheet.png`。
+    执行代理已打开检查:皮革/木材/金属完整,8 视角无裁切,mask 对齐；subject coverage
+    0.112705–0.133671,background contamination=0。
+  - exact IngestSpec replay:`out/ingest_batches/20260711T054730Z_7345e84c/manifest.json`,1/1
+    `skipped`,无 UE。
+- Barrel revision `45ce352c4416…`:
+  - acquisition:`out/acquire/polyhaven/20260711T054440Z_0b8c30e6/manifest.json`,5 files /
+    692,947 verified+downloaded bytes。
+  - batch:`out/ingest_batches/20260711T054445Z_43074a42/manifest.json`;三轮 import 与 thumbnail
+    全部 0 未过滤诊断。2,682 triangles / 1 material；UE package closure 5 files / 5,257,111 bytes,
+    terminal=`render_ok`。
+  - contact sheet:
+    `out/thumbnails/20260711T054556Z_c419789a/polyhaven_barrel_01_45ce352c4416/contact_sheet.png`。
+    执行代理已打开检查:红色磨损桶与黄色警示标识清晰,8 视角/mask 对齐；subject coverage
+    0.229786–0.230225。
+  - exact IngestSpec replay:`out/ingest_batches/20260711T054738Z_d3b9f869/manifest.json`,1/1
+    `skipped`,无 UE。
+- 当前实验 catalog `data/catalog_m3_polyhaven.db`:3 assets / 18 artifacts；3/3 `CC0-1.0/open/
+  polyhaven/render_ok`。三个 model fresh 均有逐图检查,三个 exact replay 均为 0-UE skipped。
+
+### Catalog schema v4 resource 模型
+
+- 新增独立 `resources/resource_files/resource_artifacts/resource_bindings`,不向 StaticMesh asset row
+  塞 `asset_kind`。支持 HDRI/PBR profile、verified→ready 原子发布、source revision、bundle/content
+  digest、color space/normal convention/packed channels、许可与 consumer binding。
+- verified/ready evidence cohort 不可由普通 upsert 绕过；重放幂等；跨资源同路径按 `(resource_id,path)`
+  约束；ready metadata drift fail closed。v1/v3 migration 保留现有 asset/scene rows。
+- 独立审计 COMMIT-READY；catalog/resource/CLI 95 passed + ingest/scene/thumbnail 71 passed；ruff、mypy、
+  diff-check 全绿。提交:`dcab576 feat(catalog): add typed resource records`。
+
+### BlackMyth scene-level 素材继续扩展
+
+- Concrete Column open SceneSpec:`examples/scenes/bm_concrete_column.yaml`。build
+  `out/scene_builds/20260711T050952Z_f430270d/bm_concrete_column/manifest.json`:1 StaticMesh /
+  3,472 triangles / 1 material / 3 textures / 5 actors；primary/reload/finalize 0 未过滤诊断；package
+  closure 7 files / 11,968,285 bytes。render
+  `out/scene_thumbnails/20260711T051420Z_6db298bb/scene_bm_concrete_column/manifest.json`
+  为 `render_ok`;8-view contact sheet 已人工检查,石材纹理、构图与 mask 正确,contamination=0。
+- Soul Reaper Scythe open SceneSpec:`examples/scenes/bm_soul_reaper_scythe.yaml`。首次 strict probe
+  发现 provider metadata 的 1 image 在 UE 为 2 Texture2D,失败后独立 rollback 0 诊断；修正 expected 后
+  最终 build `out/scene_builds/20260711T053947Z_155edb20/bm_soul_reaper_scythe/manifest.json`
+  成功:1 StaticMesh / 19,632 triangles / 1 material / 2 textures / 7 actors,且 `CircleAction` 保留为
+  LevelSequence；package closure 7 files / 3,889,591 bytes。
+- Scythe thumbnail 做了逐步可审计调参,最终 7/8 views luma=5.096–7.742,但一个近黑 planar thin view
+  仅 3.165(<5)。原帧清晰但继续拉近会裁切,lighting 已到 schema 上限；决定保留 built / thumbnail
+  quarantine,不降低全局 luma gate、不伪称 render_ok。失败证据:
+  `out/scene_thumbnails/20260711T054109Z_7025a4fd/scene_bm_soul_reaper_scythe/manifest.json`。
+- scene spec/executor/thumbnail 回归 `137 passed`。提交:
+  `56dffb0 feat(scene): add dark fantasy set pieces`。
