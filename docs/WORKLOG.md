@@ -1254,3 +1254,65 @@ REVIEW REQUESTED: feat/m1-render 43d2163
   `out/scene_thumbnails/20260711T054109Z_7025a4fd/scene_bm_soul_reaper_scythe/manifest.json`。
 - scene spec/executor/thumbnail 回归 `137 passed`。提交:
   `56dffb0 feat(scene): add dark fantasy set pieces`。
+
+## [2026-07-11] M3 night scene / resource validators / runtime controls — APPROVED SLICES
+
+### BlackMyth research-only night diorama
+
+- 新增 `examples/scenes/bm_toon_houses_night.yaml`,source 为 BlackMyth 素材库中的 Toon houses night；
+  license=`CC-BY-NC-SA-4.0`,tier=`nc`,`export=false`,不计开放许可场景 DoD。canonical SceneSpec
+  SHA-256=`b1e46f4088e20068b347e96127f430fbf07075488f0c0ab4d11555bcdb4f8fd6`。
+- final persistent build:
+  `out/scene_builds/20260711T061314Z_449b1c67/bm_toon_houses_night/manifest.json`；9 actors /
+  3 meshes / 9,773 triangles / 3 materials / 3 textures,11 package files / 15,398,785 bytes；
+  primary/reload/finalize 全部 0 未过滤 diagnostics,catalog integrity/FK clean。
+- 执行代理打开 internal 与 external camera 的 beauty/mask 实图。房屋夜景内容可见,但 sky sphere
+  填满全部 mask、smoke stencil 缺失；外部相机又出现 sky ball 过大、房屋过小且 frame-0 luma=4.988。
+  两次 strict visual validation 均失败,因此明确保留 build-only quarantine,不调低 gate。实现提交:
+  `63cf97b feat(scene): add quarantined night diorama`。
+
+### HDRI/PBR strict CPU resource validation
+
+- 新增 `src/uefactory/acquire/resource_validation.py`:Radiance HDR magic/FORMAT、`-Y +X`、2:1、
+  modern RLE 与完整 scanline consumption；PNG signature/chunk/CRC、单 zlib stream、standard/Adam7
+  scanline/filter、EOF/trailing stream、ancillary allowlist/order/singleton 与 Pillow verify+load 双检查。
+- PBR profile 固定 `Diffuse/png + nor_dx/png + arm/png`,要求 physical size、DirectX normal 与 ARM
+  channel semantics。首轮独立审计发现 IDAT smuggling/extra decompressed bytes 与 NUL path；均补反例后
+  关闭。resource/HDRI/catalog tests=`59 passed`,Ruff/Mypy 全绿。
+- 真实文件验证:
+  - `data/hdri/studio_small_03_1k.hdr`:1,686,299 bytes,1024×512,512 scanlines,
+    SHA-256=`30933d…`。
+  - `data/m2_samples/polyhaven_standing_picture_frame_01/textures/
+    standing_picture_frame_01_artwork_diff_1k.png`:466,004 bytes,RGB 1024×1024,SHA-256=`a362…`。
+- 实现提交:`1ff2bef feat(acquire): validate HDRI and PBR resources`。
+
+### Persistent acquisition runtime controls
+
+- `PolyHavenRuntimeConfig` 与 CLI 已接入默认 2 requests/sec、burst=1、有限 retry/backoff、严格
+  `Retry-After`、逐 redirect-hop token、UTC-day item/byte quota、model-tree max storage 与 free-space
+  floor。run receipt 升至 schema v3；schema v2 prepared/finalized 保持可重放,schema v2 no-op 因无
+  runtime anchor 明确拒绝；schema v3 no-op digest 写入 `state.noop_run_receipts`。
+- byte quota ledger 对每个 open download 保存 durable `body_bytes_claimed`:预计 body 在网络请求前
+  原子 claim,只释放 transport 明确未返回的部分。该状态机同时满足正常 206 Range restart 不重复计费、
+  Range 200 追加 offset、read→write 丢失后重传先扩 quota、process crash 后保守计账。
+- oversize 使用受 daily+disk headroom 约束的 1-byte probe；没有 probe 时只接受唯一、canonical、精确
+  `Content-Length`,并拒绝 missing/duplicate/错误长度及 TE+CL。`spec+1` partial marker、atomic ledger
+  close、close-write failure、close-success/unlink-crash、同日/跨日 recovery 均有零网络反例。
+- 其他已关闭的 adversarial window:transient/integrity 交替预算、UTC midnight reservation、force after
+  destination-replace crash、完整 partial/EOF probe error 退款、quota exact daily/storage/free boundary、
+  runtime numeric canonicality 与 ledger/state schema drift。
+- 最终验证:
+  - all acquire:`222 passed`；focused claims/crash/framing/schema:`21 passed`。
+  - 全项目最终回归:`890 passed,2 deselected`；Ruff format/check、Mypy、py_compile、diff-check 全绿。
+  - Barber/ArmChair/Barrel 三份 schema v2 terminal replay 成功,11 个 state/catalog/run/spec/batch 文件
+    hash 不变；catalog `integrity_check=ok`,FK violations=0。
+  - 真实 official listing no-payload run:
+    `out/acquire/polyhaven/20260711T075932Z_4053a0b1/manifest.json`:521 discovered、1 request、0 body、
+    518 deferred；schema v3 no-op receipt 与 state anchor 一致,CLI status=`deferred`。
+- 两位独立 reviewer 对 patch
+  `734f9dd53c80e8bd91481d65869aa46630357c7889c73c65d013cf75cdca305a` 均给 `APPROVE`,最终
+  BLOCKER/MAJOR/MINOR/NIT=0。实现提交:
+  `2eeacc9 feat(acquire): persist runtime controls`;正式报告:
+  `docs/reviews/2026-07-11-m3-acquisition-runtime.md`。
+- 边界:T3.0 尚未整体关闭。durable failure journal、permanent revision quarantine/rotation 与跨 run
+  scheduling 留作紧接的下一切片；在证明坏 revision 不会饿死 unseen 队列前不标记完成。

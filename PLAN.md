@@ -2,8 +2,8 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-11(第 14 次) · 当前阶段:**M3 T3.0 runtime controls / T3.1b PolyHaven resources** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 `v0.3.0`**
-> **当前主线:T3.0 retry/rate/quota 持久化 → T3.1b PolyHaven HDRI/PBR adapters →
+> 最后更新:2026-07-11(第 15 次) · 当前阶段:**M3 T3.0 failure journal / T3.1b PolyHaven resources** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 `v0.3.0`**
+> **当前主线:T3.0 failure journal / permanent rotation → T3.1b PolyHaven HDRI/PBR adapters →
 > Objaverse LVIS → 去重/每日调度/24h 验收。T3.1a models hardened slice 已 APPROVE。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
@@ -162,8 +162,13 @@
   run manifest 用 durable commit-intent 可恢复双写；redirect 在连接前做 host allowlist；cursor/watermark、
   no-change、pending fairness、glTF URI closure、保留路径、CAS 与 byte counters 全部有反例。最终独立复审
   `APPROVE`:139 acquire tests,Barber/ArmChair public/private terminal replay 与所有 hash 均稳定。
-- [ ] 增加持久 retry/backoff/`Retry-After`、请求速率和 item/byte/disk quota；任何 crash/restart 不丢项、
-  不越过失败 revision,且不会让单个坏资产永久饿死 unseen 队列。
+- [x] 增加持久 retry/backoff/`Retry-After`、逐 redirect-hop 请求速率和 item/byte/disk quota；schema v3
+  runtime receipt、UTC-day ledger、durable pre-read body claims、conditional oversize probe 与 strict HTTP
+  framing 已关闭 crash/restart、重传、Range 200、exact quota/disk boundary 的越额窗口。独立终审
+  `APPROVE`:222 acquire tests；全项目 890 passed / 2 deselected、真实 521 listing deferred/noop 与三个 schema v2
+  terminal replay 均稳定。实现提交:`2eeacc9 feat(acquire): persist runtime controls`。
+- [ ] 增加 durable failure journal、permanent failure/quarantine rotation 与跨 run backoff；坏 revision 必须
+  可审计地让路,不能永久饿死 unseen 队列。完成此项前 T3.0 仍不整体关闭。
 - **DoD**:脚本化 crash window、并发 source lock、redirect/oversize/hash/closure/schema drift、429/503、
   quota 与 restart 全绿；每个 run 的计数可与 state/journal 精确对账。
 
@@ -173,6 +178,9 @@
   thumbnail 达到 `render_ok`;立即重跑 IngestSpec 为 `skipped`,未启动 UE,contact sheet bytes 相同。
 - [x] BlackMyth 追加 scene 候选:挑战柱、Concrete Column 完整 `render_ok`;环境基座因透明 mask、Soul
   Reaper Scythe 因近黑薄侧面 luma 明确 build-only quarantine；skinned 日式房屋零 StaticMesh,安全 rollback。
+- [x] BlackMyth Toon houses night 以 `nc`/`export=false` 独立隔离；persistent level build/reload/finalize
+  成功(9 actors / 9,773 triangles),但 sky sphere 遮罩与构图不满足 strict visual gate,保留 build-only
+  quarantine,不计开放 DoD。实现提交:`63cf97b`。
 - [x] 在 T3.0 硬化后的代码上重放 3 个动态 PolyHaven model revisions:ArmChair、Barber Shop Chair、
   Barrel 均有完整 provenance、package bytes、catalog、contact sheets 与 terminal receipt。
 - **DoD(已达成)**:fresh 3/3 `render_ok`;精确重放 3/3 `skipped` 且 0 UE；run/state/generated spec/batch/catalog/
@@ -183,6 +191,9 @@
 - [x] 实装 catalog schema v4 独立 resource 模型:`resources/resource_files/resource_artifacts/
   resource_bindings`,为 HDRI/PBR texture set 提供 profile、状态机、许可、revision、文件语义与引用关系；
   v1/v3 → v4 migration 保持既有 asset/scene rows,166 项相关回归与独立审计通过。
+- [x] 实装 strict CPU resource validators:Radiance HDR scanline/RLE/2:1 closure 与 PNG chunk/CRC/zlib/
+  Adam7/ancillary ordering；PBR profile 固定 Diffuse + DirectX normal + ARM packed channels。59 项相关测试、
+  真实 1k HDR 与 1024² PNG 通过；实现提交:`1ff2bef`。
 - [ ] 同一 adapter 契约接入 HDRI 与 texture files,替换 M1 单文件 helper 的非增量 metadata。
 
 ### T3.2–T3.4 后续主线
