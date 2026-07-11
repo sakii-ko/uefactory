@@ -2,8 +2,8 @@
 
 > 本文件是项目的**单一事实来源**:做什么、现在做到哪、下一步做什么。
 > 由当前执行代理统一维护并直接实施;不再拆分 Planner → Coder/Executor 交接。
-> 最后更新:2026-07-11(第 15 次) · 当前阶段:**M3 T3.0 failure journal / T3.1b PolyHaven resources** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 `v0.3.0`**
-> **当前主线:T3.0 failure journal / permanent rotation → T3.1b PolyHaven HDRI/PBR adapters →
+> 最后更新:2026-07-11(第 16 次) · 当前阶段:**M3 T3.1b PolyHaven resources** · 已完成:**M0 `v0.1.0`;M1 `v0.2.0`;M2 `v0.3.0`;M3 T3.0/T3.1a**
+> **当前主线:T3.1b PolyHaven HDRI/PBR adapters →
 > Objaverse LVIS → 去重/每日调度/24h 验收。T3.1a models hardened slice 已 APPROVE。**
 > 规则不变:DoD 验收对象不可替换;实现、测试、真实运行、可视化审阅和 review 必须形成闭环。
 ---
@@ -167,9 +167,14 @@
   framing 已关闭 crash/restart、重传、Range 200、exact quota/disk boundary 的越额窗口。独立终审
   `APPROVE`:222 acquire tests；全项目 890 passed / 2 deselected、真实 521 listing deferred/noop 与三个 schema v2
   terminal replay 均稳定。实现提交:`2eeacc9 feat(acquire): persist runtime controls`。
-- [ ] 增加 durable failure journal、permanent failure/quarantine rotation 与跨 run backoff；坏 revision 必须
-  可审计地让路,不能永久饿死 unseen 队列。完成此项前 T3.0 仍不整体关闭。
-- **DoD**:脚本化 crash window、并发 source lock、redirect/oversize/hash/closure/schema drift、429/503、
+- [x] 增加 schema v4 durable hash-chain failure journal、permanent/quality quarantine、transient/deferred
+  cross-run backoff、integrity streak、audited exact-revision release 与 failure report。per-item failure 不再
+  中止 mixed batch；active attempt、stale run、journal→state/manifest crash、finalization receipts 与
+  deterministic event replay 均可恢复。run/event policy、ordinal/cohort/source/revision/resolution identity、
+  state transition/finalization anchor 精确对账；terminal state 不会被 stale failure 重选,同 revision 的 1k/2k
+  package root 独立。实现提交:`e972647 feat(acquire): rotate failed revisions`；独立 failure-journal、
+  CLI/compat、finalization 三路终审均 `APPROVE`。
+- **DoD(已达成)**:脚本化 crash window、并发 source lock、redirect/oversize/hash/closure/schema drift、429/503、
   quota 与 restart 全绿；每个 run 的计数可与 state/journal 精确对账。
 
 ### T3.1a PolyHaven dynamic models v1 `#acquire` `#ingest`
@@ -178,6 +183,9 @@
   thumbnail 达到 `render_ok`;立即重跑 IngestSpec 为 `skipped`,未启动 UE,contact sheet bytes 相同。
 - [x] BlackMyth 追加 scene 候选:挑战柱、Concrete Column 完整 `render_ok`;环境基座因透明 mask、Soul
   Reaper Scythe 因近黑薄侧面 luma 明确 build-only quarantine；skinned 日式房屋零 StaticMesh,安全 rollback。
+- [x] 继续实测 BlackMyth `Character Fight` mixed-skeletal 候选:静态主闭包可形成 118 actors / 45 meshes /
+  35,590 triangles,但 strict host 捕获 375 个 zero-scale physics、22 个 skinned hierarchy 与 7 个 empty-bounds
+  navigation diagnostics；共 404 warnings 后原子 rollback,未留下 catalog/package/render 残留,不伪装为新增素材。
 - [x] BlackMyth Toon houses night 以 `nc`/`export=false` 独立隔离；persistent level build/reload/finalize
   成功(9 actors / 9,773 triangles),但 sky sphere 遮罩与构图不满足 strict visual gate,保留 build-only
   quarantine,不计开放 DoD。实现提交:`63cf97b`。

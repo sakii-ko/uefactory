@@ -1316,3 +1316,52 @@ REVIEW REQUESTED: feat/m1-render 43d2163
   `docs/reviews/2026-07-11-m3-acquisition-runtime.md`。
 - 边界:T3.0 尚未整体关闭。durable failure journal、permanent revision quarantine/rotation 与跨 run
   scheduling 留作紧接的下一切片；在证明坏 revision 不会饿死 unseen 队列前不标记完成。
+
+## [2026-07-11] M3 T3.0 durable failure journal / revision rotation — APPROVE
+
+### Failure control plane
+
+- 新增 `acquire/failure_journal.py`：strict schema v1 event stream、连续 sequence、deterministic event ID、
+  hash chain、per-event policy、完整 semantic replay 与 active revision view。failure taxonomy 扩展
+  `interrupted/downstream/quality`，并区分 permanent、transient、integrity、deferred。
+- PolyHaven run receipt 升至 schema v4：每个 I/O attempt 先持久化 marker；failed/deferred/quarantined/
+  released/resolved event 与 run ordinal/cohort/policy/source/revision/resolution 精确绑定。permanent revision
+  会让出 unseen queue；new provider revision 不受旧 quarantine 影响；`--retry-revision` 只做 audited exact
+  release，`--force` 不绕过。
+- downstream finalization 的 journal mutation 改为整 cohort 内存预构造后一次原子写；finalization-only
+  digest 锚定 state map，避免 `state.after_finalization`、journal prefix 或 unrelated event 替换。旧
+  resolution/release 遇到 newer active failure 会 fail closed，terminal state 也不会被 selector 重选。
+- 修复审查中发现的 symlink run-root/manifest/state/lock/report escape、本地 cache 错误被 stale recovery
+  误记、quota deferred 误计数、微秒/回退时钟缩短 backoff、跨 resolution identity/storage collision、
+  multi-target release/row journal partial mutation、schema2/3 optional-key hash 回归等问题；全部有反例。
+- CLI 新增 cross-run policy flags、repeatable `--retry-revision` 与只读
+  `uef acquire polyhaven-failures --status active|quarantined|all [--json]`；human `all` 列出完整
+  failed/resolved/released history。
+
+### 验证与真实 evidence
+
+- 实现提交：`e972647 feat(acquire): rotate failed revisions`；commit hooks 全绿。
+- 最终自动化：all acquire=`283 passed`；全项目=`951 passed, 2 deselected`；Ruff、Mypy、compileall、
+  diff-check 全绿。
+- 真实 official listing：
+  `out/acquire/polyhaven/20260711T104158Z_12c6465e/manifest.json`；521 discovered、1 request、0 body、
+  0 attempted、518 quota-deferred，schema v4 receipt/current state anchor/journal prefix 全部严格验证。
+- failure report human 结果为 `0 active; 0 journal events`；journal SHA-256
+  `19d440f64a9a5549d0b871ce40450cb243d7b513b23c789acdb6451058761414` 前后不变。
+- Barber/ArmChair/Barrel 三份 schema v2 finalized、既有 schema v3 noop 与新 schema v4 noop 共 5 run
+  重放成功；13 watched files aggregate SHA-256
+  `e637436aad969439502ecee836498aca2f035d5ec94b1e9b545bcf5ed66eab4f` 前后不变。
+- 三路独立 review（failure journal adversarial、CLI/schema compatibility、finalization transaction）最终均
+  `APPROVE`，BLOCKER/MAJOR/MINOR/NIT=0；正式报告：
+  `docs/reviews/2026-07-11-m3-acquisition-failure-journal.md`。T3.0 DoD 至此关闭，下一主线 T3.1b。
+
+### BlackMyth scene candidate follow-up
+
+- 对 `/home/chijw/workspace/projs/blackmyth` 的 `Character Fight` 做真实 persistent-level build。静态主闭包
+  inventory 为 118 actors、45 StaticMeshes、8 materials/textures、35,590 triangles，bounds
+  248.699953×291.285524×196.955945 cm，inventory digest=`4e359…`。
+- strict host 捕获 404 warnings：375 `LogPhysics` zero-scale、22 skinned hierarchy、7 navigation
+  empty-bounds。候选在 host gate 原子 rollback；未留下 catalog/package/render residue，也未保留不合格
+  SceneSpec。evidence：
+  `out/scene_builds/20260711T082245Z_df6d6c7b/bm_character_fight_diorama/manifest.json`。该 mixed-skeletal
+  候选明确记为 rejected experiment，不计新增 scene-level 素材。
