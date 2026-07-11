@@ -213,7 +213,7 @@ def _pbr_artifacts(
     )
 
 
-def test_schema_v4_migration_preserves_every_existing_table_row(tmp_path: Path) -> None:
+def test_schema_v5_migration_preserves_every_existing_table_row(tmp_path: Path) -> None:
     catalog = _catalog(tmp_path)
     catalog.initialize()
     asset = catalog.upsert_asset(
@@ -290,7 +290,7 @@ def test_schema_v4_migration_preserves_every_existing_table_row(tmp_path: Path) 
     connection.commit()
     connection.close()
 
-    assert catalog.initialize() == SCHEMA_VERSION == 4
+    assert catalog.initialize() == SCHEMA_VERSION == 5
     connection = sqlite3.connect(catalog.database_path)
     connection.row_factory = sqlite3.Row
     try:
@@ -324,6 +324,7 @@ def test_ready_hdri_finalization_is_atomic_queryable_and_idempotent(tmp_path: Pa
     assert catalog.list_resources(
         resource_kind="hdri", status="ready", resolution="1k", tag="studio"
     ) == (first,)
+    assert catalog.list_resources(license_tier="open") == (first,)
     assert catalog.resource_stats().as_dict() == {
         "total_resources": 1,
         "total_files": 1,
@@ -335,6 +336,150 @@ def test_ready_hdri_finalization_is_atomic_queryable_and_idempotent(tmp_path: Pa
         "by_license": {"CC0-1.0": 1},
         "by_license_tier": {"open": 1},
     }
+
+
+def test_failed_partial_evidence_can_recover_without_becoming_published_lineage(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    ready = _hdri_resource()
+    failed = replace(ready, status="failed", error={"reason": "validation pending"})
+    source_file = _hdri_file(failed)
+    source_manifest = _hdri_artifacts(failed)[0]
+
+    catalog.upsert_resource(failed)
+    catalog.upsert_resource_file(source_file)
+    catalog.upsert_resource_artifact(source_manifest)
+    with sqlite3.connect(catalog.database_path) as connection:
+        assert connection.execute(
+            "SELECT published_once FROM resources WHERE resource_id = ?",
+            (failed.resource_id,),
+        ).fetchone() == (0,)
+
+    record, files, artifacts = catalog.finalize_resource(
+        ready,
+        (source_file,),
+        _hdri_artifacts(ready),
+    )
+
+    assert record.status == "ready"
+    assert len(files) == 1
+    assert {item.kind for item in artifacts} == {
+        "resource_source_manifest",
+        "hdri_validation_manifest",
+    }
+    with sqlite3.connect(catalog.database_path) as connection:
+        assert connection.execute(
+            "SELECT published_once FROM resources WHERE resource_id = ?",
+            (ready.resource_id,),
+        ).fetchone() == (1,)
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            connection.execute(
+                "UPDATE resources SET published_once = 0 WHERE resource_id = ?",
+                (ready.resource_id,),
+            )
+
+
+def test_resource_text_rejects_terminal_control_characters(tmp_path: Path) -> None:
+    catalog = _catalog(tmp_path)
+    failed = replace(
+        _hdri_resource(),
+        status="failed",
+        bundle_sha256=None,
+        content_sha256=None,
+        error={"reason": "fixture"},
+    )
+
+    with pytest.raises(CatalogValidationError, match="control characters"):
+        catalog.upsert_resource(replace(failed, name="Forged\nready"))
+    with pytest.raises(CatalogValidationError, match="control characters"):
+        catalog.upsert_resource(replace(failed, attribution="Bell\x07Author"))
+
+
+def test_resource_stats_reads_one_wal_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _catalog(tmp_path)
+    catalog.initialize()
+    original_connect = catalog._connect
+    injected = False
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original_connect()
+
+        def trace(statement: str) -> None:
+            nonlocal injected
+            if not injected and statement.startswith("SELECT count(*) FROM resource_files"):
+                injected = True
+                writer = _catalog(tmp_path)
+                writer.upsert_resource(
+                    replace(
+                        _hdri_resource(),
+                        status="failed",
+                        bundle_sha256=None,
+                        content_sha256=None,
+                        error={"reason": "concurrent"},
+                    )
+                )
+
+        connection.set_trace_callback(trace)
+        return connection
+
+    monkeypatch.setattr(catalog, "_connect", traced_connect)
+    stats = catalog.resource_stats()
+
+    assert injected is True
+    assert stats.total_resources == 0
+    assert stats.by_kind == {}
+    assert len(_catalog(tmp_path).list_resources()) == 1
+
+
+def test_resource_cohort_reads_parent_and_children_from_one_wal_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    catalog = _catalog(tmp_path)
+    ready = _hdri_resource()
+    failed = replace(
+        ready,
+        status="failed",
+        bundle_sha256=None,
+        content_sha256=None,
+        error={"reason": "pending"},
+    )
+    catalog.upsert_resource(failed)
+    original_connect = catalog._connect
+    injected = False
+
+    def traced_connect() -> sqlite3.Connection:
+        connection = original_connect()
+
+        def trace(statement: str) -> None:
+            nonlocal injected
+            if not injected and statement.startswith("SELECT * FROM resource_files"):
+                injected = True
+                writer = _catalog(tmp_path)
+                writer.finalize_resource(
+                    ready,
+                    (_hdri_file(ready),),
+                    _hdri_artifacts(ready),
+                )
+
+        connection.set_trace_callback(trace)
+        return connection
+
+    monkeypatch.setattr(catalog, "_connect", traced_connect)
+    cohort = catalog.get_resource_cohort(ready.resource_id)
+
+    assert injected is True
+    assert cohort is not None
+    assert cohort.resource.status == "failed"
+    assert cohort.files == ()
+    assert cohort.artifacts == ()
+    current = _catalog(tmp_path).get_resource_cohort(ready.resource_id)
+    assert current is not None and current.resource.status == "ready"
+    assert len(current.files) == 1
 
 
 def test_verified_evidence_is_idempotent_immutable_and_can_upgrade_to_ready(
@@ -376,6 +521,139 @@ def test_verified_evidence_is_idempotent_immutable_and_can_upgrade_to_ready(
         "resource_source_manifest",
         "hdri_validation_manifest",
     }
+
+
+def test_verified_ready_upgrade_cannot_replace_published_lineage(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    verified = _hdri_resource(status="verified")
+    source_file = _hdri_file(verified)
+    source_artifact = _hdri_artifacts(verified)[:1]
+    catalog.finalize_resource(verified, (source_file,), source_artifact)
+
+    with pytest.raises(CatalogConflictError, match="file evidence is immutable"):
+        catalog.finalize_resource(
+            replace(verified, status="ready"),
+            (
+                replace(
+                    source_file,
+                    source_url="https://dl.polyhaven.org/replaced_same_revision.hdr",
+                ),
+            ),
+            _hdri_artifacts(replace(verified, status="ready")),
+        )
+
+    record = catalog.get_resource(verified.resource_id)
+    assert record is not None and record.status == "verified"
+    assert catalog.list_resource_files(resource_id=verified.resource_id)[0].source_url == (
+        source_file.source_url
+    )
+    with pytest.raises(CatalogValidationError, match="illegal resource status transition"):
+        catalog.upsert_resource(
+            replace(verified, status="failed", error={"reason": "late failure"})
+        )
+
+
+def test_published_resource_rejects_new_optional_artifact(tmp_path: Path) -> None:
+    catalog = _catalog(tmp_path)
+    ready = _hdri_resource()
+    catalog.finalize_resource(ready, (_hdri_file(ready),), _hdri_artifacts(ready))
+
+    with pytest.raises(CatalogConflictError, match="artifact evidence is immutable"):
+        catalog.upsert_resource_artifact(
+            ResourceArtifactUpsert(
+                artifact_id="studio_small_03_preview_manifest",
+                resource_id=ready.resource_id,
+                kind="preview_manifest",
+                path="out/resources/studio_small_03/preview.json",
+                params={"schema_version": 1},
+                sha256="f" * 64,
+            )
+        )
+
+
+def test_legacy_downgraded_published_lineage_remains_permanently_immutable(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    verified = _hdri_resource(status="verified")
+    source_file = _hdri_file(verified)
+    source_artifact = _hdri_artifacts(verified)[:1]
+    catalog.finalize_resource(verified, (source_file,), source_artifact)
+    with sqlite3.connect(catalog.database_path) as connection:
+        connection.execute(
+            "UPDATE resources SET status = 'failed', error_json = ? WHERE resource_id = ?",
+            ('{"legacy":"downgrade"}', verified.resource_id),
+        )
+        connection.commit()
+    before = catalog.database_path.read_bytes()
+
+    with pytest.raises(CatalogConflictError, match="legacy published resource lineage"):
+        catalog.finalize_resource(
+            replace(verified, status="ready"),
+            (source_file,),
+            _hdri_artifacts(replace(verified, status="ready")),
+        )
+    with pytest.raises(CatalogConflictError, match="published resource file evidence"):
+        catalog.upsert_resource_file(
+            replace(
+                source_file,
+                file_id="legacy_replacement_radiance",
+                source_url="https://dl.polyhaven.org/legacy-replacement.hdr",
+            )
+        )
+    with pytest.raises(CatalogConflictError, match="artifact evidence is immutable"):
+        catalog.upsert_resource_artifact(
+            ResourceArtifactUpsert(
+                artifact_id="legacy_preview_manifest",
+                resource_id=verified.resource_id,
+                kind="preview_manifest",
+                path="out/resources/legacy/preview.json",
+                params={"schema_version": 1},
+                sha256="e" * 64,
+            )
+        )
+
+    assert catalog.database_path.read_bytes() == before
+
+
+def test_v4_migration_marks_downgraded_verified_cohort_as_published(
+    tmp_path: Path,
+) -> None:
+    catalog = _catalog(tmp_path)
+    verified = _hdri_resource(status="verified")
+    source_file = _hdri_file(verified)
+    source_artifact = _hdri_artifacts(verified)[:1]
+    catalog.finalize_resource(verified, (source_file,), source_artifact)
+    with sqlite3.connect(catalog.database_path) as connection:
+        connection.execute(
+            "UPDATE resources SET status = 'failed', error_json = ? WHERE resource_id = ?",
+            ('{"legacy":"downgrade"}', verified.resource_id),
+        )
+        connection.execute("DROP TRIGGER resources_published_once_insert")
+        connection.execute("DROP TRIGGER resources_published_once_update")
+        connection.execute("ALTER TABLE resources DROP COLUMN published_once")
+        connection.execute("PRAGMA user_version = 4")
+
+    assert catalog.initialize() == 5
+    with sqlite3.connect(catalog.database_path) as connection:
+        assert connection.execute(
+            "SELECT status, published_once FROM resources WHERE resource_id = ?",
+            (verified.resource_id,),
+        ).fetchone() == ("failed", 1)
+
+    with pytest.raises(CatalogConflictError, match="legacy published resource lineage"):
+        catalog.finalize_resource(
+            replace(verified, status="ready", name="Replacement"),
+            (
+                replace(
+                    source_file,
+                    source_url="https://dl.polyhaven.org/replacement.hdr",
+                ),
+            ),
+            _hdri_artifacts(replace(verified, status="ready")),
+        )
 
 
 def test_resource_file_path_uniqueness_is_scoped_to_its_resource(tmp_path: Path) -> None:

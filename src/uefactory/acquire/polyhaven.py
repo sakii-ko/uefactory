@@ -829,12 +829,22 @@ class _AcquisitionRuntime:
         clock: Clock,
         project_root: Path,
         data_dir: Path,
+        storage_root: Path | None = None,
+        additional_storage_roots: tuple[Path, ...] = (),
     ) -> None:
         self.config = config
         self.clock = clock
         self.project_root = project_root
         self.data_dir = data_dir
-        self.models_root = data_dir / "acquire/polyhaven/models"
+        # Keep the model adapter's historical default while allowing the
+        # provider-level facade to account for every Poly Haven asset class in
+        # one storage boundary. ``models_root`` remains as a compatibility
+        # alias for the existing model-adapter tests and private callers.
+        self.storage_root = (
+            data_dir / "acquire/polyhaven/models" if storage_root is None else storage_root
+        )
+        self.models_root = self.storage_root
+        self.additional_storage_roots = additional_storage_roots
         self.stats = _RuntimeStats()
         try:
             self.limiter = MonotonicTokenBucket(
@@ -936,7 +946,11 @@ class _AcquisitionRuntime:
             _OVERSIZE_PROBE_BYTES,
         }:
             raise PolyHavenAcquireError("optional disk probe is invalid")
-        snapshot = _polyhaven_disk_snapshot(models_root=self.models_root, data_dir=self.data_dir)
+        snapshot = _polyhaven_disk_snapshot(
+            models_root=self.models_root,
+            data_dir=self.data_dir,
+            additional_roots=self.additional_storage_roots,
+        )
         self.stats.disk_checks += 1
         self.stats.max_storage_bytes_observed = max(
             snapshot.storage_bytes,
@@ -6961,12 +6975,19 @@ def _clock_utc_now(clock: Clock) -> datetime:
     return value.astimezone(UTC)
 
 
-def _polyhaven_disk_snapshot(*, models_root: Path, data_dir: Path) -> DiskSnapshot:
+def _polyhaven_disk_snapshot(
+    *,
+    models_root: Path,
+    data_dir: Path,
+    additional_roots: tuple[Path, ...] = (),
+) -> DiskSnapshot:
     storage_bytes = 0
-    if models_root.exists() or models_root.is_symlink():
-        if models_root.is_symlink() or not models_root.is_dir():
+    for storage_root in (models_root, *additional_roots):
+        if not storage_root.exists() and not storage_root.is_symlink():
+            continue
+        if storage_root.is_symlink() or not storage_root.is_dir():
             raise PolyHavenAcquireError("Poly Haven model storage root is unsafe")
-        for directory, names, filenames in os.walk(models_root, followlinks=False):
+        for directory, names, filenames in os.walk(storage_root, followlinks=False):
             base = Path(directory)
             for name in names:
                 child = base / name

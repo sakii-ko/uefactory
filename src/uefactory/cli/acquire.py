@@ -27,6 +27,13 @@ from uefactory.acquire.polyhaven import (
 from uefactory.acquire.polyhaven import (
     DEFAULT_RESOLUTION as DEFAULT_POLYHAVEN_RESOLUTION,
 )
+from uefactory.acquire.polyhaven_resource_sync import (
+    PolyHavenResourceSyncResult,
+    sync_polyhaven_resources,
+)
+from uefactory.acquire.polyhaven_resources import (
+    DEFAULT_RESOURCE_RESOLUTION,
+)
 from uefactory.cli._common import settings_from_context
 from uefactory.ingest.pipeline import BatchIngestResult, ingest_batch
 
@@ -362,6 +369,205 @@ def _polyhaven_deferred_items(result: PolyHavenSyncResult) -> int:
         return 0
     value = daily.get("deferred_new_items")
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+@acquire_app.command("polyhaven-resources")
+def acquire_polyhaven_resources(
+    ctx: typer.Context,
+    kind: Annotated[
+        Literal["hdri", "pbr_texture_set"],
+        typer.Option("--kind", help="Resource cohort to acquire and publish."),
+    ] = "hdri",
+    source_id: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--source-id",
+            help="Acquire an exact listing-bound source id; repeatable.",
+        ),
+    ] = None,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=10_000, help="Maximum resource revisions."),
+    ] = 1,
+    resolution: Annotated[
+        str,
+        typer.Option("--resolution", help="Exact Poly Haven resolution, e.g. 1k or 2k."),
+    ] = DEFAULT_RESOURCE_RESOLUTION,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Redownload provider files before exact verification."),
+    ] = False,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", "--db", help="Catalog database to publish into."),
+    ] = None,
+    request_rate: Annotated[
+        float,
+        typer.Option(
+            "--request-rate",
+            min=0.000001,
+            max=1_000_000,
+            help="Maximum Poly Haven HTTP request rate per second (monotonic).",
+        ),
+    ] = DEFAULT_REQUEST_RATE_PER_SEC,
+    request_burst: Annotated[
+        int,
+        typer.Option("--request-burst", min=1, max=1_000_000, help="HTTP token bucket burst."),
+    ] = 1,
+    retry_max_attempts: Annotated[
+        int,
+        typer.Option("--retry-max-attempts", min=1, help="Transient HTTP/transport attempts."),
+    ] = 5,
+    integrity_max_attempts: Annotated[
+        int,
+        typer.Option("--integrity-max-attempts", min=1, help="Checksum attempt budget."),
+    ] = 2,
+    retry_base_delay_sec: Annotated[
+        float,
+        typer.Option("--retry-base-sec", min=0.001, help="Initial exponential backoff."),
+    ] = 5.0,
+    retry_max_delay_sec: Annotated[
+        float,
+        typer.Option("--retry-max-sec", min=0.001, help="Maximum exponential backoff."),
+    ] = 900.0,
+    max_retry_after_sec: Annotated[
+        float,
+        typer.Option("--max-retry-after-sec", min=0.0, help="Maximum honored Retry-After."),
+    ] = 3_600.0,
+    max_new_items_per_day: Annotated[
+        int | None,
+        typer.Option("--max-new-items-per-day", min=0, help="Durable UTC-day item quota."),
+    ] = None,
+    max_download_bytes_per_day: Annotated[
+        int | None,
+        typer.Option(
+            "--max-download-bytes-per-day",
+            min=0,
+            help="Durable UTC-day worst-case transfer reservation quota.",
+        ),
+    ] = None,
+    max_storage_bytes: Annotated[
+        int | None,
+        typer.Option(
+            "--max-storage-bytes",
+            min=0,
+            help="Maximum shared Poly Haven acquisition-tree bytes.",
+        ),
+    ] = None,
+    min_free_bytes: Annotated[
+        int,
+        typer.Option("--min-free-bytes", min=0, help="Free-space floor before downloads."),
+    ] = 0,
+    cross_run_backoff_base_sec: Annotated[
+        float,
+        typer.Option(
+            "--cross-run-backoff-base-sec",
+            min=1.0,
+            help="Initial delay before retrying a failed resource revision.",
+        ),
+    ] = 300.0,
+    cross_run_backoff_max_sec: Annotated[
+        float,
+        typer.Option(
+            "--cross-run-backoff-max-sec",
+            min=1.0,
+            help="Maximum cross-run resource retry delay.",
+        ),
+    ] = 86_400.0,
+    integrity_quarantine_after_runs: Annotated[
+        int,
+        typer.Option(
+            "--integrity-quarantine-after-runs",
+            min=1,
+            help="Run-level integrity failures before exact-revision quarantine.",
+        ),
+    ] = 3,
+    retry_revision: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--retry-revision",
+            help="Release one exact failed resource id for an audited retry; repeatable.",
+        ),
+    ] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable resource run receipt."),
+    ] = False,
+) -> None:
+    """Incrementally acquire, validate, and atomically catalog Poly Haven resources."""
+
+    settings = settings_from_context(ctx)
+    try:
+        runtime_config = PolyHavenRuntimeConfig(
+            request_rate_per_sec=request_rate,
+            request_burst=request_burst,
+            retry_max_attempts=retry_max_attempts,
+            integrity_max_attempts=integrity_max_attempts,
+            retry_base_delay_sec=retry_base_delay_sec,
+            retry_max_delay_sec=retry_max_delay_sec,
+            max_retry_after_sec=max_retry_after_sec,
+            max_new_items_per_day=max_new_items_per_day,
+            max_download_bytes_per_day=max_download_bytes_per_day,
+            max_storage_bytes=max_storage_bytes,
+            min_free_bytes=min_free_bytes,
+            cross_run_backoff_base_sec=cross_run_backoff_base_sec,
+            cross_run_backoff_max_sec=cross_run_backoff_max_sec,
+            integrity_quarantine_after_runs=integrity_quarantine_after_runs,
+        )
+        result = sync_polyhaven_resources(
+            settings=settings,
+            kind=kind,
+            limit=limit,
+            resolution=resolution,
+            source_ids=tuple(source_id or ()),
+            force=force,
+            runtime_config=runtime_config,
+            database_path=database,
+            retry_revisions=tuple(retry_revision or ()),
+        )
+    except Exception as exc:
+        typer.echo(f"Poly Haven resource acquisition failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    payload = _polyhaven_resource_payload(result, settings.project_root)
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        counts = payload["counts"]
+        assert isinstance(counts, Mapping)
+        typer.echo(
+            f"Poly Haven resources {result.status}: {result.kind}; "
+            f"{counts['ready']} ready, {counts['skipped']} skipped, "
+            f"{counts['failed']} failed, {counts['deferred']} deferred"
+        )
+        if result.status == "partial":
+            typer.echo("Partial run: at least one resource completed and at least one did not")
+        typer.echo(f"Run: {result.run_id}")
+        typer.echo(f"Acquisition manifest: {result.manifest_path}")
+        typer.echo(f"Catalog: {result.catalog_path}")
+    if result.status == "failed":
+        raise typer.Exit(1)
+
+
+def _polyhaven_resource_payload(
+    result: PolyHavenResourceSyncResult,
+    project_root: Path,
+) -> dict[str, object]:
+    receipt = result.as_dict(project_root=project_root.resolve())
+    return {
+        "source": "polyhaven",
+        "asset_type": result.kind,
+        "resolution": result.resolution,
+        "run_id": result.run_id,
+        "status": result.status,
+        "counts": receipt["counts"],
+        "listing_sha256": result.listing_sha256,
+        "manifest": receipt["manifest_path"],
+        "state": receipt["state_path"],
+        "failure_journal": receipt["failure_journal_path"],
+        "catalog": receipt["catalog_path"],
+        "items": receipt["items"],
+    }
 
 
 @acquire_app.command("polyhaven-failures")

@@ -4,6 +4,7 @@ import json
 import math
 import sqlite3
 import time
+import unicodedata
 from collections import Counter
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlparse
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 
 ASSET_STATUSES = frozenset({"raw", "imported", "render_ok", "failed"})
@@ -414,6 +415,21 @@ class ResourceBindingRecord:
             "params": self.params,
             "created_at": self.created_at,
         }
+
+
+@dataclass(frozen=True)
+class ResourceCohort:
+    resource: ResourceRecord
+    files: tuple[ResourceFileRecord, ...]
+    artifacts: tuple[ResourceArtifactRecord, ...]
+    bindings: tuple[ResourceBindingRecord, ...]
+
+    def as_dict(self) -> dict[str, Any]:
+        payload = self.resource.as_dict()
+        payload["files"] = [item.as_dict() for item in self.files]
+        payload["artifacts"] = [item.as_dict() for item in self.artifacts]
+        payload["bindings"] = [item.as_dict() for item in self.bindings]
+        return payload
 
 
 @dataclass(frozen=True)
@@ -1061,6 +1077,7 @@ class Catalog:
                 "resource.resource_id"
             )
         prepared_resource = self._prepare_resource(resource)
+        prepared_resource["published_once"] = 1
         prepared_files = tuple(self._prepare_resource_file(item) for item in file_items)
         prepared_artifacts = tuple(self._prepare_resource_artifact(item) for item in artifact_items)
         _reject_batch_duplicates(prepared_files, "file_id")
@@ -1078,18 +1095,44 @@ class Catalog:
             existing = connection.execute(
                 "SELECT * FROM resources WHERE resource_id = ?", (resource.resource_id,)
             ).fetchone()
-            if existing is not None and (
-                existing["status"] == "ready"
-                or (existing["status"] == "verified" and resource.status == "verified")
-            ):
-                _assert_published_resource_cohort_unchanged(
-                    connection,
-                    existing=existing,
-                    resource=prepared_resource,
-                    files=prepared_files,
-                    artifacts=prepared_artifacts,
-                )
-                connection.rollback()
+            if existing is not None and _resource_has_published_lineage(connection, existing):
+                if existing["status"] == "verified" and resource.status == "ready":
+                    _assert_verified_resource_upgrade(
+                        connection,
+                        existing=existing,
+                        resource=prepared_resource,
+                        files=prepared_files,
+                        artifacts=prepared_artifacts,
+                    )
+                    _upsert_prepared_resource(connection, prepared_resource)
+                    existing_artifact_ids = {
+                        str(row["artifact_id"])
+                        for row in connection.execute(
+                            "SELECT artifact_id FROM resource_artifacts WHERE resource_id = ?",
+                            (resource.resource_id,),
+                        )
+                    }
+                    for values in prepared_artifacts:
+                        if str(values["artifact_id"]) not in existing_artifact_ids:
+                            _upsert_prepared_resource_artifact(
+                                connection,
+                                values,
+                                allow_published_mutation=True,
+                            )
+                    connection.commit()
+                elif existing["status"] in {"verified", "ready"}:
+                    _assert_published_resource_cohort_unchanged(
+                        connection,
+                        existing=existing,
+                        resource=prepared_resource,
+                        files=prepared_files,
+                        artifacts=prepared_artifacts,
+                    )
+                    connection.rollback()
+                else:
+                    raise CatalogConflictError(
+                        "legacy published resource lineage cannot be republished"
+                    )
             else:
                 _upsert_prepared_resource(connection, prepared_resource)
                 connection.execute(
@@ -1252,6 +1295,46 @@ class Catalog:
     def show_resource(self, resource_id: str) -> ResourceRecord | None:
         return self.get_resource(resource_id)
 
+    def get_resource_cohort(self, resource_id: str) -> ResourceCohort | None:
+        """Read one resource and every child row from one SQLite snapshot."""
+
+        _validate_slug(resource_id, "resource_id")
+        self.initialize()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN")
+            resource_row = connection.execute(
+                "SELECT * FROM resources WHERE resource_id = ?", (resource_id,)
+            ).fetchone()
+            if resource_row is None:
+                connection.commit()
+                return None
+            file_rows = connection.execute(
+                "SELECT * FROM resource_files WHERE resource_id = ? ORDER BY file_id",
+                (resource_id,),
+            ).fetchall()
+            artifact_rows = connection.execute(
+                "SELECT * FROM resource_artifacts WHERE resource_id = ? ORDER BY artifact_id",
+                (resource_id,),
+            ).fetchall()
+            binding_rows = connection.execute(
+                "SELECT * FROM resource_bindings WHERE resource_id = ? ORDER BY binding_id",
+                (resource_id,),
+            ).fetchall()
+            cohort = ResourceCohort(
+                resource=_resource_from_row(resource_row),
+                files=tuple(_resource_file_from_row(row) for row in file_rows),
+                artifacts=tuple(_resource_artifact_from_row(row) for row in artifact_rows),
+                bindings=tuple(_resource_binding_from_row(row) for row in binding_rows),
+            )
+            connection.commit()
+            return cohort
+        except BaseException:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def list_resources(
         self,
         *,
@@ -1262,6 +1345,7 @@ class Catalog:
         status: str | None = None,
         source: str | None = None,
         license: str | None = None,
+        license_tier: str | None = None,
         tag: str | None = None,
         limit: int = 100,
         offset: int = 0,
@@ -1296,6 +1380,12 @@ class Catalog:
             _validate_license_name(license)
             clauses.append("resources.license = ?")
             parameters.append(license)
+        if license_tier is not None:
+            if license_tier not in LICENSE_TIERS:
+                allowed = ", ".join(sorted(LICENSE_TIERS))
+                raise CatalogValidationError(f"license_tier must be one of: {allowed}")
+            clauses.append("resources.license_tier = ?")
+            parameters.append(license_tier)
         if tag is not None:
             _validate_tag(tag)
             clauses.append(
@@ -1917,7 +2007,8 @@ class Catalog:
         self.initialize()
         connection = self._connect()
         try:
-            return ResourceStats(
+            connection.execute("BEGIN")
+            result = ResourceStats(
                 total_resources=int(
                     connection.execute("SELECT count(*) FROM resources").fetchone()[0]
                 ),
@@ -1936,6 +2027,11 @@ class Catalog:
                 by_license=_resource_group_counts(connection, "license"),
                 by_license_tier=_resource_group_counts(connection, "license_tier"),
             )
+            connection.commit()
+            return result
+        except BaseException:
+            connection.rollback()
+            raise
         finally:
             connection.close()
 
@@ -1970,6 +2066,7 @@ class Catalog:
         _validate_uri(asset.license_url, "license_url")
         if not isinstance(asset.attribution, str) or asset.attribution != asset.attribution.strip():
             raise CatalogValidationError("attribution must be text without surrounding whitespace")
+        _reject_control_characters(asset.attribution, "attribution")
         _validate_status(asset.status)
         _validate_sha256(asset.sha256, "sha256")
         raw_path = _relative_path(asset.raw_path, self.project_root, "raw_path")
@@ -2051,6 +2148,7 @@ class Catalog:
             or resource.attribution != resource.attribution.strip()
         ):
             raise CatalogValidationError("attribution must be text without surrounding whitespace")
+        _reject_control_characters(resource.attribution, "attribution")
         _validate_resource_status(resource.status)
         tags = _normalize_tags(resource.tags)
         if resource.bundle_sha256 is not None:
@@ -2114,6 +2212,7 @@ class Catalog:
             "error_json": error_json,
             "created_at": now,
             "updated_at": now,
+            "published_once": 0,
         }
 
     def _prepare_resource_file(self, item: ResourceFileUpsert) -> dict[str, Any]:
@@ -2249,6 +2348,7 @@ class Catalog:
         _validate_uri(scene.license_url, "license_url")
         if not isinstance(scene.attribution, str) or scene.attribution != scene.attribution.strip():
             raise CatalogValidationError("attribution must be text without surrounding whitespace")
+        _reject_control_characters(scene.attribution, "attribution")
         _validate_scene_status(scene.status)
         source_path = _relative_path(scene.source_path, self.project_root, "source_path")
         source_file = (
@@ -2377,6 +2477,12 @@ class Catalog:
 def _validate_text(value: str, field: str) -> None:
     if not isinstance(value, str) or not value.strip() or value != value.strip():
         raise CatalogValidationError(f"{field} must be non-empty without surrounding whitespace")
+    _reject_control_characters(value, field)
+
+
+def _reject_control_characters(value: str, field: str) -> None:
+    if any(unicodedata.category(character) == "Cc" for character in value):
+        raise CatalogValidationError(f"{field} must not contain control characters")
 
 
 def _validate_slug(value: str, field: str) -> None:
@@ -2494,6 +2600,7 @@ def _validate_tag(tag: str) -> None:
         raise CatalogValidationError(
             "tag must contain 1 to 64 characters without surrounding whitespace"
         )
+    _reject_control_characters(tag, "tag")
 
 
 def _normalize_tags(tags: Iterable[str]) -> tuple[str, ...]:
@@ -2515,6 +2622,7 @@ def _validate_ue_package_path(value: str | None, *, field: str = "ue_package_pat
         return None
     if not isinstance(value, str):
         raise CatalogValidationError(f"{field} must be text or null")
+    _reject_control_characters(value, field)
     if value != value.strip() or not value.startswith("/Game/"):
         raise CatalogValidationError(f"{field} must start with /Game/")
     invalid_part = any(part in {"", ".", ".."} for part in value[1:].split("/"))
@@ -2680,6 +2788,7 @@ def _relative_path(value: str | Path, project_root: Path, field: str) -> str:
     if not isinstance(value, str | Path):
         raise CatalogValidationError(f"{field} must be a string or Path")
     raw = str(value)
+    _reject_control_characters(raw, field)
     if not raw or raw != raw.strip() or "\\" in raw or "//" in raw:
         raise CatalogValidationError(
             f"{field} must be a non-empty normalized path without backslashes"
@@ -2719,6 +2828,7 @@ def _source_file_path(value: str | Path, project_root: Path) -> str:
     if not isinstance(value, str | Path):
         raise CatalogValidationError("source_file must be a string or Path")
     raw = str(value)
+    _reject_control_characters(raw, "source_file")
     if not raw or raw != raw.strip() or "\\" in raw or "\x00" in raw:
         raise CatalogValidationError("source_file must be a non-empty normalized path")
     path = Path(raw).expanduser()
@@ -3003,6 +3113,90 @@ def _assert_published_resource_cohort_unchanged(
         raise CatalogConflictError("published resource file and artifact evidence is immutable")
 
 
+def _assert_verified_resource_upgrade(
+    connection: sqlite3.Connection,
+    *,
+    existing: sqlite3.Row,
+    resource: Mapping[str, Any],
+    files: tuple[dict[str, Any], ...],
+    artifacts: tuple[dict[str, Any], ...],
+) -> None:
+    """Allow verified→ready only by appending the required validation proofs."""
+
+    immutable_resource_fields = (
+        "name",
+        "resource_kind",
+        "profile",
+        "resolution",
+        "source",
+        "source_id",
+        "source_url",
+        "source_revision",
+        "source_revision_scheme",
+        "license",
+        "license_tier",
+        "license_url",
+        "attribution",
+        "tags_json",
+        "bundle_sha256",
+        "content_sha256",
+        "physical_width_mm",
+        "physical_height_mm",
+    )
+    changed = [field for field in immutable_resource_fields if existing[field] != resource[field]]
+    if changed:
+        raise CatalogConflictError(
+            "verified resource upgrade changes immutable evidence: " + ", ".join(changed)
+        )
+
+    def comparable(values: Mapping[str, Any]) -> dict[str, Any]:
+        return {key: values[key] for key in values if key != "created_at"}
+
+    existing_files = tuple(
+        comparable(dict(row))
+        for row in connection.execute(
+            "SELECT * FROM resource_files WHERE resource_id = ? ORDER BY file_id",
+            (resource["resource_id"],),
+        )
+    )
+    proposed_files = tuple(
+        comparable(item) for item in sorted(files, key=lambda row: row["file_id"])
+    )
+    if existing_files != proposed_files:
+        raise CatalogConflictError(
+            "verified resource file evidence is immutable during ready upgrade"
+        )
+
+    existing_artifacts = {
+        str(row["artifact_id"]): comparable(dict(row))
+        for row in connection.execute(
+            "SELECT * FROM resource_artifacts WHERE resource_id = ? ORDER BY artifact_id",
+            (resource["resource_id"],),
+        )
+    }
+    proposed_artifacts = {str(item["artifact_id"]): comparable(item) for item in artifacts}
+    if any(
+        artifact_id not in proposed_artifacts
+        or proposed_artifacts[artifact_id] != existing_artifact
+        for artifact_id, existing_artifact in existing_artifacts.items()
+    ):
+        raise CatalogConflictError(
+            "verified resource artifact evidence is immutable during ready upgrade"
+        )
+    required_ready = RESOURCE_REQUIRED_ARTIFACT_KINDS[str(resource["resource_kind"])]
+    existing_kinds = {str(item["kind"]) for item in existing_artifacts.values()}
+    allowed_new_kinds = required_ready - existing_kinds
+    actual_new_kinds = {
+        str(item["kind"])
+        for artifact_id, item in proposed_artifacts.items()
+        if artifact_id not in existing_artifacts
+    }
+    if actual_new_kinds != allowed_new_kinds:
+        raise CatalogConflictError(
+            "verified resource upgrade may append only its required ready proofs"
+        )
+
+
 def _reject_batch_duplicates(rows: tuple[dict[str, Any], ...], key: str) -> None:
     counts = Counter(str(row[key]) for row in rows)
     duplicates = sorted(value for value, count in counts.items() if count > 1)
@@ -3100,8 +3294,29 @@ def _upsert_prepared_resource(
                 f"resource_id {values['resource_id']!r} has immutable conflicts: "
                 + ", ".join(changed)
             )
+        if _resource_has_published_lineage(connection, existing) and existing["status"] not in {
+            "verified",
+            "ready",
+        }:
+            lineage_fields = (
+                "name",
+                "tags_json",
+                "status",
+                "error_json",
+                "bundle_sha256",
+                "content_sha256",
+                "physical_width_mm",
+                "physical_height_mm",
+            )
+            lineage_changed = [
+                field for field in lineage_fields if existing[field] != values[field]
+            ]
+            if lineage_changed:
+                raise CatalogConflictError(
+                    "legacy published resource lineage is immutable: " + ", ".join(lineage_changed)
+                )
         transitions = {
-            "verified": {"verified", "ready", "failed", "quarantined"},
+            "verified": {"verified", "ready"},
             "ready": {"ready"},
             "failed": {"failed", "verified", "ready", "quarantined"},
             "quarantined": {"quarantined"},
@@ -3113,6 +3328,14 @@ def _upsert_prepared_resource(
     connection.execute(_UPSERT_RESOURCE_SQL, values)
 
 
+def _resource_has_published_lineage(
+    connection: sqlite3.Connection,
+    resource: Mapping[str, Any],
+) -> bool:
+    del connection
+    return bool(resource["published_once"])
+
+
 def _upsert_prepared_resource_file(
     connection: sqlite3.Connection,
     values: Mapping[str, Any],
@@ -3120,14 +3343,14 @@ def _upsert_prepared_resource_file(
     allow_published_mutation: bool = False,
 ) -> None:
     parent = connection.execute(
-        "SELECT status FROM resources WHERE resource_id = ?", (values["resource_id"],)
+        "SELECT * FROM resources WHERE resource_id = ?", (values["resource_id"],)
     ).fetchone()
     if parent is None:
         raise CatalogValidationError("resource file requires an existing resource")
     existing = connection.execute(
         "SELECT * FROM resource_files WHERE file_id = ?", (values["file_id"],)
     ).fetchone()
-    published = parent["status"] in {"verified", "ready"}
+    published = _resource_has_published_lineage(connection, parent)
     if published and existing is None and not allow_published_mutation:
         raise CatalogConflictError("published resource file evidence is immutable")
     if existing is not None:
@@ -3154,7 +3377,7 @@ def _upsert_prepared_resource_artifact(
     allow_published_mutation: bool = False,
 ) -> None:
     parent = connection.execute(
-        "SELECT resource_kind, status FROM resources WHERE resource_id = ?",
+        "SELECT * FROM resources WHERE resource_id = ?",
         (values["resource_id"],),
     ).fetchone()
     if parent is None:
@@ -3171,18 +3394,15 @@ def _upsert_prepared_resource_artifact(
         raise CatalogConflictError(
             f"resource artifact {values['artifact_id']!r} is bound to another identity"
         )
-    required_key = "verified" if parent["status"] == "verified" else str(parent["resource_kind"])
-    required = RESOURCE_REQUIRED_ARTIFACT_KINDS.get(required_key, frozenset())
     if (
-        parent["status"] in {"verified", "ready"}
-        and values["kind"] in required
+        _resource_has_published_lineage(connection, parent)
         and not allow_published_mutation
         and (
             existing is None
             or any(existing[field] != values[field] for field in ("params_json", "sha256"))
         )
     ):
-        raise CatalogConflictError("published resource required artifacts are immutable")
+        raise CatalogConflictError("published resource artifact evidence is immutable")
     connection.execute(_UPSERT_RESOURCE_ARTIFACT_SQL, values)
 
 
@@ -4184,6 +4404,58 @@ _MIGRATIONS: dict[int, tuple[str, ...]] = {
         "ON resource_bindings(consumer_resource_id, role) "
         "WHERE consumer_resource_id IS NOT NULL",
     ),
+    5: (
+        """
+        ALTER TABLE resources ADD COLUMN published_once INTEGER NOT NULL DEFAULT 0
+            CHECK(published_once IN (0, 1))
+        """,
+        """
+        UPDATE resources
+        SET published_once = 1
+        WHERE status IN ('verified', 'ready')
+        """,
+        """
+        UPDATE resources
+        SET published_once = 1
+        WHERE status IN ('failed', 'quarantined')
+          AND bundle_sha256 IS NOT NULL
+          AND content_sha256 IS NOT NULL
+          AND EXISTS (
+              SELECT 1 FROM resource_files
+              WHERE resource_files.resource_id = resources.resource_id
+                AND resource_files.is_primary = 1
+          )
+          AND EXISTS (
+              SELECT 1 FROM resource_artifacts
+              WHERE resource_artifacts.resource_id = resources.resource_id
+                AND resource_artifacts.kind = 'resource_source_manifest'
+                AND resource_artifacts.sha256 IS NOT NULL
+                AND json_extract(resource_artifacts.params_json, '$.resource_id')
+                    = resources.resource_id
+                AND json_extract(resource_artifacts.params_json, '$.bundle_sha256')
+                    = resources.bundle_sha256
+                AND json_extract(resource_artifacts.params_json, '$.content_sha256')
+                    = resources.content_sha256
+          )
+        """,
+        """
+        CREATE TRIGGER resources_published_once_insert
+        BEFORE INSERT ON resources
+        WHEN NEW.status IN ('verified', 'ready') AND NEW.published_once <> 1
+        BEGIN
+            SELECT RAISE(ABORT, 'published resources require publication lineage');
+        END
+        """,
+        """
+        CREATE TRIGGER resources_published_once_update
+        BEFORE UPDATE ON resources
+        WHEN (OLD.published_once = 1 AND NEW.published_once <> 1)
+          OR (NEW.status IN ('verified', 'ready') AND NEW.published_once <> 1)
+        BEGIN
+            SELECT RAISE(ABORT, 'resource publication lineage is append-only');
+        END
+        """,
+    ),
 }
 
 _UPSERT_ASSET_SQL = """
@@ -4231,12 +4503,12 @@ INSERT INTO resources (
     resource_id, resource_kind, profile, resolution, name, source, source_id, source_url,
     source_revision, source_revision_scheme, license, license_tier, license_url, attribution,
     status, tags_json, bundle_sha256, content_sha256, physical_width_mm, physical_height_mm,
-    error_json, created_at, updated_at
+    error_json, created_at, updated_at, published_once
 ) VALUES (
     :resource_id, :resource_kind, :profile, :resolution, :name, :source, :source_id, :source_url,
     :source_revision, :source_revision_scheme, :license, :license_tier, :license_url,
     :attribution, :status, :tags_json, :bundle_sha256, :content_sha256, :physical_width_mm,
-    :physical_height_mm, :error_json, :created_at, :updated_at
+    :physical_height_mm, :error_json, :created_at, :updated_at, :published_once
 )
 ON CONFLICT(resource_id) DO UPDATE SET
     name = excluded.name,
@@ -4246,6 +4518,7 @@ ON CONFLICT(resource_id) DO UPDATE SET
     content_sha256 = COALESCE(resources.content_sha256, excluded.content_sha256),
     physical_width_mm = COALESCE(resources.physical_width_mm, excluded.physical_width_mm),
     physical_height_mm = COALESCE(resources.physical_height_mm, excluded.physical_height_mm),
+    published_once = max(resources.published_once, excluded.published_once),
     error_json = excluded.error_json,
     updated_at = excluded.updated_at
 """
