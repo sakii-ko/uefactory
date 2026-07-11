@@ -1,0 +1,37 @@
+schema_version: 1
+# Compatibility status: build/reload/finalize succeeds and preserves the source
+# CircleAction as a LevelSequence. Thumbnail remains quarantined because this
+# near-black planar weapon has one unavoidable thin orbit view (minimum observed
+# full-frame luma 3.165 versus the strict threshold 5.0). Do not count it as
+# render_ok or weaken the global visual gate for this source-specific geometry.
+scene_id: bm_soul_reaper_scythe
+name: Soul Reaper Scythe Dark Fantasy Weapon
+kind: interchange_scene
+source:
+  # Scanner evidence: 1,749,628 bytes; SHA-256
+  # 965f0a57f58b3551b9eb5243c0880345b89555c22744b686e9ceb817b1ac67c0.
+  path: asset-library/derived/0378f986a6aaca74/0378f986a6aaca74.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 71b0c97bd959453cbdbad800084b0a3f
+  source_url: https://sketchfab.com/3d-models/71b0c97bd959453cbdbad800084b0a3f
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: factaforge — Soul Reaper Scythe | Dark Fantasy Weapon
+expected:
+  mesh_count: 1
+  material_count: 1
+  texture_count: 2
+  triangle_count: 19632
+build:
+  map_path: /Game/UEF/Scenes/bm_soul_reaper_scythe/L_bm_soul_reaper_scythe
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -9.5
+  pitch: -16
+  distance_multiplier: 0.55
+render:
+  no_auto_floor: true
+  lighting_intensity_multiplier: 100.0

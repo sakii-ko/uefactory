@@ -1,0 +1,32 @@
+schema_version: 1
+scene_id: bm_concrete_column
+name: Concrete Column Dark Fantasy Set Piece
+kind: interchange_scene
+source:
+  # Scanner evidence: 8,466,550 bytes; SHA-256
+  # f563fdac4e2946204d331fcdce39b3cb9f40363159c220b262a282e68ad68098.
+  path: asset-library/derived/d69bec4c68ecc41f/d69bec4c68ecc41f.glb
+  root_env: UEF_BLACKMYTH_ROOT
+  source: blackmyth_asset_library
+  source_id: 0c4fd3b5d5c54d7bbef3687397ad694d
+  source_url: https://sketchfab.com/3d-models/0c4fd3b5d5c54d7bbef3687397ad694d
+  license: CC-BY-4.0
+  license_tier: open
+  license_url: https://creativecommons.org/licenses/by/4.0/
+  attribution: yimni — Concrete Column
+expected:
+  mesh_count: 1
+  material_count: 1
+  texture_count: 3
+  triangle_count: 3472
+build:
+  map_path: /Game/UEF/Scenes/bm_concrete_column/L_bm_concrete_column
+  export: true
+camera:
+  rig: overview_bounds
+  yaw: -35
+  pitch: -18
+  distance_multiplier: 1.2
+render:
+  no_auto_floor: true
+  lighting_intensity_multiplier: 3.0

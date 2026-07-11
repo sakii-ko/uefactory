@@ -635,6 +635,7 @@ def test_checked_example_scene_specs_have_complete_provenance_and_expected_count
     examples = Path(__file__).parents[1] / "examples" / "scenes"
     expected = {
         "bm_cake_house": (127, 10, 13, 35550, "open", True),
+        "bm_concrete_column": (1, 1, 3, 3472, "open", True),
         "bm_fantasy_diorama": (6, 2, 0, 10216, "open", True),
         "bm_genshin_challenge_post": (3, 3, 7, 1416, "open", True),
         "bm_genshin_environment_base": (12, 2, 7, 4969, "open", True),
@@ -642,6 +643,7 @@ def test_checked_example_scene_specs_have_complete_provenance_and_expected_count
         "bm_old_church_ruins": (60, 16, 46, 355661, "open", True),
         "bm_player_home": (22, 10, 11, 39187, "open", True),
         "bm_rpg_lowpoly_arena": (55, 18, 49, 36551, "open", True),
+        "bm_soul_reaper_scythe": (1, 1, 2, 19632, "open", True),
         "bm_thunderclap_temple": (14, 1, 3, 437840, "open", True),
         "bm_zelda_temple_ruins": (25, 18, 13, 751016, "open", True),
         "bm_zelda_tilt_brush_forest": (14, 10, 7, 477968, "open", True),
