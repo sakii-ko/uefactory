@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
 
@@ -13,9 +14,199 @@ from uefactory.acquire.hdri import (
     acquire_polyhaven_hdri,
 )
 from uefactory.acquire.models import ModelAcquireError, acquire_m2_models
+from uefactory.acquire.polyhaven import (
+    DEFAULT_RESOLUTION as DEFAULT_POLYHAVEN_RESOLUTION,
+)
+from uefactory.acquire.polyhaven import (
+    PolyHavenAcquireError,
+    PolyHavenSyncResult,
+    TerminalStatus,
+    finalize_polyhaven_items,
+    sync_polyhaven_models,
+)
 from uefactory.cli._common import settings_from_context
+from uefactory.ingest.pipeline import BatchIngestResult, ingest_batch
 
 acquire_app = typer.Typer(help="Acquire runtime assets.")
+
+
+@acquire_app.command("polyhaven")
+def acquire_polyhaven(
+    ctx: typer.Context,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", min=1, max=10_000, help="Maximum model revisions per cycle."),
+    ] = 1,
+    resolution: Annotated[
+        str,
+        typer.Option("--resolution", help="Poly Haven glTF resolution, e.g. 1k or 2k."),
+    ] = DEFAULT_POLYHAVEN_RESOLUTION,
+    force: Annotated[
+        bool,
+        typer.Option("--force", help="Redownload files before exact verification."),
+    ] = False,
+    ingest: Annotated[
+        bool,
+        typer.Option(
+            "--ingest/--download-only",
+            help="Run the generated strict IngestSpec through UE after acquisition.",
+        ),
+    ] = False,
+    database: Annotated[
+        Path | None,
+        typer.Option("--database", "--db", help="Catalog database for --ingest."),
+    ] = None,
+    timeout_sec: Annotated[
+        int,
+        typer.Option("--timeout-sec", min=1, help="Timeout for each UE process."),
+    ] = 1800,
+    thumbnails: Annotated[
+        bool,
+        typer.Option(
+            "--thumbnails/--no-thumbnails",
+            help="Render standard beauty/mask thumbnails when --ingest is enabled.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit a machine-readable acquisition summary."),
+    ] = False,
+) -> None:
+    """Incrementally prepare verified Poly Haven models and optionally ingest them."""
+
+    settings = settings_from_context(ctx)
+    try:
+        result = sync_polyhaven_models(
+            settings=settings,
+            limit=limit,
+            resolution=resolution,
+            force=force,
+        )
+    except PolyHavenAcquireError as exc:
+        typer.echo(f"Poly Haven acquisition failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    batch: BatchIngestResult | None = None
+    terminal_statuses: dict[str, TerminalStatus] = {}
+    if ingest and result.generated_spec_path is not None:
+        try:
+            batch = ingest_batch(
+                settings=settings,
+                manifest_path=result.generated_spec_path,
+                database_path=database,
+                timeout_sec=timeout_sec,
+                render_thumbnails=thumbnails,
+            )
+            terminal_statuses = finalize_polyhaven_items(
+                result=result,
+                batch_manifest_path=batch.manifest_path,
+            )
+        except Exception as exc:
+            typer.echo(f"Poly Haven downstream ingest failed: {exc}", err=True)
+            raise typer.Exit(1) from exc
+
+    payload = _polyhaven_payload(
+        result=result,
+        batch=batch,
+        terminal_statuses=terminal_statuses,
+    )
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        typer.echo(
+            f"Poly Haven models prepared: {result.selected}/{result.discovered}; "
+            f"{result.downloaded_files} files downloaded, {result.reused_files} reused; "
+            f"{result.downloaded_bytes} bytes transferred, "
+            f"{result.verified_bytes} verified"
+        )
+        if result.generated_spec_path is not None:
+            typer.echo(f"Generated IngestSpec: {result.generated_spec_path}")
+        else:
+            typer.echo("No eligible Poly Haven model revisions; source is unchanged")
+        typer.echo(f"Acquisition manifest: {result.manifest_path}")
+        if batch is not None:
+            typer.echo(f"Ingest status: {batch.status}")
+            typer.echo(f"Ingest manifest: {batch.manifest_path}")
+            if batch.report is not None:
+                typer.echo(f"Contact sheet: {batch.report.contact_sheet}")
+    if batch is not None and batch.status != "ok":
+        raise typer.Exit(1)
+
+
+def _polyhaven_payload(
+    *,
+    result: PolyHavenSyncResult,
+    batch: BatchIngestResult | None,
+    terminal_statuses: Mapping[str, TerminalStatus],
+) -> dict[str, object]:
+    ingest_payload: dict[str, object] | None = None
+    if batch is not None:
+        ingest_payload = {
+            "status": batch.status,
+            "manifest": str(batch.manifest_path),
+            "catalog": str(batch.catalog_path),
+            "assets": [
+                {
+                    "asset_id": item.asset_id,
+                    "status": item.status,
+                    "catalog_status": item.catalog_status,
+                    "terminal_status": terminal_statuses.get(item.asset_id),
+                    "error": item.error,
+                }
+                for item in batch.assets
+            ],
+            "report": (
+                None
+                if batch.report is None
+                else {
+                    "contact_sheet": str(batch.report.contact_sheet),
+                    "index_html": str(batch.report.index_html),
+                }
+            ),
+            "report_error": batch.report_error,
+        }
+    return {
+        "status": (
+            "noop"
+            if batch is None and result.generated_spec_path is None
+            else ("prepared" if batch is None else batch.status)
+        ),
+        "source": "polyhaven",
+        "asset_type": "models",
+        "discovered": result.discovered,
+        "selected": result.selected,
+        "downloaded_files": result.downloaded_files,
+        "reused_files": result.reused_files,
+        "downloaded_bytes": result.downloaded_bytes,
+        "verified_bytes": result.verified_bytes,
+        "snapshot_sha256": result.snapshot_sha256,
+        "run_dir": str(result.run_dir),
+        "manifest": str(result.manifest_path),
+        "state": str(result.state_path),
+        "generated_ingest_spec": (
+            None if result.generated_spec_path is None else str(result.generated_spec_path)
+        ),
+        "items": [
+            {
+                "asset_id": item.asset_id,
+                "source_id": item.source_id,
+                "revision": item.revision,
+                "main_path": str(item.main_path),
+                "dependencies": [str(path) for path in item.dependency_paths],
+                "downloaded_files": item.downloaded_files,
+                "reused_files": item.reused_files,
+                "downloaded_bytes": item.downloaded_bytes,
+                "verified_bytes": item.verified_bytes,
+                "source_bundle_sha256": item.source_bundle_sha256,
+                "source_content_sha256": item.source_content_sha256,
+                "acquired_at": item.acquired_at,
+                "verified_at": item.verified_at,
+                "state_status": terminal_statuses.get(item.asset_id, item.state_status),
+            }
+            for item in result.items
+        ],
+        "ingest": ingest_payload,
+    }
 
 
 @acquire_app.command("hdri")
