@@ -315,6 +315,30 @@ def test_failure_taxonomy_distinguishes_retry_permanent_and_deferred() -> None:
         ).category
         is FailureCategory.DEFERRED
     )
+    assert (
+        AcquisitionFailure(
+            kind=FailureKind.INTERRUPTED,
+            phase="revision_attempt",
+            message="process terminated",
+        ).category
+        is FailureCategory.TRANSIENT
+    )
+    assert (
+        AcquisitionFailure(
+            kind=FailureKind.DOWNSTREAM,
+            phase="ingest",
+            message="worker unavailable",
+        ).category
+        is FailureCategory.TRANSIENT
+    )
+    assert (
+        AcquisitionFailure(
+            kind=FailureKind.QUALITY,
+            phase="quality",
+            message="zero mesh output",
+        ).category
+        is FailureCategory.PERMANENT
+    )
     with pytest.raises(RuntimeValidationError, match="failure kind"):
         AcquisitionFailure(
             kind="transport",  # type: ignore[arg-type]

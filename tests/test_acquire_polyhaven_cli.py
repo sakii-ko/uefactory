@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -69,6 +70,8 @@ def _sync_result(tmp_path: Path, *, count: int = 1) -> PolyHavenSyncResult:
         downloaded_bytes=42 * count,
         verified_bytes=42 * count,
         snapshot_sha256="b" * 64,
+        attempted=count,
+        failure_journal_path=tmp_path / "data/acquire/polyhaven/failure_journal.json",
     )
 
 
@@ -117,6 +120,14 @@ def test_polyhaven_cli_download_only_emits_json_and_forwards_options(
             "2000",
             "--min-free-bytes",
             "100",
+            "--cross-run-backoff-base-sec",
+            "12",
+            "--cross-run-backoff-max-sec",
+            "34",
+            "--integrity-quarantine-after-runs",
+            "4",
+            "--retry-revision",
+            "polyhaven_bad_aaaaaaaaaaaa",
             "--download-only",
             "--json",
         ],
@@ -149,7 +160,11 @@ def test_polyhaven_cli_download_only_emits_json_and_forwards_options(
                 max_download_bytes_per_day=1_000,
                 max_storage_bytes=2_000,
                 min_free_bytes=100,
+                cross_run_backoff_base_sec=12,
+                cross_run_backoff_max_sec=34,
+                integrity_quarantine_after_runs=4,
             ),
+            "retry_revisions": ("polyhaven_bad_aaaaaaaaaaaa",),
         }
     ]
 
@@ -306,6 +321,126 @@ def test_polyhaven_cli_noop_does_not_invoke_ingest(
     assert payload["selected"] == 0
     assert payload["generated_ingest_spec"] is None
     assert payload["ingest"] is None
+
+
+def test_polyhaven_cli_reports_journaled_revision_failures(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    result = replace(
+        _sync_result(tmp_path, count=0),
+        attempted=1,
+        failed=1,
+        quarantined=1,
+    )
+    monkeypatch.setattr(
+        "uefactory.cli.acquire.sync_polyhaven_models",
+        lambda **_kwargs: result,
+    )
+
+    invocation = CliRunner().invoke(
+        _app(tmp_path),
+        ["acquire", "polyhaven", "--download-only", "--json"],
+    )
+
+    assert invocation.exit_code == 0, invocation.output
+    payload = json.loads(invocation.stdout)
+    assert payload["status"] == "journaled"
+    assert payload["attempted"] == 1
+    assert payload["failed"] == 1
+    assert payload["deferred"] == 0
+    assert payload["quarantined"] == 1
+    assert payload["failure_journal"].endswith("failure_journal.json")
+
+
+def test_polyhaven_failure_report_cli_is_read_only_and_json_serializable(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    calls: list[dict[str, Any]] = []
+
+    def fake_report(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": 1,
+            "source": "polyhaven",
+            "asset_type": "models",
+            "status_filter": "all",
+            "journal_path": str(tmp_path / "data/acquire/polyhaven/failure_journal.json"),
+            "event_count": 1,
+            "head_event_sha256": "a" * 64,
+            "active_count": 1,
+            "active": [
+                {
+                    "asset_id": "polyhaven_bad_aaaaaaaaaaaa",
+                    "disposition": "quarantined",
+                    "failure": {"kind": "http_permanent", "phase": "api"},
+                }
+            ],
+            "events": [{"type": "failed"}],
+        }
+
+    monkeypatch.setattr("uefactory.cli.acquire.polyhaven_failure_report", fake_report)
+    invocation = CliRunner().invoke(
+        _app(tmp_path),
+        ["acquire", "polyhaven-failures", "--status", "all", "--json"],
+    )
+
+    assert invocation.exit_code == 0, invocation.output
+    payload = json.loads(invocation.stdout)
+    assert payload["event_count"] == 1
+    assert payload["active"][0]["disposition"] == "quarantined"
+    assert calls == [{"settings": calls[0]["settings"], "status": "all"}]
+
+
+def test_polyhaven_failure_report_human_all_lists_complete_event_history(
+    monkeypatch: Any,
+    tmp_path: Path,
+) -> None:
+    asset_id = "polyhaven_bad_aaaaaaaaaaaa"
+    monkeypatch.setattr(
+        "uefactory.cli.acquire.polyhaven_failure_report",
+        lambda **_kwargs: {
+            "schema_version": 1,
+            "source": "polyhaven",
+            "asset_type": "models",
+            "status_filter": "all",
+            "journal_path": str(tmp_path / "data/acquire/polyhaven/failure_journal.json"),
+            "event_count": 3,
+            "head_event_sha256": "a" * 64,
+            "active_count": 0,
+            "active": [],
+            "events": [
+                {
+                    "sequence": 1,
+                    "type": "failed",
+                    "asset_id": asset_id,
+                    "disposition": "backoff",
+                    "failure": {"kind": "transport", "phase": "download"},
+                },
+                {"sequence": 2, "type": "resolved", "asset_id": asset_id},
+                {
+                    "sequence": 3,
+                    "type": "released",
+                    "asset_id": asset_id,
+                    "reason": "operator_requested_exact_revision_retry",
+                },
+            ],
+        },
+    )
+
+    invocation = CliRunner().invoke(
+        _app(tmp_path),
+        ["acquire", "polyhaven-failures", "--status", "all"],
+    )
+
+    assert invocation.exit_code == 0, invocation.output
+    assert f"event 1: failed {asset_id} backoff transport (download)" in invocation.output
+    assert f"event 2: resolved {asset_id}" in invocation.output
+    assert (
+        f"event 3: released {asset_id} (operator_requested_exact_revision_retry)"
+        in invocation.output
+    )
 
 
 def test_polyhaven_cli_reports_acquisition_failure(

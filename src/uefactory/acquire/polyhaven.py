@@ -24,6 +24,17 @@ from uuid import uuid4
 import yaml
 
 from uefactory import __version__
+from uefactory.acquire.failure_journal import (
+    ActiveFailure,
+    CrossRunFailurePolicy,
+    FailureDisposition,
+    FailureJournalError,
+    append_failure_event,
+    append_release_event,
+    append_resolution_event,
+    empty_failure_journal,
+    validate_failure_journal,
+)
 from uefactory.acquire.runtime import (
     AcquisitionFailure,
     Clock,
@@ -68,7 +79,15 @@ POLYHAVEN_SOURCE = "polyhaven"
 DEFAULT_RESOLUTION = "1k"
 STATE_SCHEMA_VERSION = 2
 LEGACY_RUN_MANIFEST_SCHEMA_VERSION = 2
-RUN_MANIFEST_SCHEMA_VERSION = 3
+RUNTIME_RUN_MANIFEST_SCHEMA_VERSION = 3
+RUN_MANIFEST_SCHEMA_VERSION = 4
+_SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS = frozenset(
+    {
+        LEGACY_RUN_MANIFEST_SCHEMA_VERSION,
+        RUNTIME_RUN_MANIFEST_SCHEMA_VERSION,
+        RUN_MANIFEST_SCHEMA_VERSION,
+    }
+)
 COMMIT_INTENT_SCHEMA_VERSION = 1
 USER_AGENT = f"UEFactory/{__version__} research downloader"
 DEFAULT_REQUEST_RATE_PER_SEC = 2.0
@@ -90,6 +109,8 @@ _MAX_FILE_BYTES = 32 * 1024 * 1024 * 1024
 _HASH_CHUNK_BYTES = 1024 * 1024
 _LISTING_DIGEST_DOMAIN = b"uefactory.polyhaven-model-listing.v1\0"
 _PREPARED_MANIFEST_DIGEST_DOMAIN = b"uefactory.polyhaven-prepared-manifest.v1\0"
+_STATE_TRANSITION_DIGEST_DOMAIN = b"uefactory.polyhaven-state-transition.v1\0"
+_FINALIZED_MANIFEST_DIGEST_DOMAIN = b"uefactory.polyhaven-finalized-manifest.v1\0"
 _QUOTA_LEDGER_SCHEMA_VERSION = 1
 _QUOTA_DOWNLOAD_KEY_DOMAIN = b"uefactory.polyhaven-quota-download.v1\0"
 _REDIRECT_HOOK_ATTRIBUTE = "_uefactory_before_redirect_request"
@@ -100,6 +121,14 @@ TerminalStatus = Literal["imported", "render_ok", "skipped"]
 
 class PolyHavenAcquireError(RuntimeError):
     """Poly Haven metadata or downloaded bytes violated the acquisition contract."""
+
+
+class PolyHavenPathSecurityError(PolyHavenAcquireError):
+    """Provider-controlled path or endpoint data violated the security boundary."""
+
+
+class PolyHavenIntegrityError(PolyHavenAcquireError):
+    """Provider-delivered framing or bytes violated their declared closure."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +146,11 @@ class PolyHavenRuntimeConfig:
     max_download_bytes_per_day: int | None = None
     max_storage_bytes: int | None = None
     min_free_bytes: int = 0
+    cross_run_backoff_base_sec: float = 300.0
+    cross_run_backoff_max_sec: float = 86_400.0
+    integrity_quarantine_after_runs: int = 3
     retry_policy: RetryPolicy = field(init=False, repr=False)
+    failure_policy: CrossRunFailurePolicy = field(init=False, repr=False)
     daily_quota_limits: DailyQuotaLimits = field(init=False, repr=False)
     disk_quota_limits: DiskQuotaLimits = field(init=False, repr=False)
 
@@ -154,12 +187,18 @@ class PolyHavenRuntimeConfig:
                 max_storage_bytes=self.max_storage_bytes,
                 min_free_bytes=self.min_free_bytes,
             )
-        except RuntimeValidationError as exc:
+            failure_policy = CrossRunFailurePolicy(
+                backoff_base_sec=self.cross_run_backoff_base_sec,
+                backoff_max_sec=self.cross_run_backoff_max_sec,
+                integrity_quarantine_after=self.integrity_quarantine_after_runs,
+            )
+        except (FailureJournalError, RuntimeValidationError) as exc:
             raise PolyHavenAcquireError(f"invalid Poly Haven runtime configuration: {exc}") from exc
         object.__setattr__(self, "request_rate_per_sec", float(rate))
         object.__setattr__(self, "retry_policy", retry_policy)
         object.__setattr__(self, "daily_quota_limits", daily_limits)
         object.__setattr__(self, "disk_quota_limits", disk_limits)
+        object.__setattr__(self, "failure_policy", failure_policy)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -179,6 +218,11 @@ class PolyHavenRuntimeConfig:
             "disk_quota": {
                 "max_storage_bytes": self.disk_quota_limits.max_storage_bytes,
                 "min_free_bytes": self.disk_quota_limits.min_free_bytes,
+            },
+            "failure_schedule": {
+                "backoff_base_sec": self.failure_policy.backoff_base_sec,
+                "backoff_max_sec": self.failure_policy.backoff_max_sec,
+                "integrity_quarantine_after_runs": (self.failure_policy.integrity_quarantine_after),
             },
         }
 
@@ -278,6 +322,12 @@ class PolyHavenSyncResult:
     verified_bytes: int
     snapshot_sha256: str
     runtime_evidence: Mapping[str, Any] | None = None
+    attempted: int = 0
+    failed: int = 0
+    deferred: int = 0
+    quarantined: int = 0
+    released: int = 0
+    failure_journal_path: Path | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -296,6 +346,15 @@ class _LoadedState:
     before_file_sha256: str | None
     before_payload_sha256: str | None
     migrated_from: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LoadedFailureJournal:
+    payload: dict[str, Any]
+    active: Mapping[str, ActiveFailure]
+    before_exists: bool
+    before_file_sha256: str | None
+    before_payload_sha256: str | None
 
 
 @dataclass(slots=True)
@@ -326,6 +385,23 @@ class _AttemptFailure(Exception):
         self.failure = failure
         self.retry_after_value = retry_after_value
         super().__init__(failure.message)
+
+
+class _ClassifiedItemFailure(PolyHavenAcquireError):
+    def __init__(
+        self,
+        failure: AcquisitionFailure,
+        *,
+        attempts_in_run: int,
+        retry_after_deadline: datetime | None = None,
+        exhausted: bool = False,
+    ) -> None:
+        self.failure = failure
+        self.attempts_in_run = attempts_in_run
+        self.retry_after_deadline = retry_after_deadline
+        self.exhausted = exhausted
+        suffix = "retry budget exhausted" if exhausted else "not retryable"
+        super().__init__(f"{failure.message} ({suffix})")
 
 
 class _DailyQuotaLedger:
@@ -374,7 +450,10 @@ class _DailyQuotaLedger:
         models: tuple[PolyHavenModel, ...],
         *,
         state: Mapping[str, Any],
+        ineligible_unseen_ids: frozenset[str] = frozenset(),
     ) -> frozenset[str] | None:
+        if not isinstance(ineligible_unseen_ids, frozenset):
+            raise PolyHavenAcquireError("ineligible unseen ids must be a frozenset")
         maximum = self.limits.max_new_items
         if maximum is None:
             return None
@@ -384,7 +463,7 @@ class _DailyQuotaLedger:
         remaining = max(0, maximum - self.usage.new_items_reserved)
         allowed: set[str] = set()
         for model in models:
-            if model.asset_id in state_items:
+            if model.asset_id in state_items or model.asset_id in ineligible_unseen_ids:
                 continue
             if model.asset_id in already_reserved:
                 allowed.add(model.asset_id)
@@ -717,8 +796,13 @@ class _DailyQuotaLedger:
                 request=DailyQuotaRequest(download_bytes=count),
             )
         except (QuotaExceeded, RuntimeValidationError) as exc:
-            raise PolyHavenAcquireError(
-                f"Poly Haven daily download quota rejected bytes: {exc}"
+            raise _ClassifiedItemFailure(
+                AcquisitionFailure(
+                    kind=FailureKind.QUOTA,
+                    phase="download_quota",
+                    message=f"Poly Haven daily download quota rejected bytes: {exc}",
+                ),
+                attempts_in_run=1,
             ) from exc
         return reservation.after
 
@@ -777,7 +861,10 @@ class _AcquisitionRuntime:
 
     def run_with_retries(self, *, phase: str, operation: Any) -> Any:
         failures_by_category: dict[FailureCategory, int] = {}
+        attempts_in_run = 0
+        retry_after_deadline: datetime | None = None
         while True:
+            attempts_in_run += 1
             try:
                 return operation()
             except _AttemptFailure as exc:
@@ -793,9 +880,21 @@ class _AcquisitionRuntime:
                             max_delay_sec=self.config.retry_policy.max_retry_after_sec,
                         )
                     except RuntimeValidationError as parse_exc:
-                        raise PolyHavenAcquireError(
-                            f"Poly Haven {phase} returned an invalid Retry-After header"
+                        raise _ClassifiedItemFailure(
+                            AcquisitionFailure(
+                                kind=FailureKind.SCHEMA,
+                                phase=phase,
+                                message=(
+                                    f"Poly Haven {phase} returned an invalid Retry-After header"
+                                ),
+                            ),
+                            attempts_in_run=attempts_in_run,
                         ) from parse_exc
+                    if retry_after is not None and (
+                        retry_after_deadline is None
+                        or retry_after.deadline_utc > retry_after_deadline
+                    ):
+                        retry_after_deadline = retry_after.deadline_utc
                 try:
                     decision = compute_retry_decision(
                         policy=self.config.retry_policy,
@@ -809,8 +908,12 @@ class _AcquisitionRuntime:
                         f"Poly Haven {phase} retry decision failed: {decision_exc}"
                     ) from decision_exc
                 if not decision.will_retry or decision.delay_sec is None:
-                    suffix = "retry budget exhausted" if decision.exhausted else "not retryable"
-                    raise PolyHavenAcquireError(f"{exc.failure.message} ({suffix})") from exc
+                    raise _ClassifiedItemFailure(
+                        exc.failure,
+                        attempts_in_run=attempts_in_run,
+                        retry_after_deadline=retry_after_deadline,
+                        exhausted=decision.exhausted,
+                    ) from exc
                 self.stats.retry_attempts += 1
                 if retry_after is not None:
                     self.stats.retry_after_honored += 1
@@ -853,8 +956,13 @@ class _AcquisitionRuntime:
             )
         except QuotaExceeded as probe_exc:
             if optional_probe_bytes == 0:
-                raise PolyHavenAcquireError(
-                    f"Poly Haven disk quota rejected download: {probe_exc}"
+                raise _ClassifiedItemFailure(
+                    AcquisitionFailure(
+                        kind=FailureKind.DISK,
+                        phase="disk_quota",
+                        message=f"Poly Haven disk quota rejected download: {probe_exc}",
+                    ),
+                    attempts_in_run=1,
                 ) from probe_exc
             try:
                 reserve_disk_growth(
@@ -863,8 +971,13 @@ class _AcquisitionRuntime:
                     growth_bytes=growth_bytes,
                 )
             except (QuotaExceeded, RuntimeValidationError) as exc:
-                raise PolyHavenAcquireError(
-                    f"Poly Haven disk quota rejected download: {exc}"
+                raise _ClassifiedItemFailure(
+                    AcquisitionFailure(
+                        kind=FailureKind.DISK,
+                        phase="disk_quota",
+                        message=f"Poly Haven disk quota rejected download: {exc}",
+                    ),
+                    attempts_in_run=1,
                 ) from exc
             return 0
         except RuntimeValidationError as exc:
@@ -903,6 +1016,72 @@ def revisioned_asset_id(source_id: str, revision: str) -> str:
         raise PolyHavenAcquireError(
             f"Poly Haven source id cannot form a catalog asset id: {source_id!r}"
         ) from exc
+
+
+def polyhaven_failure_report(
+    *,
+    settings: Settings,
+    status: Literal["active", "quarantined", "all"] = "active",
+) -> dict[str, Any]:
+    """Return a validated, read-only view of the durable revision failure journal."""
+
+    if status not in {"active", "quarantined", "all"}:
+        raise PolyHavenAcquireError("failure report status must be active, quarantined, or all")
+    project_root = settings.project_root.expanduser().resolve()
+    data_dir = settings.data_dir.expanduser().resolve()
+    _require_data_dir_inside_project(project_root=project_root, data_dir=data_dir)
+    path = data_dir / "acquire/polyhaven/failure_journal.json"
+    _reject_symlink_components(
+        path,
+        project_root=project_root,
+        context="Poly Haven failure journal report",
+    )
+    loaded = _load_failure_journal(path)
+    records = []
+    for asset_id, active in sorted(loaded.active.items()):
+        if status == "quarantined" and active.disposition is not FailureDisposition.QUARANTINED:
+            continue
+        records.append(
+            {
+                "asset_id": asset_id,
+                "source_id": active.source_id,
+                "revision": active.revision,
+                "resolution": active.resolution,
+                "event_id": active.event_id,
+                "run_id": active.run_id,
+                "recorded_at": active.recorded_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "failure": {
+                    "category": active.failure.category.value,
+                    "kind": active.failure.kind.value,
+                    "phase": active.failure.phase,
+                    "message": active.failure.message,
+                    "http_status": active.failure.http_status,
+                },
+                "consecutive_failures": active.consecutive_failures,
+                "integrity_streak": active.integrity_streak,
+                "attempts_in_run": active.attempts_in_run,
+                "disposition": active.disposition.value,
+                "next_eligible_at": (
+                    None
+                    if active.next_eligible_at is None
+                    else active.next_eligible_at.strftime("%Y-%m-%dT%H:%M:%SZ")
+                ),
+            }
+        )
+    payload: dict[str, Any] = {
+        "schema_version": 1,
+        "source": POLYHAVEN_SOURCE,
+        "asset_type": "models",
+        "status_filter": status,
+        "journal_path": str(path),
+        "event_count": len(loaded.payload["events"]),
+        "head_event_sha256": loaded.payload["head_event_sha256"],
+        "active_count": len(records),
+        "active": records,
+    }
+    if status == "all":
+        payload["events"] = json.loads(json.dumps(loaded.payload["events"]))
+    return payload
 
 
 def parse_polyhaven_model_listing(payload: Any) -> tuple[PolyHavenModel, ...]:
@@ -1047,6 +1226,172 @@ def parse_polyhaven_model_files(
     )
 
 
+def _sync_model_revision(
+    *,
+    model: PolyHavenModel,
+    resolution: str,
+    force: bool,
+    data_dir: Path,
+    project_root: Path,
+    runtime: _AcquisitionRuntime,
+    state: Mapping[str, Any],
+    run_id: str,
+) -> tuple[PolyHavenSyncItem, dict[str, Any]]:
+    files_url = POLYHAVEN_FILES_URL.format(source_id=quote(model.source_id, safe=""))
+    try:
+        files_payload = _fetch_json(files_url, runtime=runtime)
+    except _ClassifiedItemFailure:
+        raise
+    except PolyHavenAcquireError as exc:
+        raise _ClassifiedItemFailure(
+            AcquisitionFailure(
+                kind=FailureKind.SCHEMA,
+                phase="files_api",
+                message=str(exc),
+            ),
+            attempts_in_run=1,
+        ) from exc
+    try:
+        package = parse_polyhaven_model_files(
+            model.source_id,
+            files_payload,
+            resolution=resolution,
+        )
+    except PolyHavenPathSecurityError as exc:
+        raise _ClassifiedItemFailure(
+            AcquisitionFailure(
+                kind=FailureKind.PATH_SECURITY,
+                phase="files_schema",
+                message=str(exc),
+            ),
+            attempts_in_run=1,
+        ) from exc
+    except PolyHavenAcquireError as exc:
+        raise _ClassifiedItemFailure(
+            AcquisitionFailure(
+                kind=FailureKind.SCHEMA,
+                phase="files_schema",
+                message=str(exc),
+            ),
+            attempts_in_run=1,
+        ) from exc
+    root_dir = _ensure_safe_directory(
+        data_dir,
+        Path("acquire/polyhaven/models")
+        / model.source_id.lower()
+        / model.revision
+        / package.resolution,
+    )
+    metadata_path = root_dir / "metadata.json"
+    acquired_at, previous_verified_at = _existing_metadata_times(
+        metadata_path,
+        asset_id=model.asset_id,
+        revision=model.revision,
+    )
+    downloaded_entries: list[_DownloadedFile] = []
+    for file_spec in package.files:
+        destination = _safe_destination(root_dir, file_spec.relative_path)
+        try:
+            downloaded_entries.append(
+                _acquire_file(
+                    file_spec,
+                    destination=destination,
+                    force=force,
+                    asset_id=model.asset_id,
+                    runtime=runtime,
+                )
+            )
+        except _ClassifiedItemFailure as exc:
+            if exc.failure.category is FailureCategory.PERMANENT:
+                runtime.quota.finish_download(
+                    _quota_download_key(asset_id=model.asset_id, spec=file_spec)
+                )
+            raise
+        except PolyHavenPathSecurityError as exc:
+            runtime.quota.finish_download(
+                _quota_download_key(asset_id=model.asset_id, spec=file_spec)
+            )
+            raise _ClassifiedItemFailure(
+                AcquisitionFailure(
+                    kind=FailureKind.PATH_SECURITY,
+                    phase="download",
+                    message=str(exc),
+                ),
+                attempts_in_run=1,
+            ) from exc
+        except PolyHavenIntegrityError as exc:
+            raise _ClassifiedItemFailure(
+                AcquisitionFailure(
+                    kind=FailureKind.INTEGRITY,
+                    phase="download",
+                    message=str(exc),
+                ),
+                attempts_in_run=1,
+            ) from exc
+    downloaded = tuple(downloaded_entries)
+    try:
+        _require_exact_gltf_dependency_closure(root_dir=root_dir, package=package)
+    except PolyHavenAcquireError as exc:
+        raise _ClassifiedItemFailure(
+            AcquisitionFailure(
+                kind=FailureKind.SCHEMA,
+                phase="gltf_closure",
+                message=str(exc),
+            ),
+            attempts_in_run=1,
+        ) from exc
+    verified_at = _next_utc_timestamp(previous_verified_at)
+    metadata = _metadata_payload(
+        model=model,
+        package=package,
+        files=downloaded,
+        project_root=project_root,
+        acquired_at=acquired_at or verified_at,
+        verified_at=verified_at,
+    )
+    runtime.check_disk_growth(len(_render_json(metadata)))
+    _write_json_atomic(metadata_path, metadata)
+    relative_files = tuple(
+        sorted(
+            (entry.spec.relative_path for entry in downloaded),
+            key=lambda path: path.as_posix(),
+        )
+    )
+    source_bundle_hash = bundle_sha256(root_dir, relative_files)
+    source_content_hash = content_sha256(root_dir, relative_files)
+    state_items = _object(state.get("items"), "Poly Haven state items")
+    previous = state_items.get(model.asset_id)
+    previous_status = previous.get("status") if isinstance(previous, dict) else None
+    item = PolyHavenSyncItem(
+        asset_id=model.asset_id,
+        source_id=model.source_id,
+        revision=model.revision,
+        root_dir=root_dir,
+        main_path=root_dir / package.main_file,
+        dependency_paths=tuple(root_dir / path for path in package.dependencies),
+        metadata_path=metadata_path,
+        downloaded_files=sum(not entry.reused for entry in downloaded),
+        reused_files=sum(entry.reused for entry in downloaded),
+        downloaded_bytes=sum(entry.downloaded_bytes for entry in downloaded),
+        verified_bytes=sum(entry.spec.bytes for entry in downloaded),
+        source_bundle_sha256=source_bundle_hash,
+        source_content_sha256=source_content_hash,
+        acquired_at=acquired_at or verified_at,
+        verified_at=verified_at,
+        state_status="downloaded",
+    )
+    manifest_item = _manifest_item(
+        item=item,
+        model=model,
+        package=package,
+        files=downloaded,
+        project_root=project_root,
+        run_id=run_id,
+        state_status_before=(str(previous_status) if previous_status is not None else None),
+    )
+    return item, manifest_item
+
+
 def sync_polyhaven_models(
     *,
     settings: Settings,
@@ -1054,6 +1399,7 @@ def sync_polyhaven_models(
     resolution: str = DEFAULT_RESOLUTION,
     force: bool = False,
     runtime_config: PolyHavenRuntimeConfig | None = None,
+    retry_revisions: tuple[str, ...] = (),
 ) -> PolyHavenSyncResult:
     """Discover and prepare a bounded, resumable Poly Haven model ingest batch."""
 
@@ -1063,15 +1409,26 @@ def sync_polyhaven_models(
     if not isinstance(config, PolyHavenRuntimeConfig):
         raise PolyHavenAcquireError("runtime_config must be PolyHavenRuntimeConfig")
     checked_resolution = _resolution(resolution)
+    if not isinstance(retry_revisions, tuple):
+        raise PolyHavenAcquireError("retry_revisions must be an immutable tuple")
+    checked_retry_revisions: list[str] = []
+    for asset_id in retry_revisions:
+        try:
+            checked_retry_revisions.append(validate_asset_id(asset_id))
+        except (TypeError, ValueError) as exc:
+            raise PolyHavenAcquireError("retry_revisions contains an invalid asset id") from exc
+    if len(checked_retry_revisions) != len(set(checked_retry_revisions)):
+        raise PolyHavenAcquireError("retry_revisions contains duplicate asset ids")
+    checked_retry_revisions.sort()
     project_root = settings.project_root.expanduser().resolve()
     data_dir = settings.data_dir.expanduser().resolve()
     run_id = f"{utc_timestamp()}_{uuid4().hex[:8]}"
     run_dir = project_root / "out/acquire/polyhaven" / run_id
-    run_dir.mkdir(parents=True, exist_ok=False)
     manifest_path = run_dir / "manifest.json"
     generated_spec_path = run_dir / "generated_ingest.yaml"
     state_path = data_dir / "acquire/polyhaven/state.json"
     intent_path = data_dir / "acquire/polyhaven/commit_intent.json"
+    failure_journal_path = data_dir / "acquire/polyhaven/failure_journal.json"
     started_at = _utc_now()
     running_manifest: dict[str, Any] = {
         "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
@@ -1085,40 +1442,119 @@ def sync_polyhaven_models(
             "limit": limit,
             "resolution": checked_resolution,
             "runtime": config.as_dict(),
+            "retry_revisions": checked_retry_revisions,
         },
+        "active_attempt": None,
+        "journal_event_refs": [],
     }
-    _write_json_atomic(manifest_path, running_manifest)
     runtime: _AcquisitionRuntime | None = None
     try:
         _require_data_dir_inside_project(project_root=project_root, data_dir=data_dir)
         with _source_lock(data_dir):
+            output_root = _ensure_safe_directory(
+                project_root,
+                Path("out/acquire/polyhaven"),
+            )
+            run_dir = output_root / run_id
+            manifest_path = run_dir / "manifest.json"
+            generated_spec_path = run_dir / "generated_ingest.yaml"
+            run_dir.mkdir(exist_ok=False)
+            _write_json_atomic(manifest_path, running_manifest)
             _ensure_safe_directory(data_dir, Path("acquire/polyhaven"))
             _reconcile_commit_intent(
                 intent_path=intent_path,
                 state_path=state_path,
                 project_root=project_root,
             )
-            _interrupt_stale_running_manifests(
-                project_root=project_root,
-                exclude=manifest_path,
-            )
-            loaded_state = _load_state(state_path, project_root=project_root)
-            state = loaded_state.payload
+            loaded_journal = _load_failure_journal(failure_journal_path)
+            if not loaded_journal.before_exists:
+                _persist_failure_journal(failure_journal_path, loaded_journal.payload)
+                loaded_journal = _load_failure_journal(failure_journal_path)
             runtime = _AcquisitionRuntime(
                 config=config,
                 clock=SystemClock(),
                 project_root=project_root,
                 data_dir=data_dir,
             )
+            _reconcile_stale_running_manifests(
+                project_root=project_root,
+                exclude=manifest_path,
+                journal_path=failure_journal_path,
+                journal_payload=loaded_journal.payload,
+                policy=config.failure_policy,
+                clock=runtime.clock,
+            )
+            loaded_journal = _load_failure_journal(failure_journal_path)
+            journal_payload = loaded_journal.payload
+            active_failures = dict(loaded_journal.active)
+            journal_event_refs: list[dict[str, Any]] = []
+            released_events: list[dict[str, Any]] = []
+            release_targets: list[ActiveFailure] = []
+            for asset_id in checked_retry_revisions:
+                active = active_failures.get(asset_id)
+                if active is None:
+                    raise PolyHavenAcquireError(
+                        f"retry revision {asset_id!r} has no active failure"
+                    )
+                release_targets.append(active)
+            for ordinal, active in enumerate(release_targets, start=1):
+                try:
+                    journal_payload, release_event = append_release_event(
+                        journal_payload,
+                        source=POLYHAVEN_SOURCE,
+                        asset_type="models",
+                        asset_id=active.asset_id,
+                        source_id=active.source_id,
+                        revision=active.revision,
+                        resolution=active.resolution,
+                        run_id=run_id,
+                        attempt_id=f"{run_id}:release:{ordinal}",
+                        recorded_at=_next_failure_journal_datetime(
+                            journal_payload,
+                            now=_clock_utc_now(runtime.clock),
+                        ),
+                        reason="operator_requested_exact_revision_retry",
+                    )
+                except FailureJournalError as exc:
+                    raise PolyHavenAcquireError(
+                        f"cannot release Poly Haven revision {active.asset_id!r}: {exc}"
+                    ) from exc
+                released_events.append(release_event)
+                journal_event_refs.append(_failure_event_ref(release_event))
+            if released_events:
+                _persist_failure_journal(failure_journal_path, journal_payload)
+                running_manifest["journal_event_refs"] = journal_event_refs
+                _write_json_atomic(manifest_path, running_manifest)
+                active_failures = dict(
+                    validate_failure_journal(
+                        journal_payload,
+                        source=POLYHAVEN_SOURCE,
+                        asset_type="models",
+                    )
+                )
+            loaded_state = _load_state(state_path, project_root=project_root)
+            state = loaded_state.payload
             listing_payload = _fetch_json(POLYHAVEN_MODELS_URL, runtime=runtime)
             models = parse_polyhaven_model_listing(listing_payload)
             snapshot_sha256 = _listing_sha256(models)
-            allowed_unseen_ids = runtime.quota.allowed_unseen_ids(models, state=state)
+            selection_now = _clock_utc_now(runtime.clock)
+            ineligible_unseen_ids = frozenset(
+                asset_id
+                for asset_id, failure in active_failures.items()
+                if not failure.eligible(now=selection_now)
+            )
+            allowed_unseen_ids = runtime.quota.allowed_unseen_ids(
+                models,
+                state=state,
+                ineligible_unseen_ids=ineligible_unseen_ids,
+            )
             selected, next_selection_class = _select_models(
                 models,
                 state=state,
                 limit=limit,
                 allowed_unseen_ids=allowed_unseen_ids,
+                active_failures=active_failures,
+                now=selection_now,
             )
             state_items = _object(state.get("items"), "Poly Haven state items")
             unseen_selected = tuple(
@@ -1127,92 +1563,115 @@ def sync_polyhaven_models(
             runtime.quota.reserve_items(unseen_selected)
             if allowed_unseen_ids is not None:
                 runtime.stats.deferred_new_items = sum(
-                    model.asset_id not in state_items and model.asset_id not in allowed_unseen_ids
+                    model.asset_id not in state_items
+                    and model.asset_id not in allowed_unseen_ids
+                    and model.asset_id not in ineligible_unseen_ids
                     for model in models
                 )
             sync_items: list[PolyHavenSyncItem] = []
             manifest_items: list[dict[str, Any]] = []
-            for model in selected:
-                files_url = POLYHAVEN_FILES_URL.format(source_id=quote(model.source_id, safe=""))
-                package = parse_polyhaven_model_files(
-                    model.source_id,
-                    _fetch_json(files_url, runtime=runtime),
-                    resolution=checked_resolution,
-                )
-                root_dir = _ensure_safe_directory(
-                    data_dir,
-                    Path("acquire/polyhaven/models") / model.source_id.lower() / model.revision,
-                )
-                metadata_path = root_dir / "metadata.json"
-                acquired_at, previous_verified_at = _existing_metadata_times(
-                    metadata_path,
-                    asset_id=model.asset_id,
-                    revision=model.revision,
-                )
-                downloaded = tuple(
-                    _acquire_file(
-                        file_spec,
-                        destination=_safe_destination(root_dir, file_spec.relative_path),
-                        force=force,
-                        asset_id=model.asset_id,
-                        runtime=runtime,
-                    )
-                    for file_spec in package.files
-                )
-                _require_exact_gltf_dependency_closure(root_dir=root_dir, package=package)
-                verified_at = _next_utc_timestamp(previous_verified_at)
-                metadata = _metadata_payload(
-                    model=model,
-                    package=package,
-                    files=downloaded,
-                    project_root=project_root,
-                    acquired_at=acquired_at or verified_at,
-                    verified_at=verified_at,
-                )
-                runtime.check_disk_growth(len(_render_json(metadata)))
-                _write_json_atomic(metadata_path, metadata)
-                relative_files = tuple(
-                    sorted(
-                        (entry.spec.relative_path for entry in downloaded),
-                        key=lambda path: path.as_posix(),
-                    )
-                )
-                source_bundle_hash = bundle_sha256(root_dir, relative_files)
-                source_content_hash = content_sha256(root_dir, relative_files)
-                previous = state["items"].get(model.asset_id)
-                previous_status = previous.get("status") if isinstance(previous, dict) else None
-                item = PolyHavenSyncItem(
-                    asset_id=model.asset_id,
-                    source_id=model.source_id,
-                    revision=model.revision,
-                    root_dir=root_dir,
-                    main_path=root_dir / package.main_file,
-                    dependency_paths=tuple(root_dir / path for path in package.dependencies),
-                    metadata_path=metadata_path,
-                    downloaded_files=sum(not entry.reused for entry in downloaded),
-                    reused_files=sum(entry.reused for entry in downloaded),
-                    downloaded_bytes=sum(entry.downloaded_bytes for entry in downloaded),
-                    verified_bytes=sum(entry.spec.bytes for entry in downloaded),
-                    source_bundle_sha256=source_bundle_hash,
-                    source_content_sha256=source_content_hash,
-                    acquired_at=acquired_at or verified_at,
-                    verified_at=verified_at,
-                    state_status="downloaded",
-                )
-                sync_items.append(item)
-                manifest_items.append(
-                    _manifest_item(
-                        item=item,
+            failure_events: list[dict[str, Any]] = []
+            for ordinal, model in enumerate(selected, start=1):
+                attempt_id = f"{run_id}:{ordinal}"
+                running_manifest["active_attempt"] = {
+                    "attempt_id": attempt_id,
+                    "ordinal": ordinal,
+                    "asset_id": model.asset_id,
+                    "source_id": model.source_id,
+                    "revision": model.revision,
+                    "resolution": checked_resolution,
+                    "started_at": _clock_utc_now(runtime.clock).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                }
+                _write_json_atomic(manifest_path, running_manifest)
+                try:
+                    item, manifest_item = _sync_model_revision(
                         model=model,
-                        package=package,
-                        files=downloaded,
+                        resolution=checked_resolution,
+                        force=force,
+                        data_dir=data_dir,
                         project_root=project_root,
+                        runtime=runtime,
+                        state=state,
                         run_id=run_id,
-                        state_status_before=(
-                            str(previous_status) if previous_status is not None else None
-                        ),
                     )
-                )
+                except _ClassifiedItemFailure as exc:
+                    try:
+                        journal_payload, event = append_failure_event(
+                            journal_payload,
+                            source=POLYHAVEN_SOURCE,
+                            asset_type="models",
+                            asset_id=model.asset_id,
+                            source_id=model.source_id,
+                            revision=model.revision,
+                            resolution=checked_resolution,
+                            run_id=run_id,
+                            attempt_id=attempt_id,
+                            failure=exc.failure,
+                            recorded_at=_next_failure_journal_datetime(
+                                journal_payload,
+                                now=_clock_utc_now(runtime.clock),
+                            ),
+                            policy=config.failure_policy,
+                            retry_after_deadline=exc.retry_after_deadline,
+                            attempts_in_run=exc.attempts_in_run,
+                        )
+                    except FailureJournalError as journal_exc:
+                        raise PolyHavenAcquireError(
+                            f"cannot journal Poly Haven revision failure: {journal_exc}"
+                        ) from journal_exc
+                    _persist_failure_journal(failure_journal_path, journal_payload)
+                    failure_events.append(event)
+                    event_ref = _failure_event_ref(event)
+                    journal_event_refs.append(event_ref)
+                    running_manifest["journal_event_refs"] = journal_event_refs
+                    running_manifest["active_attempt"] = None
+                    _write_json_atomic(manifest_path, running_manifest)
+                    active_failures = dict(
+                        validate_failure_journal(
+                            journal_payload,
+                            source=POLYHAVEN_SOURCE,
+                            asset_type="models",
+                        )
+                    )
+                    continue
+                active_before_success = validate_failure_journal(
+                    journal_payload,
+                    source=POLYHAVEN_SOURCE,
+                    asset_type="models",
+                ).get(model.asset_id)
+                resolution_event: dict[str, Any] | None = None
+                if active_before_success is None or active_before_success.failure.kind not in {
+                    FailureKind.DOWNSTREAM,
+                    FailureKind.QUALITY,
+                }:
+                    try:
+                        journal_payload, resolution_event = append_resolution_event(
+                            journal_payload,
+                            source=POLYHAVEN_SOURCE,
+                            asset_type="models",
+                            asset_id=model.asset_id,
+                            source_id=model.source_id,
+                            revision=model.revision,
+                            resolution=checked_resolution,
+                            run_id=run_id,
+                            attempt_id=attempt_id,
+                            recorded_at=_next_failure_journal_datetime(
+                                journal_payload,
+                                now=_clock_utc_now(runtime.clock),
+                            ),
+                        )
+                    except FailureJournalError as journal_exc:
+                        raise PolyHavenAcquireError(
+                            f"cannot resolve Poly Haven revision failure: {journal_exc}"
+                        ) from journal_exc
+                if resolution_event is not None:
+                    _persist_failure_journal(failure_journal_path, journal_payload)
+                    journal_event_refs.append(_failure_event_ref(resolution_event))
+                    running_manifest["journal_event_refs"] = journal_event_refs
+                running_manifest["active_attempt"] = None
+                _write_json_atomic(manifest_path, running_manifest)
+                sync_items.append(item)
+                manifest_items.append(manifest_item)
 
             resolved_spec_path: Path | None = None
             generated_spec_evidence: dict[str, Any] | None = None
@@ -1248,12 +1707,51 @@ def sync_polyhaven_models(
             reused_files = sum(item.reused_files for item in sync_items)
             downloaded_bytes = sum(item.downloaded_bytes for item in sync_items)
             verified_bytes = sum(item.verified_bytes for item in sync_items)
+            deferred_failures = sum(
+                event.get("failure", {}).get("category") == FailureCategory.DEFERRED.value
+                for event in failure_events
+            )
+            failed_revisions = len(failure_events) - deferred_failures
+            quarantined_revisions = sum(
+                event.get("disposition") == FailureDisposition.QUARANTINED.value
+                for event in failure_events
+            )
+            released_revisions = len(released_events)
+            run_status = (
+                "prepared"
+                if sync_items
+                else "deferred"
+                if failure_events and deferred_failures == len(failure_events)
+                else "journaled"
+                if failure_events
+                else "released"
+                if released_events
+                else "noop"
+            )
+            failure_journal_receipt = {
+                "path": _portable_path(failure_journal_path, project_root),
+                "before": {
+                    "exists": loaded_journal.before_exists,
+                    "file_sha256": loaded_journal.before_file_sha256,
+                    "payload_sha256": loaded_journal.before_payload_sha256,
+                    "event_count": len(loaded_journal.payload["events"]),
+                    "head_event_sha256": loaded_journal.payload["head_event_sha256"],
+                },
+                "after": {
+                    "exists": True,
+                    "file_sha256": _sha256_file(failure_journal_path),
+                    "payload_sha256": _payload_sha256(journal_payload),
+                    "event_count": len(journal_payload["events"]),
+                    "head_event_sha256": journal_payload["head_event_sha256"],
+                },
+                "event_refs": journal_event_refs,
+            }
             prepared_manifest: dict[str, Any] = {
                 "schema_version": RUN_MANIFEST_SCHEMA_VERSION,
                 "source": POLYHAVEN_SOURCE,
                 "asset_type": "models",
                 "run_id": run_id,
-                "status": "prepared" if sync_items else "noop",
+                "status": run_status,
                 "started_at": started_at,
                 "completed_at": completed_at,
                 "request": {
@@ -1261,6 +1759,7 @@ def sync_polyhaven_models(
                     "limit": limit,
                     "resolution": checked_resolution,
                     "runtime": config.as_dict(),
+                    "retry_revisions": checked_retry_revisions,
                 },
                 "listing": {
                     "url": POLYHAVEN_MODELS_URL,
@@ -1276,22 +1775,43 @@ def sync_polyhaven_models(
                         "payload_sha256": loaded_state.before_payload_sha256,
                     },
                     "after": {
-                        "file_sha256": _json_file_sha256(new_state),
-                        "payload_sha256": _payload_sha256(new_state),
+                        "transition_sha256": _state_transition_sha256(
+                            new_state,
+                            run_id=run_id,
+                        ),
                     },
                     "migrated_from": loaded_state.migrated_from,
                 },
                 "generated_ingest_spec": generated_spec_evidence,
                 "counts": {
+                    "attempted": len(selected),
                     "selected": len(sync_items),
+                    "failed": failed_revisions,
+                    "deferred": deferred_failures,
+                    "quarantined": quarantined_revisions,
+                    "released": released_revisions,
+                    "transport_body_bytes": runtime.stats.download_body_bytes,
                     "downloaded_files": downloaded_files,
                     "reused_files": reused_files,
                     "downloaded_bytes": downloaded_bytes,
                     "verified_bytes": verified_bytes,
                 },
                 "runtime": runtime.evidence(),
+                "failure_journal": failure_journal_receipt,
+                "failures": failure_events,
                 "items": manifest_items,
             }
+            if not sync_items:
+                # The no-work receipt advances the durable state timestamp.  Do that
+                # before hashing state.after; the receipt anchor itself is excluded
+                # by _state_transition_sha256 to avoid a digest cycle.
+                new_state["updated_at"] = completed_at
+                prepared_manifest["state"]["after"] = {
+                    "transition_sha256": _state_transition_sha256(
+                        new_state,
+                        run_id=run_id,
+                    ),
+                }
             prepare_receipt_sha256 = _prepared_manifest_payload_sha256(prepared_manifest)
             prepared_manifest["prepare_receipt_sha256"] = prepare_receipt_sha256
             for item in sync_items:
@@ -1304,10 +1824,11 @@ def sync_polyhaven_models(
                     "Poly Haven state noop_run_receipts",
                 )
                 noop_receipts[run_id] = prepare_receipt_sha256
-                new_state["updated_at"] = completed_at
             prepared_manifest["state"]["after"] = {
-                "file_sha256": _json_file_sha256(new_state),
-                "payload_sha256": _payload_sha256(new_state),
+                "transition_sha256": _state_transition_sha256(
+                    new_state,
+                    run_id=run_id,
+                ),
             }
             _validate_prepared_manifest_receipt(
                 manifest=prepared_manifest,
@@ -1347,6 +1868,12 @@ def sync_polyhaven_models(
             verified_bytes=verified_bytes,
             snapshot_sha256=snapshot_sha256,
             runtime_evidence=runtime.evidence(),
+            attempted=len(selected),
+            failed=failed_revisions,
+            deferred=deferred_failures,
+            quarantined=quarantined_revisions,
+            released=released_revisions,
+            failure_journal_path=failure_journal_path,
         )
     except BaseException as exc:
         _persist_run_failure(
@@ -1371,9 +1898,31 @@ def finalize_polyhaven_items(
 
     if not result.items or result.generated_spec_path is None:
         raise PolyHavenAcquireError("a no-change Poly Haven sync result cannot be finalized")
-    state_path = result.state_path.expanduser().resolve()
+    unresolved_run_dir = result.run_dir.expanduser().absolute()
+    project_root = unresolved_run_dir.parents[3].resolve()
+    _reject_symlink_components(
+        unresolved_run_dir,
+        project_root=project_root,
+        context="Poly Haven finalize run directory",
+    )
+    unresolved_manifest_path = result.manifest_path.expanduser().absolute()
+    expected_manifest_path = unresolved_run_dir / "manifest.json"
+    if unresolved_manifest_path != expected_manifest_path:
+        raise PolyHavenAcquireError("Poly Haven finalize manifest path is not the run manifest")
+    _reject_symlink_components(
+        unresolved_manifest_path,
+        project_root=project_root,
+        context="Poly Haven finalize manifest",
+    )
+    _require_regular_file(unresolved_manifest_path, "Poly Haven finalize manifest")
+    unresolved_state_path = result.state_path.expanduser().absolute()
+    _reject_symlink_components(
+        unresolved_state_path,
+        project_root=project_root,
+        context="Poly Haven finalize state",
+    )
+    state_path = unresolved_state_path.resolve()
     data_dir = state_path.parents[2]
-    project_root = result.run_dir.resolve().parents[3]
     _require_data_dir_inside_project(project_root=project_root, data_dir=data_dir)
     intent_path = data_dir / "acquire/polyhaven/commit_intent.json"
     with (
@@ -1392,8 +1941,7 @@ def finalize_polyhaven_items(
         state = loaded_state.payload
         manifest = _read_json_object_strict(result.manifest_path, "Poly Haven run manifest")
         if (
-            manifest.get("schema_version")
-            not in {LEGACY_RUN_MANIFEST_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION}
+            manifest.get("schema_version") not in _SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS
             or manifest.get("source") != POLYHAVEN_SOURCE
             or manifest.get("asset_type") != "models"
             or manifest.get("run_id") != result.run_dir.name
@@ -1465,6 +2013,35 @@ def finalize_polyhaven_items(
             batch_manifest_path=checked_batch_path,
             project_root=project_root,
         )
+        downstream_journal_receipt: dict[str, Any] | None = None
+        downstream_failure_events: list[dict[str, Any]] = []
+        if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
+            request = _object(manifest.get("request"), "run manifest request")
+            runtime_config = _validate_runtime_config_payload(request.get("runtime"))
+            raw_manifest_items = manifest.get("items")
+            if not isinstance(raw_manifest_items, list):
+                raise PolyHavenAcquireError("Poly Haven run manifest items must be a list")
+            result_items_by_id = {item.asset_id: item for item in result.items}
+            ordered_items = tuple(
+                result_items_by_id[
+                    _string(
+                        _object(raw_item, "run manifest item").get("asset_id"),
+                        "run manifest asset_id",
+                        max_length=64,
+                    )
+                ]
+                for raw_item in raw_manifest_items
+            )
+            downstream_journal_receipt, downstream_failure_events = _journal_downstream_outcomes(
+                items=ordered_items,
+                batch=batch,
+                batch_file_sha256=batch_file_sha256,
+                project_root=project_root,
+                data_dir=data_dir,
+                run_id=result.run_dir.name,
+                resolution=_resolution(request.get("resolution")),
+                policy=runtime_config.failure_policy,
+            )
         statuses: dict[str, TerminalStatus] = {
             asset_id: evidence["status"] for asset_id, evidence in terminal_evidence.items()
         }
@@ -1499,7 +2076,7 @@ def finalize_polyhaven_items(
         new_manifest = json.loads(json.dumps(manifest))
         new_manifest["status"] = "finalized"
         new_manifest["finalized_at"] = finalized_at
-        new_manifest["finalization"] = {
+        finalization_payload: dict[str, Any] = {
             "batch_manifest": _portable_path(checked_batch_path, project_root),
             "batch_manifest_file_sha256": batch_file_sha256,
             "terminal_statuses": dict(sorted(statuses.items())),
@@ -1514,13 +2091,45 @@ def finalize_polyhaven_items(
                 item.asset_id for item in result.items if item.asset_id not in statuses
             ),
         }
+        if downstream_journal_receipt is not None:
+            finalization_payload["failure_journal"] = downstream_journal_receipt
+            finalization_payload["failures"] = downstream_failure_events
+        new_manifest["finalization"] = finalization_payload
         state_payload = new_manifest.get("state")
         if not isinstance(state_payload, dict):
             raise PolyHavenAcquireError("Poly Haven run manifest state must be an object")
-        state_payload["after_finalization"] = {
-            "file_sha256": _json_file_sha256(new_state),
-            "payload_sha256": _payload_sha256(new_state),
-        }
+        state_payload["after_finalization"] = (
+            {
+                "transition_sha256": _state_transition_sha256(
+                    new_state,
+                    run_id=result.run_dir.name,
+                )
+            }
+            if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION
+            else {
+                "file_sha256": _json_file_sha256(new_state),
+                "payload_sha256": _payload_sha256(new_state),
+            }
+        )
+        if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
+            finalization_receipts = _object(
+                new_state.setdefault("finalization_run_receipts", {}),
+                "Poly Haven state finalization_run_receipts",
+            )
+            finalization_receipts[result.run_dir.name] = _finalized_manifest_payload_sha256(
+                new_manifest
+            )
+            # The current run's finalization anchor is excluded from the state
+            # transition projection, so storing it cannot create a digest cycle.
+            state_payload["after_finalization"] = {
+                "transition_sha256": _state_transition_sha256(
+                    new_state,
+                    run_id=result.run_dir.name,
+                )
+            }
+            anchored_receipt = _finalized_manifest_payload_sha256(new_manifest)
+            if finalization_receipts[result.run_dir.name] != anchored_receipt:
+                raise PolyHavenAcquireError("Poly Haven finalization receipt is self-inconsistent")
         _commit_state_and_manifest(
             intent_path=intent_path,
             state_path=state_path,
@@ -1541,24 +2150,52 @@ def _select_models(
     state: dict[str, Any],
     limit: int,
     allowed_unseen_ids: frozenset[str] | None = None,
+    active_failures: Mapping[str, ActiveFailure] | None = None,
+    now: datetime | None = None,
 ) -> tuple[tuple[PolyHavenModel, ...], str]:
     state_items = state["items"]
+    checked_failures = {} if active_failures is None else active_failures
+    if checked_failures and now is None:
+        raise PolyHavenAcquireError("failure-aware selection requires the current UTC time")
     pending: list[PolyHavenModel] = []
     unseen: list[PolyHavenModel] = []
     for model in models:
         entry = state_items.get(model.asset_id)
+        if entry is not None and entry.get("status") in _TERMINAL_STATUSES:
+            # Terminal catalog state dominates stale or independently appended
+            # failure history; a completed immutable revision is never reacquired.
+            continue
+        failure = checked_failures.get(model.asset_id)
+        if failure is not None:
+            if now is None or not failure.eligible(now=now):
+                continue
+            if entry is None and (
+                allowed_unseen_ids is not None and model.asset_id not in allowed_unseen_ids
+            ):
+                continue
+            pending.append(model)
+            continue
         if entry is None:
             if allowed_unseen_ids is None or model.asset_id in allowed_unseen_ids:
                 unseen.append(model)
         elif entry["status"] == "downloaded":
             pending.append(model)
-    pending.sort(
-        key=lambda model: (
-            str(state_items[model.asset_id].get("last_prepared_at") or ""),
+
+    def pending_key(model: PolyHavenModel) -> tuple[str, int, str]:
+        failure = checked_failures.get(model.asset_id)
+        deadline = failure.next_eligible_at if failure is not None else None
+        scheduled_at = (
+            deadline.isoformat()
+            if deadline is not None
+            else str(state_items[model.asset_id].get("last_prepared_at") or "")
+        )
+        return (
+            scheduled_at,
             model.date_published,
             model.source_id.casefold(),
         )
-    )
+
+    pending.sort(key=pending_key)
     queues = {"unseen": unseen, "pending": pending}
     positions = {"unseen": 0, "pending": 0}
     turn = str(state["next_selection_class"])
@@ -1589,6 +2226,7 @@ def _state_after_sync(
 ) -> dict[str, Any]:
     result = json.loads(json.dumps(state))
     result.setdefault("noop_run_receipts", {})
+    result.setdefault("finalization_run_receipts", {})
     watermark = _listing_watermark(listing_models)
     previous_listing = state.get("last_listing")
     if (
@@ -1670,6 +2308,7 @@ def _empty_state() -> dict[str, Any]:
         "next_selection_class": "unseen",
         "last_listing": None,
         "noop_run_receipts": {},
+        "finalization_run_receipts": {},
         "items": {},
     }
 
@@ -1721,6 +2360,91 @@ def _load_state(path: Path, *, project_root: Path) -> _LoadedState:
     )
 
 
+def _load_failure_journal(path: Path) -> _LoadedFailureJournal:
+    if not path.exists() and not path.is_symlink():
+        payload = empty_failure_journal(source=POLYHAVEN_SOURCE, asset_type="models")
+        return _LoadedFailureJournal(
+            payload=payload,
+            active={},
+            before_exists=False,
+            before_file_sha256=None,
+            before_payload_sha256=None,
+        )
+    _require_regular_file(path, "Poly Haven failure journal")
+    payload = _read_json_object_strict(path, "Poly Haven failure journal")
+    try:
+        active = validate_failure_journal(
+            payload,
+            source=POLYHAVEN_SOURCE,
+            asset_type="models",
+        )
+    except FailureJournalError as exc:
+        raise PolyHavenAcquireError(f"Poly Haven failure journal is invalid: {exc}") from exc
+    return _LoadedFailureJournal(
+        payload=payload,
+        active=active,
+        before_exists=True,
+        before_file_sha256=_sha256_file(path),
+        before_payload_sha256=_payload_sha256(payload),
+    )
+
+
+def _persist_failure_journal(path: Path, payload: dict[str, Any]) -> None:
+    try:
+        validate_failure_journal(
+            payload,
+            source=POLYHAVEN_SOURCE,
+            asset_type="models",
+        )
+    except FailureJournalError as exc:
+        raise PolyHavenAcquireError(f"Poly Haven failure journal is invalid: {exc}") from exc
+    _write_json_atomic(path, payload)
+
+
+def _failure_journal_head(payload: Mapping[str, Any]) -> dict[str, Any]:
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise PolyHavenAcquireError("Poly Haven failure journal events are invalid")
+    return {
+        "event_count": len(events),
+        "head_event_sha256": payload.get("head_event_sha256"),
+        "payload_sha256": _payload_sha256(payload),
+    }
+
+
+def _next_failure_journal_datetime(
+    payload: Mapping[str, Any],
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    checked_now = datetime.now(UTC) if now is None else now
+    if checked_now.tzinfo is None or checked_now.utcoffset() is None:
+        raise PolyHavenAcquireError("failure journal clock must be timezone-aware")
+    checked_now = checked_now.astimezone(UTC)
+    if checked_now.microsecond:
+        checked_now = checked_now.replace(microsecond=0) + timedelta(seconds=1)
+    updated_at = payload.get("updated_at")
+    if updated_at is None:
+        return checked_now
+    checked = datetime.strptime(
+        _timestamp(updated_at, "failure journal updated_at"),
+        "%Y-%m-%dT%H:%M:%SZ",
+    ).replace(tzinfo=UTC)
+    return max(checked_now, checked + timedelta(seconds=1))
+
+
+def _failure_event_ref(event: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "sequence": _positive_int(event.get("sequence"), "failure event sequence"),
+        "event_id": _sha256_value(event.get("event_id"), "failure event id"),
+        "event_sha256": _sha256_value(
+            event.get("event_sha256"),
+            "failure event payload hash",
+        ),
+        "type": _string(event.get("type"), "failure event type", max_length=32),
+    }
+
+
 def _validate_v2_state(state: dict[str, Any], *, project_root: Path) -> None:
     expected_keys = {
         "schema_version",
@@ -1732,10 +2456,8 @@ def _validate_v2_state(state: dict[str, Any], *, project_root: Path) -> None:
         "last_listing",
         "items",
     }
-    if frozenset(state) not in {
-        frozenset(expected_keys),
-        frozenset(expected_keys | {"noop_run_receipts"}),
-    }:
+    optional_keys = {"noop_run_receipts", "finalization_run_receipts"}
+    if not expected_keys.issubset(state) or set(state) - expected_keys - optional_keys:
         raise PolyHavenAcquireError("Poly Haven state has an unsupported shape")
     schema_version = state.get("schema_version")
     if (
@@ -1760,6 +2482,12 @@ def _validate_v2_state(state: dict[str, Any], *, project_root: Path) -> None:
     for run_id, receipt in raw_noop_receipts.items():
         _string(run_id, "state noop run_id", max_length=128)
         _sha256_value(receipt, f"state noop receipt {run_id}")
+    raw_finalization_receipts = state.get("finalization_run_receipts", {})
+    if not isinstance(raw_finalization_receipts, dict):
+        raise PolyHavenAcquireError("Poly Haven state finalization_run_receipts must be an object")
+    for run_id, receipt in raw_finalization_receipts.items():
+        _string(run_id, "state finalization run_id", max_length=128)
+        _sha256_value(receipt, f"state finalization receipt {run_id}")
     items = state.get("items")
     if not isinstance(items, dict):
         raise PolyHavenAcquireError("Poly Haven state items must be an object")
@@ -2049,7 +2777,14 @@ def _prepare_token(
 
 def _prepared_manifest_payload_sha256(manifest: Mapping[str, Any]) -> str:
     status = manifest.get("status")
-    if status not in {"prepared", "finalized", "noop"}:
+    if status not in {
+        "prepared",
+        "finalized",
+        "noop",
+        "journaled",
+        "deferred",
+        "released",
+    }:
         raise PolyHavenAcquireError("Poly Haven run manifest is not receipt-eligible")
     state = _object(manifest.get("state"), "run manifest state")
     prepared_status = "prepared" if status == "finalized" else status
@@ -2072,17 +2807,51 @@ def _prepared_manifest_payload_sha256(manifest: Mapping[str, Any]) -> str:
         "counts": manifest.get("counts"),
         "items": manifest.get("items"),
     }
-    if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
+    if manifest.get("schema_version") in {
+        RUNTIME_RUN_MANIFEST_SCHEMA_VERSION,
+        RUN_MANIFEST_SCHEMA_VERSION,
+    }:
         payload["runtime"] = manifest.get("runtime")
+    if manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
+        payload["state"]["after"] = state.get("after")
+        payload["failure_journal"] = manifest.get("failure_journal")
+        payload["failures"] = manifest.get("failures")
     return _domain_payload_sha256(_PREPARED_MANIFEST_DIGEST_DOMAIN, payload)
 
 
-def _validate_runtime_config_payload(value: Any) -> PolyHavenRuntimeConfig:
-    payload = _exact_object(
-        value,
-        {"request_rate_per_sec", "request_burst", "retry", "daily_quota", "disk_quota"},
-        "run manifest runtime configuration",
+def _finalized_manifest_payload_sha256(manifest: Mapping[str, Any]) -> str:
+    """Bind finalize-only evidence to the durable state without a hash cycle."""
+
+    if manifest.get("status") != "finalized":
+        raise PolyHavenAcquireError("Poly Haven run manifest is not finalized")
+    state = _object(manifest.get("state"), "run manifest state")
+    return _domain_payload_sha256(
+        _FINALIZED_MANIFEST_DIGEST_DOMAIN,
+        {
+            "schema_version": manifest.get("schema_version"),
+            "source": manifest.get("source"),
+            "asset_type": manifest.get("asset_type"),
+            "run_id": manifest.get("run_id"),
+            "status": manifest.get("status"),
+            "finalized_at": manifest.get("finalized_at"),
+            "prepare_receipt_sha256": manifest.get("prepare_receipt_sha256"),
+            "state_after_finalization": state.get("after_finalization"),
+            "finalization": manifest.get("finalization"),
+        },
     )
+
+
+def _validate_runtime_config_payload(value: Any) -> PolyHavenRuntimeConfig:
+    payload = _object(value, "run manifest runtime configuration")
+    legacy_keys = {
+        "request_rate_per_sec",
+        "request_burst",
+        "retry",
+        "daily_quota",
+        "disk_quota",
+    }
+    if set(payload) not in {frozenset(legacy_keys), frozenset(legacy_keys | {"failure_schedule"})}:
+        raise PolyHavenAcquireError("run manifest runtime configuration has an unsupported shape")
     retry = _exact_object(
         payload["retry"],
         {
@@ -2104,6 +2873,27 @@ def _validate_runtime_config_payload(value: Any) -> PolyHavenRuntimeConfig:
         {"max_storage_bytes", "min_free_bytes"},
         "run manifest disk quota configuration",
     )
+    schedule = (
+        _exact_object(
+            payload["failure_schedule"],
+            {
+                "backoff_base_sec",
+                "backoff_max_sec",
+                "integrity_quarantine_after_runs",
+            },
+            "run manifest failure schedule configuration",
+        )
+        if "failure_schedule" in payload
+        else {
+            "backoff_base_sec": 300.0,
+            "backoff_max_sec": 86_400.0,
+            "integrity_quarantine_after_runs": 3,
+        }
+    )
+    integrity_quarantine_after_runs = _positive_int(
+        schedule["integrity_quarantine_after_runs"],
+        "run manifest integrity quarantine threshold",
+    )
     try:
         config = PolyHavenRuntimeConfig(
             request_rate_per_sec=payload["request_rate_per_sec"],
@@ -2117,10 +2907,16 @@ def _validate_runtime_config_payload(value: Any) -> PolyHavenRuntimeConfig:
             max_download_bytes_per_day=daily["max_download_bytes"],
             max_storage_bytes=disk["max_storage_bytes"],
             min_free_bytes=disk["min_free_bytes"],
+            cross_run_backoff_base_sec=schedule["backoff_base_sec"],
+            cross_run_backoff_max_sec=schedule["backoff_max_sec"],
+            integrity_quarantine_after_runs=integrity_quarantine_after_runs,
         )
     except (PolyHavenAcquireError, TypeError) as exc:
         raise PolyHavenAcquireError("run manifest runtime configuration is invalid") from exc
-    if _payload_sha256(config.as_dict()) != _payload_sha256(payload):
+    canonical = config.as_dict()
+    if "failure_schedule" not in payload:
+        canonical.pop("failure_schedule")
+    if _payload_sha256(canonical) != _payload_sha256(payload):
         raise PolyHavenAcquireError("run manifest runtime configuration is not canonical")
     return config
 
@@ -2141,7 +2937,7 @@ def _validate_runtime_evidence(
     *,
     config: PolyHavenRuntimeConfig,
     project_root: Path,
-    downloaded_bytes: int,
+    received_body_bytes: int,
 ) -> None:
     payload = _exact_object(value, {"http", "daily_quota", "disk"}, "run manifest runtime")
     http = _exact_object(
@@ -2162,7 +2958,7 @@ def _validate_runtime_evidence(
         raise PolyHavenAcquireError("run manifest HTTP attempt accounting differs")
     if http["retry_after_honored"] > http["retry_attempts"]:
         raise PolyHavenAcquireError("run manifest Retry-After accounting differs")
-    if http["download_body_bytes"] != downloaded_bytes:
+    if http["download_body_bytes"] != received_body_bytes:
         raise PolyHavenAcquireError("run manifest download body accounting differs")
 
     daily = _exact_object(
@@ -2256,7 +3052,7 @@ def _validate_runtime_evidence(
         raise PolyHavenAcquireError("receipt-eligible run contains download overage accounting")
     if (
         config.daily_quota_limits.max_download_bytes is not None
-        and downloaded_bytes > after["download_bytes_reserved"]
+        and received_body_bytes > after["download_bytes_reserved"]
     ):
         raise PolyHavenAcquireError("run downloaded bytes exceed durable quota reservations")
 
@@ -2275,6 +3071,265 @@ def _validate_runtime_evidence(
             _nonnegative_int(raw, f"run manifest runtime.disk.{key}")
 
 
+def _validate_failure_journal_manifest_receipt(
+    value: Any,
+    *,
+    failures: Any,
+    counts: Mapping[str, Any],
+    project_root: Path,
+    expected_failure_policy: CrossRunFailurePolicy,
+) -> list[dict[str, Any]]:
+    receipt = _exact_object(
+        value,
+        {"path", "before", "after", "event_refs"},
+        "run manifest failure_journal",
+    )
+    relative_path = _portable_state_path(
+        receipt["path"],
+        project_root=project_root,
+        context="run manifest failure_journal.path",
+    )
+    path = project_root / relative_path
+    loaded = _load_failure_journal(path)
+    current = loaded.payload
+    events = current["events"]
+    snapshots: dict[str, dict[str, Any]] = {}
+    for key in ("before", "after"):
+        snapshot = _exact_object(
+            receipt[key],
+            {
+                "exists",
+                "file_sha256",
+                "payload_sha256",
+                "event_count",
+                "head_event_sha256",
+            },
+            f"run manifest failure_journal.{key}",
+        )
+        exists = snapshot["exists"]
+        if not isinstance(exists, bool):
+            raise PolyHavenAcquireError("failure journal snapshot exists flag is invalid")
+        event_count = _nonnegative_int(
+            snapshot["event_count"],
+            f"run manifest failure_journal.{key}.event_count",
+        )
+        if event_count > len(events):
+            raise PolyHavenAcquireError("failure journal receipt is ahead of current history")
+        if event_count:
+            expected_head = events[event_count - 1]["event_sha256"]
+            if snapshot["head_event_sha256"] != expected_head:
+                raise PolyHavenAcquireError("failure journal receipt head differs from history")
+        elif snapshot["head_event_sha256"] is not None:
+            raise PolyHavenAcquireError("empty failure journal receipt has a head")
+        prefix = _failure_journal_prefix(current, event_count)
+        if exists:
+            _sha256_value(
+                snapshot["file_sha256"],
+                f"run manifest failure_journal.{key}.file_sha256",
+            )
+            _sha256_value(
+                snapshot["payload_sha256"],
+                f"run manifest failure_journal.{key}.payload_sha256",
+            )
+            if snapshot["file_sha256"] != _json_file_sha256(prefix) or snapshot[
+                "payload_sha256"
+            ] != _payload_sha256(prefix):
+                raise PolyHavenAcquireError(
+                    "failure journal receipt snapshot differs from its history prefix"
+                )
+        elif (
+            snapshot["file_sha256"] is not None
+            or snapshot["payload_sha256"] is not None
+            or event_count
+        ):
+            raise PolyHavenAcquireError("absent failure journal receipt contains history")
+        snapshots[key] = snapshot
+
+    if not snapshots["after"]["exists"] or not path.is_file() or path.is_symlink():
+        raise PolyHavenAcquireError("failure journal receipt has no durable after file")
+
+    refs = receipt["event_refs"]
+    if not isinstance(refs, list):
+        raise PolyHavenAcquireError("failure journal event_refs must be a list")
+    before_count = snapshots["before"]["event_count"]
+    after_count = snapshots["after"]["event_count"]
+    if after_count < before_count:
+        raise PolyHavenAcquireError("failure journal receipt moves its head backwards")
+    referenced_events: list[dict[str, Any]] = []
+    referenced_sequences: list[int] = []
+    for raw_ref in refs:
+        ref = _exact_object(
+            raw_ref,
+            {"sequence", "event_id", "event_sha256", "type"},
+            "run manifest failure journal event ref",
+        )
+        sequence = _positive_int(ref["sequence"], "failure journal event ref sequence")
+        if sequence > after_count:
+            raise PolyHavenAcquireError("failure journal event ref is beyond its after head")
+        if referenced_sequences and sequence <= referenced_sequences[-1]:
+            raise PolyHavenAcquireError("failure journal event refs are not strictly ordered")
+        referenced_sequences.append(sequence)
+        event = events[sequence - 1]
+        for ref_key in ("event_id", "event_sha256", "type"):
+            if ref[ref_key] != event[ref_key]:
+                raise PolyHavenAcquireError("failure journal event ref differs from history")
+        referenced_events.append(event)
+    appended_sequences = set(range(before_count + 1, after_count + 1))
+    if not appended_sequences.issubset(referenced_sequences):
+        raise PolyHavenAcquireError("failure journal appended event range is not fully referenced")
+
+    if not isinstance(failures, list):
+        raise PolyHavenAcquireError("run manifest failures must be a list")
+    expected_failures = [event for event in referenced_events if event["type"] == "failed"]
+    if failures != expected_failures:
+        raise PolyHavenAcquireError("run manifest failures differ from journal events")
+    expected_policy_payload = {
+        "backoff_base_sec": expected_failure_policy.backoff_base_sec,
+        "backoff_max_sec": expected_failure_policy.backoff_max_sec,
+        "integrity_quarantine_after": expected_failure_policy.integrity_quarantine_after,
+    }
+    if any(event.get("policy") != expected_policy_payload for event in expected_failures):
+        raise PolyHavenAcquireError("run manifest failure policy differs from its journal events")
+    deferred = sum(
+        event["failure"]["category"] == FailureCategory.DEFERRED.value
+        for event in expected_failures
+    )
+    failed = len(expected_failures) - deferred
+    quarantined = sum(
+        event["disposition"] == FailureDisposition.QUARANTINED.value for event in expected_failures
+    )
+    if (
+        counts["failed"] != failed
+        or counts["deferred"] != deferred
+        or counts["quarantined"] != quarantined
+    ):
+        raise PolyHavenAcquireError("run manifest failure counts differ from journal events")
+    if "released" in counts:
+        released = sum(event["type"] == "released" for event in referenced_events)
+        if counts["released"] != released:
+            raise PolyHavenAcquireError("run manifest release count differs from journal events")
+    return referenced_events
+
+
+def _failure_journal_prefix(payload: Mapping[str, Any], event_count: int) -> dict[str, Any]:
+    result = json.loads(json.dumps(payload))
+    result["events"] = result["events"][:event_count]
+    result["next_sequence"] = event_count + 1
+    result["head_event_sha256"] = result["events"][-1]["event_sha256"] if event_count else None
+    result["updated_at"] = result["events"][-1]["recorded_at"] if event_count else None
+    try:
+        validate_failure_journal(
+            result,
+            source=POLYHAVEN_SOURCE,
+            asset_type="models",
+        )
+    except FailureJournalError as exc:
+        raise PolyHavenAcquireError(f"failure journal history prefix is invalid: {exc}") from exc
+    return result
+
+
+def _validate_sync_journal_event_binding(
+    events: list[dict[str, Any]],
+    *,
+    run_id: str,
+    attempted: int,
+    successful_asset_ids: set[str],
+    retry_revisions: tuple[str, ...],
+    request_resolution: str,
+) -> None:
+    seen_attempt_ordinals: set[int] = set()
+    seen_release_ordinals: set[int] = set()
+    failed_asset_ids: set[str] = set()
+    resolved_asset_ids: set[str] = set()
+    for event in events:
+        if event.get("run_id") != run_id:
+            raise PolyHavenAcquireError("run manifest references a foreign journal event")
+        asset_id = _string(
+            event.get("asset_id"),
+            "run journal event asset_id",
+            max_length=64,
+        )
+        try:
+            validate_asset_id(asset_id)
+        except ValueError as exc:
+            raise PolyHavenAcquireError("run journal event asset id is invalid") from exc
+        source_id = _source_id(
+            event.get("source_id"),
+            "run journal event source_id",
+        )
+        revision = _string(
+            event.get("revision"),
+            "run journal event revision",
+            max_length=40,
+        )
+        if (
+            _SHA1_PATTERN.fullmatch(revision) is None
+            or revisioned_asset_id(source_id, revision) != asset_id
+        ):
+            raise PolyHavenAcquireError("run journal event revision identity is invalid")
+        event_resolution = _resolution(event.get("resolution"))
+        event_type = event.get("type")
+        attempt_id = _string(
+            event.get("attempt_id"),
+            "run journal event attempt_id",
+            max_length=160,
+        )
+        if event_type == "released":
+            ordinal = _journal_attempt_ordinal(
+                attempt_id,
+                prefix=f"{run_id}:release:",
+                maximum=len(retry_revisions),
+                context="release journal event",
+            )
+            if ordinal in seen_release_ordinals:
+                raise PolyHavenAcquireError("run journal has a duplicate release ordinal")
+            seen_release_ordinals.add(ordinal)
+            if retry_revisions[ordinal - 1] != asset_id:
+                raise PolyHavenAcquireError("release journal event differs from its retry target")
+            continue
+        if event_type not in {"failed", "resolved"}:
+            raise PolyHavenAcquireError("run journal contains an unsupported event type")
+        if event_resolution != request_resolution:
+            raise PolyHavenAcquireError("revision journal event resolution differs from its run")
+        ordinal = _journal_attempt_ordinal(
+            attempt_id,
+            prefix=f"{run_id}:",
+            maximum=attempted,
+            context="revision journal event",
+        )
+        if ordinal in seen_attempt_ordinals:
+            raise PolyHavenAcquireError("run journal has a duplicate revision attempt ordinal")
+        seen_attempt_ordinals.add(ordinal)
+        if event_type == "failed":
+            if asset_id in successful_asset_ids or asset_id in failed_asset_ids:
+                raise PolyHavenAcquireError("failed journal event differs from the run cohort")
+            failed_asset_ids.add(asset_id)
+        else:
+            if asset_id not in successful_asset_ids or asset_id in resolved_asset_ids:
+                raise PolyHavenAcquireError("resolution journal event differs from the run cohort")
+            resolved_asset_ids.add(asset_id)
+    if seen_release_ordinals != set(range(1, len(retry_revisions) + 1)):
+        raise PolyHavenAcquireError("run journal release events do not cover every retry target")
+
+
+def _journal_attempt_ordinal(
+    attempt_id: str,
+    *,
+    prefix: str,
+    maximum: int,
+    context: str,
+) -> int:
+    if not attempt_id.startswith(prefix):
+        raise PolyHavenAcquireError(f"{context} id is not bound to its run")
+    raw = attempt_id[len(prefix) :]
+    if not raw.isascii() or not raw.isdigit() or raw.startswith("0"):
+        raise PolyHavenAcquireError(f"{context} ordinal is not canonical")
+    ordinal = int(raw)
+    if ordinal < 1 or ordinal > maximum:
+        raise PolyHavenAcquireError(f"{context} ordinal is outside the run cohort")
+    return ordinal
+
+
 def _validate_prepared_manifest_receipt(
     *,
     manifest: dict[str, Any],
@@ -2286,7 +3341,11 @@ def _validate_prepared_manifest_receipt(
     version = manifest.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int):
         raise PolyHavenAcquireError("Poly Haven run manifest schema version is not canonical")
-    has_runtime_receipt = version == RUN_MANIFEST_SCHEMA_VERSION
+    has_runtime_receipt = version in {
+        RUNTIME_RUN_MANIFEST_SCHEMA_VERSION,
+        RUN_MANIFEST_SCHEMA_VERSION,
+    }
+    has_failure_receipt = version == RUN_MANIFEST_SCHEMA_VERSION
     if version == LEGACY_RUN_MANIFEST_SCHEMA_VERSION and status == "noop":
         raise PolyHavenAcquireError(
             "legacy schema-2 no-op receipts are unverifiable and may not be replayed"
@@ -2309,13 +3368,18 @@ def _validate_prepared_manifest_receipt(
     }
     if has_runtime_receipt:
         base_keys.add("runtime")
+    if has_failure_receipt:
+        base_keys.update({"failure_journal", "failures"})
     expected_keys = base_keys | (
         {"finalized_at", "finalization"} if status == "finalized" else set()
     )
-    if status not in {"prepared", "finalized", "noop"} or set(manifest) != expected_keys:
+    allowed_statuses = {"prepared", "finalized", "noop"}
+    if has_failure_receipt:
+        allowed_statuses.update({"journaled", "deferred", "released"})
+    if status not in allowed_statuses or set(manifest) != expected_keys:
         raise PolyHavenAcquireError("Poly Haven run manifest has an unsupported receipt shape")
     if (
-        version not in {LEGACY_RUN_MANIFEST_SCHEMA_VERSION, RUN_MANIFEST_SCHEMA_VERSION}
+        version not in _SUPPORTED_RUN_MANIFEST_SCHEMA_VERSIONS
         or manifest.get("source") != POLYHAVEN_SOURCE
         or manifest.get("asset_type") != "models"
     ):
@@ -2327,11 +3391,37 @@ def _validate_prepared_manifest_receipt(
     request_keys = {"force", "limit", "resolution"}
     if has_runtime_receipt:
         request_keys.add("runtime")
+    if has_failure_receipt:
+        request_keys.add("retry_revisions")
     request = _exact_object(manifest.get("request"), request_keys, "run manifest request")
     if not isinstance(request["force"], bool):
         raise PolyHavenAcquireError("run manifest request.force must be boolean")
     _positive_int(request["limit"], "run manifest request.limit")
     _resolution(request["resolution"])
+    if has_failure_receipt:
+        retry_revisions = request["retry_revisions"]
+        if (
+            not isinstance(retry_revisions, list)
+            or any(not isinstance(asset_id, str) for asset_id in retry_revisions)
+            or retry_revisions != sorted(set(retry_revisions))
+        ):
+            raise PolyHavenAcquireError("run manifest retry revisions are not canonical")
+        for asset_id in retry_revisions:
+            try:
+                validate_asset_id(asset_id)
+            except ValueError as exc:
+                raise PolyHavenAcquireError(
+                    "run manifest retry revisions contain an invalid asset id"
+                ) from exc
+    if has_failure_receipt:
+        runtime_payload = _object(
+            request["runtime"],
+            "run manifest runtime configuration",
+        )
+        if "failure_schedule" not in runtime_payload:
+            raise PolyHavenAcquireError(
+                "schema-4 run manifest requires an explicit failure schedule"
+            )
     runtime_config = (
         _validate_runtime_config_payload(request["runtime"]) if has_runtime_receipt else None
     )
@@ -2389,37 +3479,65 @@ def _validate_prepared_manifest_receipt(
         state_receipt_keys.append("after_finalization")
     state_receipts: dict[str, dict[str, Any]] = {}
     for key in state_receipt_keys:
-        state_receipts[key] = _exact_object(
-            state_payload[key],
-            {"file_sha256", "payload_sha256"},
-            f"run manifest state.{key}",
-        )
-        _sha256_value(state_receipts[key]["file_sha256"], f"run manifest state.{key}.file_sha256")
-        _sha256_value(
-            state_receipts[key]["payload_sha256"],
-            f"run manifest state.{key}.payload_sha256",
-        )
+        if has_failure_receipt:
+            state_receipts[key] = _exact_object(
+                state_payload[key],
+                {"transition_sha256"},
+                f"run manifest state.{key}",
+            )
+            _sha256_value(
+                state_receipts[key]["transition_sha256"],
+                f"run manifest state.{key}.transition_sha256",
+            )
+        else:
+            state_receipts[key] = _exact_object(
+                state_payload[key],
+                {"file_sha256", "payload_sha256"},
+                f"run manifest state.{key}",
+            )
+            _sha256_value(
+                state_receipts[key]["file_sha256"],
+                f"run manifest state.{key}.file_sha256",
+            )
+            _sha256_value(
+                state_receipts[key]["payload_sha256"],
+                f"run manifest state.{key}.payload_sha256",
+            )
     if require_current_state_receipt:
         current_key = "after_finalization" if status == "finalized" else "after"
         current_receipt = state_receipts[current_key]
-        if current_receipt["file_sha256"] != _json_file_sha256(state) or current_receipt[
+        if has_failure_receipt:
+            if current_receipt["transition_sha256"] != _state_transition_sha256(
+                state,
+                run_id=str(manifest["run_id"]),
+            ):
+                raise PolyHavenAcquireError("Poly Haven run state transition receipt is stale")
+        elif current_receipt["file_sha256"] != _json_file_sha256(state) or current_receipt[
             "payload_sha256"
         ] != _payload_sha256(state):
             raise PolyHavenAcquireError("Poly Haven run manifest state receipt is stale")
     if state_payload["migrated_from"] not in {None, 1}:
         raise PolyHavenAcquireError("run manifest state migration marker is invalid")
 
-    counts = _exact_object(
-        manifest.get("counts"),
-        {
-            "selected",
-            "downloaded_files",
-            "reused_files",
-            "downloaded_bytes",
-            "verified_bytes",
-        },
-        "run manifest counts",
-    )
+    count_keys = {
+        "selected",
+        "downloaded_files",
+        "reused_files",
+        "downloaded_bytes",
+        "verified_bytes",
+    }
+    if has_failure_receipt:
+        count_keys.update(
+            {
+                "attempted",
+                "failed",
+                "deferred",
+                "quarantined",
+                "released",
+                "transport_body_bytes",
+            }
+        )
+    counts = _exact_object(manifest.get("counts"), count_keys, "run manifest counts")
     for key, value in counts.items():
         _nonnegative_int(value, f"run manifest counts.{key}")
     if runtime_config is not None:
@@ -2427,16 +3545,67 @@ def _validate_prepared_manifest_receipt(
             manifest.get("runtime"),
             config=runtime_config,
             project_root=project_root,
-            downloaded_bytes=counts["downloaded_bytes"],
+            received_body_bytes=(
+                counts["transport_body_bytes"]
+                if has_failure_receipt
+                else counts["downloaded_bytes"]
+            ),
+        )
+    referenced_journal_events: list[dict[str, Any]] = []
+    if has_failure_receipt:
+        if runtime_config is None:
+            raise PolyHavenAcquireError("schema-4 run manifest has no runtime configuration")
+        if counts["attempted"] != counts["selected"] + counts["failed"] + counts["deferred"]:
+            raise PolyHavenAcquireError("run manifest attempt accounting differs")
+        if counts["attempted"] > request["limit"]:
+            raise PolyHavenAcquireError("run manifest attempted count exceeds its request limit")
+        if counts["quarantined"] > counts["failed"]:
+            raise PolyHavenAcquireError("run manifest quarantine accounting differs")
+        referenced_journal_events = _validate_failure_journal_manifest_receipt(
+            manifest.get("failure_journal"),
+            failures=manifest.get("failures"),
+            counts=counts,
+            project_root=project_root,
+            expected_failure_policy=runtime_config.failure_policy,
         )
     raw_items = manifest.get("items")
     if not isinstance(raw_items, list):
         raise PolyHavenAcquireError("Poly Haven run manifest items must be a list")
     if counts["selected"] != len(raw_items):
         raise PolyHavenAcquireError("Poly Haven run manifest selected count differs")
-    if status == "noop":
+    if status in {"noop", "journaled", "deferred", "released"}:
         if raw_items or manifest.get("generated_ingest_spec") is not None or any(counts.values()):
-            raise PolyHavenAcquireError("Poly Haven no-op receipt contains selected work")
+            allowed_nonzero = (
+                {
+                    "attempted",
+                    "failed",
+                    "deferred",
+                    "quarantined",
+                    "released",
+                    "transport_body_bytes",
+                }
+                if status in {"journaled", "deferred", "released"}
+                else set()
+            )
+            if (
+                raw_items
+                or manifest.get("generated_ingest_spec") is not None
+                or any(value for key, value in counts.items() if key not in allowed_nonzero)
+            ):
+                raise PolyHavenAcquireError(
+                    "Poly Haven receipt without prepared items contains selected work"
+                )
+        if status == "journaled" and counts.get("failed", 0) == 0:
+            raise PolyHavenAcquireError("journaled run failure counts are invalid")
+        if status == "deferred" and (counts.get("deferred", 0) == 0 or counts.get("failed")):
+            raise PolyHavenAcquireError("deferred run failure counts are invalid")
+        if status == "released" and (
+            counts.get("released", 0) == 0
+            or counts.get("failed")
+            or counts.get("deferred")
+            or counts.get("attempted")
+        ):
+            raise PolyHavenAcquireError("released run counts are invalid")
     elif not raw_items:
         raise PolyHavenAcquireError("prepared Poly Haven receipt has no items")
 
@@ -2453,7 +3622,7 @@ def _validate_prepared_manifest_receipt(
         _sha256_value(
             generated_payload["file_sha256"], "run manifest generated_ingest_spec.file_sha256"
         )
-    elif status != "noop":
+    elif status in {"prepared", "finalized"}:
         raise PolyHavenAcquireError("prepared Poly Haven receipt lacks generated IngestSpec")
 
     item_count_keys = {
@@ -2539,10 +3708,19 @@ def _validate_prepared_manifest_receipt(
             raise PolyHavenAcquireError(f"state prepared-manifest receipt differs for {asset_id!r}")
     if any(counts[key] != totals[key] for key in item_count_keys):
         raise PolyHavenAcquireError("Poly Haven run manifest aggregate accounting differs")
+    if has_failure_receipt:
+        _validate_sync_journal_event_binding(
+            referenced_journal_events,
+            run_id=str(manifest["run_id"]),
+            attempted=counts["attempted"],
+            successful_asset_ids=seen_asset_ids,
+            retry_revisions=tuple(request["retry_revisions"]),
+            request_resolution=str(request["resolution"]),
+        )
     actual_receipt_sha256 = _prepared_manifest_payload_sha256(manifest)
     if prepare_receipt_sha256 != actual_receipt_sha256:
         raise PolyHavenAcquireError("Poly Haven prepared manifest receipt changed")
-    if status == "noop":
+    if status in {"noop", "journaled", "deferred", "released"}:
         noop_receipts = _object(
             state.get("noop_run_receipts"),
             "Poly Haven state noop_run_receipts",
@@ -2555,6 +3733,17 @@ def _validate_prepared_manifest_receipt(
             project_root=project_root,
             expected_asset_ids=seen_asset_ids,
         )
+        if has_failure_receipt:
+            finalization_receipts = _object(
+                state.get("finalization_run_receipts"),
+                "Poly Haven state finalization_run_receipts",
+            )
+            if finalization_receipts.get(manifest["run_id"]) != (
+                _finalized_manifest_payload_sha256(manifest)
+            ):
+                raise PolyHavenAcquireError(
+                    "Poly Haven finalized manifest receipt is not anchored in state"
+                )
 
 
 def _existing_metadata_times(
@@ -2815,7 +4004,7 @@ def _file_spec(
         raise PolyHavenAcquireError(f"{context} contains unsupported key {extra[0]!r}")
     url = _download_url(payload.get("url"), f"{context}.url")
     if unquote(PurePosixPath(urlsplit(url).path).name) != relative_path.name:
-        raise PolyHavenAcquireError(f"{context}.url filename does not match package path")
+        raise PolyHavenPathSecurityError(f"{context}.url filename does not match package path")
     md5 = _string(payload.get("md5"), f"{context}.md5", max_length=32)
     if _MD5_PATTERN.fullmatch(md5) is None:
         raise PolyHavenAcquireError(f"{context}.md5 must be lowercase 32-character MD5")
@@ -2829,7 +4018,7 @@ def _reject_reserved_package_path(path: Path) -> None:
     for part in path.parts:
         lowered = part.casefold()
         if part.startswith(".") or lowered in _RESERVED_PACKAGE_NAMES or lowered.endswith(".part"):
-            raise PolyHavenAcquireError(
+            raise PolyHavenPathSecurityError(
                 f"Poly Haven package path collides with reserved metadata/temp storage: {path}"
             )
 
@@ -2863,7 +4052,7 @@ def _acquire_file(
                 )
             partial.unlink()
             _fsync_directory(partial.parent)
-            raise PolyHavenAcquireError(
+            raise PolyHavenIntegrityError(
                 "recovered a previously received oversized Poly Haven response"
             )
 
@@ -3003,7 +4192,7 @@ def _acquire_file(
                                 headers=getattr(response, "headers", None),
                             )
                         else:
-                            raise PolyHavenAcquireError(
+                            raise PolyHavenIntegrityError(
                                 f"Poly Haven resume returned HTTP {status} for {spec.url}"
                             )
                     elif status not in {200, 206}:
@@ -3013,7 +4202,7 @@ def _acquire_file(
                                 phase="download",
                                 headers=getattr(response, "headers", None),
                             )
-                        raise PolyHavenAcquireError(
+                        raise PolyHavenIntegrityError(
                             f"Poly Haven download returned HTTP {status} for {spec.url}"
                         )
                     else:
@@ -3042,7 +4231,7 @@ def _acquire_file(
                                     runtime.quota.claim_download_body(quota_key, excess)
                                 body_bytes_claimed += excess
                                 body_bytes_received += len(chunk)
-                                raise PolyHavenAcquireError(
+                                raise PolyHavenIntegrityError(
                                     "Poly Haven response returned more bytes than requested"
                                 )
                             body_bytes_received += len(chunk)
@@ -3068,7 +4257,7 @@ def _acquire_file(
                                     )
                                 partial.unlink(missing_ok=True)
                                 _fsync_directory(partial.parent)
-                                raise PolyHavenAcquireError(
+                                raise PolyHavenIntegrityError(
                                     f"Poly Haven download exceeds expected size: {spec.url}"
                                 )
                             file.write(chunk)
@@ -3076,7 +4265,16 @@ def _acquire_file(
                         os.fsync(file.fileno())
             except _AttemptFailure:
                 raise
-            except (OSError, urllib.error.URLError) as exc:
+            except OSError as exc:
+                if exc.errno in {errno.ENOSPC, getattr(errno, "EDQUOT", -1)}:
+                    raise _ClassifiedItemFailure(
+                        AcquisitionFailure(
+                            kind=FailureKind.DISK,
+                            phase="download_write",
+                            message="Poly Haven download storage is exhausted",
+                        ),
+                        attempts_in_run=1,
+                    ) from exc
                 raise _transport_attempt_failure("download") from exc
             finally:
                 release_unused_body_claim()
@@ -3150,7 +4348,11 @@ def _run_retryable(
     try:
         return operation()
     except _AttemptFailure as exc:
-        raise PolyHavenAcquireError(exc.failure.message) from exc
+        raise _ClassifiedItemFailure(
+            exc.failure,
+            attempts_in_run=1,
+            exhausted=False,
+        ) from exc
 
 
 def _set_redirect_request_hook(
@@ -3192,22 +4394,22 @@ def _validate_content_length(
     content_lengths = _response_header_values(headers, "Content-Length")
     transfer_encodings = _response_header_values(headers, "Transfer-Encoding")
     if content_lengths and transfer_encodings:
-        raise PolyHavenAcquireError(
+        raise PolyHavenIntegrityError(
             "Poly Haven response has ambiguous Content-Length and Transfer-Encoding framing"
         )
     if not content_lengths:
         if required:
-            raise PolyHavenAcquireError(
+            raise PolyHavenIntegrityError(
                 "Poly Haven response requires an exact Content-Length without an oversize probe"
             )
         return
     if len(content_lengths) != 1:
-        raise PolyHavenAcquireError("Poly Haven response Content-Length is ambiguous")
+        raise PolyHavenIntegrityError("Poly Haven response Content-Length is ambiguous")
     value = content_lengths[0]
     if len(value) > 20 or re.fullmatch(r"0|[1-9][0-9]*", value) is None:
-        raise PolyHavenAcquireError("Poly Haven response Content-Length is invalid")
+        raise PolyHavenIntegrityError("Poly Haven response Content-Length is invalid")
     if int(value) != expected_bytes:
-        raise PolyHavenAcquireError(
+        raise PolyHavenIntegrityError(
             "Poly Haven response Content-Length differs from its expected body"
         )
 
@@ -3222,7 +4424,7 @@ def _response_header_values(headers: Any, name: str) -> tuple[str, ...]:
             if not isinstance(values, list | tuple) or any(
                 not isinstance(value, str) for value in values
             ):
-                raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+                raise PolyHavenIntegrityError("Poly Haven response headers are invalid")
             return tuple(values)
     items = getattr(headers, "items", None)
     if callable(items):
@@ -3230,7 +4432,7 @@ def _response_header_values(headers: Any, name: str) -> tuple[str, ...]:
         for key, value in items():
             if isinstance(key, str) and key.casefold() == name.casefold():
                 if not isinstance(value, str):
-                    raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+                    raise PolyHavenIntegrityError("Poly Haven response headers are invalid")
                 matches.append(value)
         return tuple(matches)
     getter = getattr(headers, "get", None)
@@ -3239,9 +4441,9 @@ def _response_header_values(headers: Any, name: str) -> tuple[str, ...]:
         if value is None:
             return ()
         if not isinstance(value, str):
-            raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+            raise PolyHavenIntegrityError("Poly Haven response headers are invalid")
         return (value,)
-    raise PolyHavenAcquireError("Poly Haven response headers are invalid")
+    raise PolyHavenIntegrityError("Poly Haven response headers are invalid")
 
 
 def _http_attempt_failure(status: int, *, phase: str, headers: Any) -> _AttemptFailure:
@@ -3329,7 +4531,7 @@ def _download_url(value: Any, context: str) -> str:
     url = _string(value, context, max_length=4_096)
     parsed = _require_https_host(url, allowed_hosts=frozenset({_DOWNLOAD_HOST}), context=context)
     if parsed.query or parsed.fragment:
-        raise PolyHavenAcquireError(f"{context}: unapproved Poly Haven download URL")
+        raise PolyHavenPathSecurityError(f"{context}: unapproved Poly Haven download URL")
     return url
 
 
@@ -3354,7 +4556,7 @@ def _require_https_host(
     try:
         port = parsed.port
     except ValueError as exc:
-        raise PolyHavenAcquireError(f"{context}: invalid URL") from exc
+        raise PolyHavenPathSecurityError(f"{context}: invalid URL") from exc
     if (
         parsed.scheme != "https"
         or parsed.hostname not in allowed_hosts
@@ -3362,7 +4564,7 @@ def _require_https_host(
         or parsed.password
         or port is not None
     ):
-        raise PolyHavenAcquireError(f"{context}: unapproved HTTPS host")
+        raise PolyHavenPathSecurityError(f"{context}: unapproved HTTPS host")
     return parsed
 
 
@@ -3372,12 +4574,12 @@ def _validate_response_url(response: Any, *, expected_host: str) -> None:
         return
     final_url = geturl()
     if not isinstance(final_url, str):
-        raise PolyHavenAcquireError("Poly Haven response final URL is invalid")
+        raise PolyHavenPathSecurityError("Poly Haven response final URL is invalid")
     parsed = urlsplit(final_url)
     try:
         port = parsed.port
     except ValueError as exc:
-        raise PolyHavenAcquireError(
+        raise PolyHavenPathSecurityError(
             f"Poly Haven response redirected to an invalid URL: {final_url}"
         ) from exc
     if (
@@ -3387,7 +4589,7 @@ def _validate_response_url(response: Any, *, expected_host: str) -> None:
         or parsed.password
         or port is not None
     ):
-        raise PolyHavenAcquireError(
+        raise PolyHavenPathSecurityError(
             f"Poly Haven response redirected to an unapproved host: {final_url}"
         )
 
@@ -3398,7 +4600,7 @@ def _response_status(response: Any) -> int:
         getcode = getattr(response, "getcode", None)
         status = getcode() if callable(getcode) else 200
     if isinstance(status, bool) or not isinstance(status, int):
-        raise PolyHavenAcquireError("Poly Haven response has an invalid HTTP status")
+        raise PolyHavenIntegrityError("Poly Haven response has an invalid HTTP status")
     return status
 
 
@@ -3406,13 +4608,13 @@ def _validate_content_range(response: Any, *, offset: int, total: int) -> None:
     headers = getattr(response, "headers", None)
     value = headers.get("Content-Range") if headers is not None else None
     if not isinstance(value, str):
-        raise PolyHavenAcquireError("Poly Haven resume response has no Content-Range")
+        raise PolyHavenIntegrityError("Poly Haven resume response has no Content-Range")
     match = re.fullmatch(r"bytes ([0-9]+)-([0-9]+)/([0-9]+)", value)
     if match is None:
-        raise PolyHavenAcquireError("Poly Haven resume Content-Range is invalid")
+        raise PolyHavenIntegrityError("Poly Haven resume Content-Range is invalid")
     start, end, received_total = (int(part) for part in match.groups())
     if start != offset or received_total != total or end < start or end >= total:
-        raise PolyHavenAcquireError("Poly Haven resume Content-Range does not match request")
+        raise PolyHavenIntegrityError("Poly Haven resume Content-Range does not match request")
 
 
 def _assert_prepared_inputs_unchanged(
@@ -3769,6 +4971,137 @@ def _derive_terminal_statuses(
     return result_evidence
 
 
+def _journal_downstream_outcomes(
+    *,
+    items: tuple[PolyHavenSyncItem, ...],
+    batch: Mapping[str, Any],
+    batch_file_sha256: str,
+    project_root: Path,
+    data_dir: Path,
+    run_id: str,
+    resolution: str,
+    policy: CrossRunFailurePolicy,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    journal_path = data_dir / "acquire/polyhaven/failure_journal.json"
+    _reject_symlink_components(
+        journal_path,
+        project_root=project_root,
+        context="Poly Haven downstream failure journal",
+    )
+    loaded = _load_failure_journal(journal_path)
+    if not loaded.before_exists:
+        raise PolyHavenAcquireError("prepared Poly Haven run has no failure journal")
+    journal_payload = loaded.payload
+    rows = _validated_batch_rows(dict(batch))
+    event_refs: list[dict[str, Any]] = []
+    failure_events: list[dict[str, Any]] = []
+    for ordinal, item in enumerate(items, start=1):
+        row = rows[item.asset_id]
+        attempt_id = f"{run_id}:finalize:{ordinal}:{batch_file_sha256}"
+        event: dict[str, Any] | None = None
+        if row["status"] == "failed":
+            error = _object(row.get("error"), f"downstream error for {item.asset_id}")
+            error_type = _string(
+                error.get("type"),
+                f"downstream error type for {item.asset_id}",
+                max_length=128,
+            )
+            message = _string(
+                error.get("message"),
+                f"downstream error message for {item.asset_id}",
+                max_length=2_048,
+            )
+            raw_phase = error.get("phase", "downstream")
+            phase = _string(
+                raw_phase,
+                f"downstream error phase for {item.asset_id}",
+                max_length=64,
+            )
+            kind = (
+                FailureKind.QUALITY
+                if error_type == "IngestQualityError"
+                else FailureKind.DOWNSTREAM
+            )
+            try:
+                updated, event = append_failure_event(
+                    journal_payload,
+                    source=POLYHAVEN_SOURCE,
+                    asset_type="models",
+                    asset_id=item.asset_id,
+                    source_id=item.source_id,
+                    revision=item.revision,
+                    resolution=resolution,
+                    run_id=run_id,
+                    attempt_id=attempt_id,
+                    failure=AcquisitionFailure(
+                        kind=kind,
+                        phase=phase,
+                        message=message,
+                    ),
+                    recorded_at=_next_failure_journal_datetime(journal_payload),
+                    policy=policy,
+                    attempts_in_run=1,
+                )
+            except FailureJournalError as exc:
+                raise PolyHavenAcquireError(
+                    f"cannot journal downstream outcome for {item.asset_id}: {exc}"
+                ) from exc
+            journal_payload = updated
+            failure_events.append(event)
+        else:
+            active = validate_failure_journal(
+                journal_payload,
+                source=POLYHAVEN_SOURCE,
+                asset_type="models",
+            ).get(item.asset_id)
+            if active is not None:
+                try:
+                    updated, event = append_resolution_event(
+                        journal_payload,
+                        source=POLYHAVEN_SOURCE,
+                        asset_type="models",
+                        asset_id=item.asset_id,
+                        source_id=item.source_id,
+                        revision=item.revision,
+                        resolution=resolution,
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        recorded_at=_next_failure_journal_datetime(journal_payload),
+                    )
+                except FailureJournalError as exc:
+                    raise PolyHavenAcquireError(
+                        f"cannot resolve downstream outcome for {item.asset_id}: {exc}"
+                    ) from exc
+                journal_payload = updated
+        if event is not None:
+            event_refs.append(_failure_event_ref(event))
+    if journal_payload != loaded.payload:
+        # Validate the entire downstream cohort before one atomic journal
+        # commit; an invalid later row must not leave earlier orphan events.
+        _persist_failure_journal(journal_path, journal_payload)
+    return (
+        {
+            "path": _portable_path(journal_path, project_root),
+            "before": {
+                "exists": loaded.before_exists,
+                "file_sha256": loaded.before_file_sha256,
+                "payload_sha256": loaded.before_payload_sha256,
+                "event_count": len(loaded.payload["events"]),
+                "head_event_sha256": loaded.payload["head_event_sha256"],
+            },
+            "after": {
+                "exists": True,
+                "file_sha256": _sha256_file(journal_path),
+                "payload_sha256": _payload_sha256(journal_payload),
+                "event_count": len(journal_payload["events"]),
+                "head_event_sha256": journal_payload["head_event_sha256"],
+            },
+            "event_refs": event_refs,
+        },
+        failure_events,
+    )
+
+
 def _validated_batch_rows(batch: dict[str, Any]) -> dict[str, dict[str, Any]]:
     expected_batch_keys = {
         "schema_version",
@@ -4121,15 +5454,19 @@ def _validated_finalization_payload(
     expected_asset_ids: set[str],
 ) -> tuple[dict[str, Any], dict[str, TerminalStatus], dict[str, dict[str, Any]], tuple[str, ...]]:
     _timestamp(manifest.get("finalized_at"), "run manifest finalized_at")
+    finalization_keys = {
+        "batch_manifest",
+        "batch_manifest_file_sha256",
+        "terminal_statuses",
+        "terminal_evidence",
+        "nonterminal_asset_ids",
+    }
+    has_failure_receipt = manifest.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION
+    if has_failure_receipt:
+        finalization_keys.update({"failure_journal", "failures"})
     finalization = _exact_object(
         manifest.get("finalization"),
-        {
-            "batch_manifest",
-            "batch_manifest_file_sha256",
-            "terminal_statuses",
-            "terminal_evidence",
-            "nonterminal_asset_ids",
-        },
+        finalization_keys,
         "run manifest finalization",
     )
     _portable_state_path(
@@ -4180,6 +5517,119 @@ def _validated_finalization_payload(
         expected_asset_ids
     ):
         raise PolyHavenAcquireError("run manifest finalization cohort differs")
+    if has_failure_receipt:
+        failures = finalization["failures"]
+        if not isinstance(failures, list):
+            raise PolyHavenAcquireError("run manifest finalization failures must be a list")
+        request = _object(manifest.get("request"), "run manifest finalization request")
+        runtime_payload = _object(
+            request.get("runtime"),
+            "run manifest finalization runtime configuration",
+        )
+        if "failure_schedule" not in runtime_payload:
+            raise PolyHavenAcquireError(
+                "schema-4 run manifest requires an explicit failure schedule"
+            )
+        runtime_config = _validate_runtime_config_payload(runtime_payload)
+        quarantined = sum(
+            isinstance(event, dict)
+            and event.get("disposition") == FailureDisposition.QUARANTINED.value
+            for event in failures
+        )
+        referenced_events = _validate_failure_journal_manifest_receipt(
+            finalization["failure_journal"],
+            failures=failures,
+            counts={
+                "failed": len(failures),
+                "deferred": 0,
+                "quarantined": quarantined,
+            },
+            project_root=project_root,
+            expected_failure_policy=runtime_config.failure_policy,
+        )
+        raw_items = manifest.get("items")
+        if not isinstance(raw_items, list):
+            raise PolyHavenAcquireError("run manifest finalization has no item cohort")
+        item_identities: dict[str, tuple[int, str, str, str]] = {}
+        for ordinal, raw_item in enumerate(raw_items, start=1):
+            item = _object(raw_item, "run manifest finalization item")
+            asset_id = _string(
+                item.get("asset_id"),
+                "run manifest finalization asset_id",
+                max_length=64,
+            )
+            item_identities[asset_id] = (
+                ordinal,
+                _source_id(item.get("source_id"), "run manifest finalization source_id"),
+                _string(
+                    item.get("revision"),
+                    "run manifest finalization revision",
+                    max_length=40,
+                ),
+                _resolution(item.get("resolution")),
+            )
+        run_id = _string(manifest.get("run_id"), "run manifest run_id", max_length=128)
+        batch_hash = str(finalization["batch_manifest_file_sha256"])
+        journal_receipt = _object(
+            finalization["failure_journal"],
+            "run manifest finalization failure_journal",
+        )
+        journal_path = project_root / _portable_state_path(
+            journal_receipt.get("path"),
+            project_root=project_root,
+            context="run manifest finalization failure journal path",
+        )
+        journal = _load_failure_journal(journal_path).payload
+        events_by_id = {
+            str(event["event_id"]): event for event in journal["events"] if isinstance(event, dict)
+        }
+        failed_asset_ids: set[str] = set()
+        for event in referenced_events:
+            asset_id = str(event["asset_id"])
+            identity = item_identities.get(asset_id)
+            if identity is None:
+                raise PolyHavenAcquireError(
+                    "finalization journal event is outside the prepared cohort"
+                )
+            ordinal, source_id, revision, resolution = identity
+            if (
+                event.get("run_id") != run_id
+                or event.get("attempt_id") != f"{run_id}:finalize:{ordinal}:{batch_hash}"
+                or event.get("source_id") != source_id
+                or event.get("revision") != revision
+                or event.get("resolution") != resolution
+            ):
+                raise PolyHavenAcquireError(
+                    "finalization journal event identity differs from its batch operation"
+                )
+            if event.get("type") == "failed":
+                failure = _object(
+                    event.get("failure"),
+                    "run manifest finalization journal failure",
+                )
+                if asset_id not in nonterminal or failure.get("kind") not in {
+                    FailureKind.DOWNSTREAM.value,
+                    FailureKind.QUALITY.value,
+                }:
+                    raise PolyHavenAcquireError(
+                        "finalization failure event differs from the nonterminal cohort"
+                    )
+                failed_asset_ids.add(asset_id)
+            elif event.get("type") == "resolved":
+                previous = events_by_id.get(str(event.get("failure_event_id")))
+                previous_failure = previous.get("failure") if isinstance(previous, dict) else None
+                if asset_id not in statuses or not isinstance(previous_failure, dict):
+                    raise PolyHavenAcquireError(
+                        "finalization resolution event has no prior revision failure"
+                    )
+            else:
+                raise PolyHavenAcquireError(
+                    "finalization journal contains an unsupported event type"
+                )
+        if failed_asset_ids != set(nonterminal):
+            raise PolyHavenAcquireError(
+                "finalization failure events do not match the nonterminal cohort"
+            )
     return finalization, statuses, terminal_evidence, nonterminal
 
 
@@ -4732,6 +6182,10 @@ def _persist_run_failure(
         if payload.get("status") != "running":
             return
         payload["status"] = "failed" if isinstance(error, Exception) else "interrupted"
+        if isinstance(error, Exception):
+            # The exception was observed and durably classified as a run failure;
+            # only process-level interruptions leave an attempt for crash recovery.
+            payload["active_attempt"] = None
         payload["completed_at"] = _utc_now()
         payload["error"] = {"type": type(error).__name__, "message": str(error)}
         if runtime_evidence is not None:
@@ -4759,29 +6213,174 @@ def _intent_targets_manifest(intent_path: Path, manifest_path: Path) -> bool:
         return False
 
 
-def _interrupt_stale_running_manifests(*, project_root: Path, exclude: Path) -> None:
+def _reconcile_stale_running_manifests(
+    *,
+    project_root: Path,
+    exclude: Path,
+    journal_path: Path,
+    journal_payload: dict[str, Any],
+    policy: CrossRunFailurePolicy,
+    clock: Clock,
+) -> None:
     root = project_root / "out/acquire/polyhaven"
-    if not root.is_dir() or root.is_symlink():
+    if root.is_symlink():
+        raise PolyHavenPathSecurityError(f"Poly Haven run root is a symlink: {root}")
+    if not root.is_dir():
         return
-    for path in sorted(root.glob("*/manifest.json")):
-        if path.resolve() == exclude.resolve() or path.is_symlink() or not path.is_file():
+    canonical_root = root.resolve()
+    for run_dir in sorted(root.iterdir()):
+        if run_dir.is_symlink():
+            raise PolyHavenPathSecurityError(f"Poly Haven run directory is a symlink: {run_dir}")
+        if not run_dir.is_dir():
+            continue
+        path = run_dir / "manifest.json"
+        if not path.exists() and not path.is_symlink():
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise PolyHavenPathSecurityError(f"Poly Haven stale run manifest is unsafe: {path}")
+        try:
+            path.resolve().relative_to(canonical_root)
+        except (OSError, ValueError) as exc:
+            raise PolyHavenPathSecurityError(
+                f"Poly Haven stale run manifest escapes its root: {path}"
+            ) from exc
+        _reject_symlink_components(
+            path,
+            project_root=project_root,
+            context="Poly Haven stale run manifest",
+        )
+        if path.resolve() == exclude.resolve():
             continue
         payload = _read_json_object_strict(path, "Poly Haven run manifest")
-        if payload.get("status") != "running":
+        active_attempt = payload.get("active_attempt")
+        is_transient_shape = "active_attempt" in payload or "journal_event_refs" in payload
+        if payload.get("status") != "running" and active_attempt is None and not is_transient_shape:
             continue
-        payload["status"] = "interrupted"
-        payload["completed_at"] = _utc_now()
-        payload["error"] = {
-            "type": "InterruptedRun",
-            "message": "reconciled on the next source-scoped startup",
-        }
+        if active_attempt is not None:
+            active = _exact_object(
+                active_attempt,
+                {
+                    "attempt_id",
+                    "ordinal",
+                    "asset_id",
+                    "source_id",
+                    "revision",
+                    "resolution",
+                    "started_at",
+                },
+                "stale Poly Haven active_attempt",
+            )
+            run_id = _string(payload.get("run_id"), "stale run_id", max_length=128)
+            ordinal = _positive_int(active["ordinal"], "stale active attempt ordinal")
+            attempt_id = _string(
+                active["attempt_id"],
+                "stale active attempt id",
+                max_length=160,
+            )
+            if attempt_id != f"{run_id}:{ordinal}":
+                raise PolyHavenAcquireError("stale active attempt id is invalid")
+            asset_id = _string(active["asset_id"], "stale asset_id", max_length=64)
+            try:
+                validate_asset_id(asset_id)
+            except ValueError as exc:
+                raise PolyHavenAcquireError("stale active attempt asset id is invalid") from exc
+            source_id = _source_id(active["source_id"], "stale active attempt source_id")
+            revision = _string(
+                active["revision"],
+                "stale active attempt revision",
+                max_length=40,
+            )
+            if (
+                _SHA1_PATTERN.fullmatch(revision) is None
+                or revisioned_asset_id(source_id, revision) != asset_id
+            ):
+                raise PolyHavenAcquireError("stale active attempt revision is invalid")
+            resolution = _resolution(active["resolution"])
+            _timestamp(active["started_at"], "stale active attempt started_at")
+            event = _journal_event_for_attempt(journal_payload, attempt_id=attempt_id)
+            if event is None:
+                try:
+                    journal_payload, event = append_failure_event(
+                        journal_payload,
+                        source=POLYHAVEN_SOURCE,
+                        asset_type="models",
+                        asset_id=asset_id,
+                        source_id=source_id,
+                        revision=revision,
+                        resolution=resolution,
+                        run_id=run_id,
+                        attempt_id=attempt_id,
+                        failure=AcquisitionFailure(
+                            kind=FailureKind.INTERRUPTED,
+                            phase="revision_attempt",
+                            message="Poly Haven revision attempt was interrupted before receipt",
+                        ),
+                        recorded_at=_next_failure_journal_datetime(
+                            journal_payload,
+                            now=_clock_utc_now(clock),
+                        ),
+                        policy=policy,
+                        attempts_in_run=0,
+                    )
+                except FailureJournalError as exc:
+                    raise PolyHavenAcquireError(
+                        f"cannot reconcile interrupted Poly Haven attempt: {exc}"
+                    ) from exc
+                _persist_failure_journal(journal_path, journal_payload)
+            elif (
+                event.get("asset_id") != asset_id
+                or event.get("source_id") != source_id
+                or event.get("revision") != revision
+                or event.get("resolution") != resolution
+            ):
+                raise PolyHavenAcquireError("stale active attempt conflicts with its journal event")
+            payload["active_attempt"] = None
+        raw_refs = payload.get("journal_event_refs", [])
+        if not isinstance(raw_refs, list):
+            raise PolyHavenAcquireError("stale run journal_event_refs are invalid")
+        run_id = _string(payload.get("run_id"), "stale run_id", max_length=128)
+        events = journal_payload.get("events")
+        if not isinstance(events, list):
+            raise PolyHavenAcquireError("Poly Haven failure journal events are invalid")
+        for event in events:
+            if isinstance(event, dict) and event.get("run_id") == run_id:
+                event_ref = _failure_event_ref(event)
+                if event_ref not in raw_refs:
+                    raw_refs.append(event_ref)
+        raw_refs.sort(key=lambda item: int(item["sequence"]))
+        payload["journal_event_refs"] = raw_refs
+        if payload.get("status") == "running":
+            payload["status"] = "interrupted"
+            payload["completed_at"] = _utc_now()
+            payload["error"] = {
+                "type": "InterruptedRun",
+                "message": "reconciled on the next source-scoped startup",
+            }
         _write_json_atomic(path, payload)
+
+
+def _journal_event_for_attempt(
+    payload: Mapping[str, Any],
+    *,
+    attempt_id: str,
+) -> dict[str, Any] | None:
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise PolyHavenAcquireError("Poly Haven failure journal events are invalid")
+    matches = [
+        event
+        for event in events
+        if isinstance(event, dict) and event.get("attempt_id") == attempt_id
+    ]
+    if len(matches) > 1:
+        raise PolyHavenAcquireError("Poly Haven attempt has multiple journal outcomes")
+    return matches[0] if matches else None
 
 
 @contextmanager
 def _source_lock(data_dir: Path) -> Iterator[Path]:
-    lock_path = data_dir / "locks/acquire/polyhaven.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_root = _ensure_safe_directory(data_dir, Path("locks/acquire"))
+    lock_path = lock_root / "polyhaven.lock"
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -4914,12 +6513,12 @@ def _md5_file(path: Path) -> str:
 def _relative_path(value: Any, context: str) -> Path:
     raw = _string(value, context, max_length=1_024)
     if "\\" in raw:
-        raise PolyHavenAcquireError(f"{context} must use normalized POSIX separators")
+        raise PolyHavenPathSecurityError(f"{context} must use normalized POSIX separators")
     pure = PurePosixPath(raw)
     if pure.is_absolute() or not pure.parts or any(part in {"", ".", ".."} for part in pure.parts):
-        raise PolyHavenAcquireError(f"{context} must be a safe relative path")
+        raise PolyHavenPathSecurityError(f"{context} must be a safe relative path")
     if pure.as_posix() != raw:
-        raise PolyHavenAcquireError(f"{context} must be a normalized relative path")
+        raise PolyHavenPathSecurityError(f"{context} must be a normalized relative path")
     return Path(*pure.parts)
 
 
@@ -5046,6 +6645,25 @@ def _payload_sha256(payload: Any) -> str:
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(rendered).hexdigest()
+
+
+def _state_transition_sha256(state: Mapping[str, Any], *, run_id: str) -> str:
+    """Bind one run's state transition without its self-referential receipt anchor."""
+
+    checked_run_id = _string(run_id, "state transition run_id", max_length=128)
+    projection = json.loads(json.dumps(state))
+    noop_receipts = projection.get("noop_run_receipts")
+    if isinstance(noop_receipts, dict):
+        noop_receipts.pop(checked_run_id, None)
+    finalization_receipts = projection.get("finalization_run_receipts")
+    if isinstance(finalization_receipts, dict):
+        finalization_receipts.pop(checked_run_id, None)
+    items = projection.get("items")
+    if isinstance(items, dict):
+        for raw_item in items.values():
+            if isinstance(raw_item, dict) and raw_item.get("last_run_id") == checked_run_id:
+                raw_item["prepared_manifest_payload_sha256"] = None
+    return _domain_payload_sha256(_STATE_TRANSITION_DIGEST_DOMAIN, projection)
 
 
 def _domain_payload_sha256(domain: bytes, payload: Any) -> str:

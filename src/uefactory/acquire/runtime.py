@@ -372,6 +372,9 @@ class FailureKind(StrEnum):
     LICENSE = "license"
     QUOTA = "quota"
     DISK = "disk"
+    INTERRUPTED = "interrupted"
+    DOWNSTREAM = "downstream"
+    QUALITY = "quality"
 
 
 class FailureCategory(StrEnum):
@@ -393,6 +396,9 @@ _FAILURE_CATEGORIES: Mapping[FailureKind, FailureCategory] = {
     FailureKind.LICENSE: FailureCategory.PERMANENT,
     FailureKind.QUOTA: FailureCategory.DEFERRED,
     FailureKind.DISK: FailureCategory.DEFERRED,
+    FailureKind.INTERRUPTED: FailureCategory.TRANSIENT,
+    FailureKind.DOWNSTREAM: FailureCategory.TRANSIENT,
+    FailureKind.QUALITY: FailureCategory.PERMANENT,
 }
 
 

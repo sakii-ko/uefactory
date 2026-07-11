@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 
@@ -21,6 +21,7 @@ from uefactory.acquire.polyhaven import (
     PolyHavenSyncResult,
     TerminalStatus,
     finalize_polyhaven_items,
+    polyhaven_failure_report,
     sync_polyhaven_models,
 )
 from uefactory.acquire.polyhaven import (
@@ -104,6 +105,37 @@ def acquire_polyhaven(
         int,
         typer.Option("--min-free-bytes", min=0, help="Free-space floor before downloads."),
     ] = 0,
+    cross_run_backoff_base_sec: Annotated[
+        float,
+        typer.Option(
+            "--cross-run-backoff-base-sec",
+            min=1.0,
+            help="Initial delay before retrying a failed revision in a later run.",
+        ),
+    ] = 300.0,
+    cross_run_backoff_max_sec: Annotated[
+        float,
+        typer.Option(
+            "--cross-run-backoff-max-sec",
+            min=1.0,
+            help="Maximum cross-run revision retry delay.",
+        ),
+    ] = 86_400.0,
+    integrity_quarantine_after_runs: Annotated[
+        int,
+        typer.Option(
+            "--integrity-quarantine-after-runs",
+            min=1,
+            help="Run-level integrity failures before exact-revision quarantine.",
+        ),
+    ] = 3,
+    retry_revision: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--retry-revision",
+            help="Release one exact failed asset revision for an audited retry; repeatable.",
+        ),
+    ] = None,
     ingest: Annotated[
         bool,
         typer.Option(
@@ -147,6 +179,9 @@ def acquire_polyhaven(
             max_download_bytes_per_day=max_download_bytes_per_day,
             max_storage_bytes=max_storage_bytes,
             min_free_bytes=min_free_bytes,
+            cross_run_backoff_base_sec=cross_run_backoff_base_sec,
+            cross_run_backoff_max_sec=cross_run_backoff_max_sec,
+            integrity_quarantine_after_runs=integrity_quarantine_after_runs,
         )
         result = sync_polyhaven_models(
             settings=settings,
@@ -154,6 +189,7 @@ def acquire_polyhaven(
             resolution=resolution,
             force=force,
             runtime_config=runtime_config,
+            retry_revisions=tuple(retry_revision or ()),
         )
     except PolyHavenAcquireError as exc:
         typer.echo(f"Poly Haven acquisition failed: {exc}", err=True)
@@ -194,13 +230,26 @@ def acquire_polyhaven(
         )
         if result.generated_spec_path is not None:
             typer.echo(f"Generated IngestSpec: {result.generated_spec_path}")
-        elif _polyhaven_deferred_items(result):
+        elif not (
+            _polyhaven_deferred_items(result) or result.deferred or result.failed or result.released
+        ):
+            typer.echo("No eligible Poly Haven model revisions; source is unchanged")
+        if _polyhaven_deferred_items(result):
             typer.echo(
                 f"Poly Haven unseen revisions deferred by daily item quota: "
                 f"{_polyhaven_deferred_items(result)}"
             )
-        else:
-            typer.echo("No eligible Poly Haven model revisions; source is unchanged")
+        if result.deferred:
+            typer.echo(
+                f"Poly Haven revisions deferred by durable failure policy: {result.deferred}"
+            )
+        if result.failed:
+            typer.echo(
+                f"Poly Haven revision failures journaled: {result.failed}; "
+                f"quarantined: {result.quarantined}"
+            )
+        if result.released:
+            typer.echo(f"Poly Haven revision failure releases recorded: {result.released}")
         typer.echo(f"Acquisition manifest: {result.manifest_path}")
         if batch is not None:
             typer.echo(f"Ingest status: {batch.status}")
@@ -245,10 +294,14 @@ def _polyhaven_payload(
         }
     return {
         "status": (
-            "deferred"
+            "journaled"
+            if batch is None and result.generated_spec_path is None and result.failed
+            else "deferred"
             if batch is None
             and result.generated_spec_path is None
-            and _polyhaven_deferred_items(result)
+            and (_polyhaven_deferred_items(result) or result.deferred)
+            else "released"
+            if batch is None and result.generated_spec_path is None and result.released
             else "noop"
             if batch is None and result.generated_spec_path is None
             else ("prepared" if batch is None else batch.status)
@@ -257,6 +310,11 @@ def _polyhaven_payload(
         "asset_type": "models",
         "discovered": result.discovered,
         "selected": result.selected,
+        "attempted": result.attempted,
+        "failed": result.failed,
+        "deferred": result.deferred,
+        "quarantined": result.quarantined,
+        "released": result.released,
         "downloaded_files": result.downloaded_files,
         "reused_files": result.reused_files,
         "downloaded_bytes": result.downloaded_bytes,
@@ -266,6 +324,9 @@ def _polyhaven_payload(
         "run_dir": str(result.run_dir),
         "manifest": str(result.manifest_path),
         "state": str(result.state_path),
+        "failure_journal": (
+            None if result.failure_journal_path is None else str(result.failure_journal_path)
+        ),
         "generated_ingest_spec": (
             None if result.generated_spec_path is None else str(result.generated_spec_path)
         ),
@@ -301,6 +362,53 @@ def _polyhaven_deferred_items(result: PolyHavenSyncResult) -> int:
         return 0
     value = daily.get("deferred_new_items")
     return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
+@acquire_app.command("polyhaven-failures")
+def acquire_polyhaven_failures(
+    ctx: typer.Context,
+    status: Annotated[
+        Literal["active", "quarantined", "all"],
+        typer.Option("--status", help="Failure records to display."),
+    ] = "active",
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit the validated journal view as JSON."),
+    ] = False,
+) -> None:
+    """Inspect durable Poly Haven revision failures without mutating the journal."""
+
+    try:
+        payload = polyhaven_failure_report(
+            settings=settings_from_context(ctx),
+            status=status,
+        )
+    except PolyHavenAcquireError as exc:
+        typer.echo(f"Poly Haven failure journal is unavailable: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+        return
+    typer.echo(
+        f"Poly Haven failures ({status}): {payload['active_count']} active; "
+        f"{payload['event_count']} journal events"
+    )
+    for record in payload["active"]:
+        typer.echo(
+            f"{record['asset_id']}: {record['disposition']} "
+            f"{record['failure']['kind']} ({record['failure']['phase']})"
+        )
+    if status == "all":
+        for event in payload["events"]:
+            details = ""
+            if event["type"] == "failed":
+                details = (
+                    f" {event['disposition']} {event['failure']['kind']} "
+                    f"({event['failure']['phase']})"
+                )
+            elif event["type"] == "released":
+                details = f" ({event['reason']})"
+            typer.echo(f"event {event['sequence']}: {event['type']} {event['asset_id']}{details}")
 
 
 @acquire_app.command("hdri")

@@ -50,7 +50,7 @@ def _write_base_files(tmp_path: Path) -> tuple[Path, Path, Path, dict[str, objec
 
     base_state = polyhaven._empty_state()
     base_manifest: dict[str, object] = {
-        "schema_version": polyhaven.RUN_MANIFEST_SCHEMA_VERSION,
+        "schema_version": polyhaven.RUNTIME_RUN_MANIFEST_SCHEMA_VERSION,
         "source": polyhaven.POLYHAVEN_SOURCE,
         "asset_type": "models",
         "run_id": "run",
@@ -77,7 +77,7 @@ def _noop_after_payloads(
     new_state = copy.deepcopy(loaded_state.payload)
     new_state["updated_at"] = _TIMESTAMP
     new_manifest: dict[str, object] = {
-        "schema_version": polyhaven.RUN_MANIFEST_SCHEMA_VERSION,
+        "schema_version": polyhaven.RUNTIME_RUN_MANIFEST_SCHEMA_VERSION,
         "source": polyhaven.POLYHAVEN_SOURCE,
         "asset_type": "models",
         "run_id": "run",
@@ -135,6 +135,44 @@ def _noop_after_payloads(
         "payload_sha256": polyhaven._payload_sha256(new_state),
     }
     return new_state, new_manifest
+
+
+def test_historical_state_loader_preserves_absent_optional_receipt_maps(
+    tmp_path: Path,
+) -> None:
+    state_path = tmp_path / "data/acquire/polyhaven/state.json"
+    historical = polyhaven._empty_state()
+    historical.pop("noop_run_receipts")
+    historical.pop("finalization_run_receipts")
+    polyhaven._write_json_atomic(state_path, historical)
+
+    loaded = polyhaven._load_state(state_path, project_root=tmp_path)
+
+    assert loaded.payload == historical
+    assert polyhaven._json_file_sha256(loaded.payload) == polyhaven._json_file_sha256(historical)
+    assert polyhaven._payload_sha256(loaded.payload) == polyhaven._payload_sha256(historical)
+
+
+def test_schema_3_noop_receipt_replays_without_finalization_anchor_key(
+    tmp_path: Path,
+) -> None:
+    state_path, _, _, _ = _write_base_files(tmp_path)
+    state = polyhaven._empty_state()
+    state.pop("finalization_run_receipts")
+    polyhaven._write_json_atomic(state_path, state)
+    loaded = polyhaven._load_state(state_path, project_root=tmp_path)
+    new_state, manifest = _noop_after_payloads(
+        tmp_path=tmp_path,
+        state_path=state_path,
+        loaded_state=loaded,
+    )
+    polyhaven._write_json_atomic(state_path, new_state)
+
+    polyhaven._validate_prepared_manifest_receipt(
+        manifest=manifest,
+        state=new_state,
+        project_root=tmp_path,
+    )
 
 
 @pytest.mark.parametrize(
